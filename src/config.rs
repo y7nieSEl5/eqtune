@@ -46,8 +46,8 @@ impl Default for Config {
         );
         presets.insert("flat".to_string(), Preset { bands: Vec::new(), preamp_db: 0.0 });
         // Candidate device tunings supplied by users (provisional names).
-        // NOTE: "air-desk" is all boosts — loud by design; it drives the limiter, so
-        // lower the preamp (e.g. `eqtune preamp -8`) while it's active if it distorts.
+        // NOTE: "air-desk" is all boosts; it ships with -8 dB preamp to tame the
+        // loudness. Nudge the preamp toward 0 with `eqtune preamp` if you want it louder.
         presets.insert(
             "air-desk".to_string(),
             Preset {
@@ -55,7 +55,7 @@ impl Default for Config {
                     (32.0, 7.5), (64.0, 9.0), (125.0, 11.0), (250.0, 7.5), (500.0, 4.0),
                     (1000.0, 4.5), (2000.0, 7.5), (4000.0, 7.5), (8000.0, 9.5), (16000.0, 7.0),
                 ]),
-                preamp_db: 0.0,
+                preamp_db: -8.0,
             },
         );
         presets.insert(
@@ -64,16 +64,6 @@ impl Default for Config {
                 bands: graphic(&[
                     (32.0, 3.0), (64.0, 2.0), (125.0, 1.0), (250.0, -2.0), (500.0, -3.0),
                     (1000.0, -4.0), (2000.0, -7.0), (4000.0, -1.0), (8000.0, 2.0), (16000.0, 2.0),
-                ]),
-                preamp_db: 0.0,
-            },
-        );
-        presets.insert(
-            "macbook-pro".to_string(),
-            Preset {
-                bands: graphic(&[
-                    (32.0, 3.0), (64.0, 4.0), (125.0, 3.0), (250.0, 2.0), (500.0, 0.0),
-                    (1000.0, -2.0), (2000.0, -4.0), (4000.0, 3.0), (8000.0, 6.0), (16000.0, 4.0),
                 ]),
                 preamp_db: 0.0,
             },
@@ -162,11 +152,12 @@ mod tests {
     #[test]
     fn library_has_device_presets() {
         let c = Config::default();
-        for name in ["default", "flat", "air-desk", "air-lap", "macbook-pro", "engineer"] {
+        for name in ["default", "flat", "air-desk", "air-lap", "engineer"] {
             assert!(c.presets.contains_key(name), "missing preset {name}");
         }
+        assert!(!c.presets.contains_key("macbook-pro"), "macbook-pro should be removed");
         assert_eq!(c.presets["air-desk"].bands.len(), 10);
-        assert_eq!(c.presets["macbook-pro"].bands.len(), 10);
+        assert_eq!(c.presets["air-desk"].preamp_db, -8.0);
         assert_eq!(c.presets["engineer"].bands.len(), 28);
     }
 
