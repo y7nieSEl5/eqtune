@@ -40,16 +40,11 @@ fn graphic(points: &[(f32, f32)]) -> Vec<Band> {
 impl Default for Config {
     fn default() -> Self {
         let mut presets = BTreeMap::new();
-        // The original hand-tuned 9-band curve (kept as a selectable option).
-        presets.insert(
-            "original".to_string(),
-            Preset { bands: dsp::default_bands(), preamp_db: dsp::DEFAULT_PREAMP_DB },
-        );
-        // Candidate device tunings supplied by users (provisional names).
-        // NOTE: "air-desk" is all boosts; it ships with -8 dB preamp to tame the
+        // Candidate tunings (peaking filters at ~octave Q).
+        // NOTE: "bright" is all boosts; it ships with -8 dB preamp to tame the
         // loudness. Nudge the preamp toward 0 with `eqtune preamp` if you want it louder.
         presets.insert(
-            "air-desk".to_string(),
+            "bright".to_string(),
             Preset {
                 bands: graphic(&[
                     (32.0, 7.5), (64.0, 9.0), (125.0, 11.0), (250.0, 7.5), (500.0, 4.0),
@@ -59,7 +54,7 @@ impl Default for Config {
             },
         );
         presets.insert(
-            "air-lap".to_string(),
+            "mellow".to_string(),
             Preset {
                 bands: graphic(&[
                     (32.0, 3.0), (64.0, 2.0), (125.0, 1.0), (250.0, -2.0), (500.0, -3.0),
@@ -68,10 +63,10 @@ impl Default for Config {
                 preamp_db: 0.0,
             },
         );
-        // Sound-engineer 31-band 1/3-octave curve (sub-bass lift + deep 125 Hz notch).
+        // "pro" — sound-engineer 31-band 1/3-octave curve (sub-bass lift + deep 125 Hz notch).
         // Best-effort parse of a hand-supplied spec; tweak by ear with `eqtune band`.
         presets.insert(
-            "engineer".to_string(),
+            "pro".to_string(),
             Preset {
                 bands: graphic(&[
                     (20.0, 0.0), (25.0, 1.0), (31.5, 2.0), (40.0, 1.5), (50.0, 1.5), (63.0, 1.5),
@@ -85,7 +80,7 @@ impl Default for Config {
             },
         );
         Self {
-            active_preset: "air-lap".to_string(),
+            active_preset: "mellow".to_string(),
             limiter: true,
             auto_follow_new_devices: true,
             presets,
@@ -140,28 +135,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_active_is_air_lap_and_keeps_original() {
+    fn default_active_is_mellow() {
         let c = Config::default();
-        assert_eq!(c.active_preset, "air-lap");
+        assert_eq!(c.active_preset, "mellow");
         assert_eq!(c.active().unwrap().bands.len(), 10);
-        // the original hand-tuned 9-band curve is preserved
-        assert_eq!(c.presets["original"].bands.len(), dsp::default_bands().len());
-        assert_eq!(c.presets["original"].preamp_db, dsp::DEFAULT_PREAMP_DB);
+        assert!(!c.presets.contains_key("original"), "original should be removed");
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
     }
 
     #[test]
-    fn library_has_device_presets() {
+    fn library_has_expected_presets() {
         let c = Config::default();
-        for name in ["original", "air-desk", "air-lap", "engineer"] {
+        for name in ["bright", "mellow", "pro"] {
             assert!(c.presets.contains_key(name), "missing preset {name}");
         }
-        assert!(!c.presets.contains_key("flat"), "flat should be removed");
-        assert!(!c.presets.contains_key("macbook-pro"), "macbook-pro should be removed");
-        assert_eq!(c.presets["air-desk"].bands.len(), 10);
-        assert_eq!(c.presets["air-desk"].preamp_db, -8.0);
-        assert_eq!(c.presets["engineer"].bands.len(), 28);
+        for gone in ["flat", "macbook-pro", "original", "air-desk", "air-lap", "engineer"] {
+            assert!(!c.presets.contains_key(gone), "{gone} should be gone");
+        }
+        assert_eq!(c.presets["bright"].bands.len(), 10);
+        assert_eq!(c.presets["bright"].preamp_db, -8.0);
+        assert_eq!(c.presets["pro"].bands.len(), 28);
     }
 
     #[test]
