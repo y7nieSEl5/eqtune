@@ -2,6 +2,16 @@
 name = "eqtune"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A lightweight, system-wide audio equalizer for macOS, built on Core Audio process taps."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/USERNAME/eqtune"
+readme = "README.md"
+keywords = ["audio", "equalizer", "macos", "coreaudio", "eq"]
+categories = ["multimedia::audio", "command-line-utilities"]
+
+[package.metadata.docs.rs]
+targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 anyhow = "1.0.102"

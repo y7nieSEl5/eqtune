@@ -80,7 +80,7 @@ impl Default for Config {
             },
         );
         Self {
-            active_preset: "mellow".to_string(),
+            active_preset: "bright".to_string(),
             limiter: true,
             auto_follow_new_devices: true,
             presets,
@@ -135,9 +135,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_active_is_mellow() {
+    fn default_active_is_bright() {
         let c = Config::default();
-        assert_eq!(c.active_preset, "mellow");
+        assert_eq!(c.active_preset, "bright");
         assert_eq!(c.active().unwrap().bands.len(), 10);
         assert!(!c.presets.contains_key("original"), "original should be removed");
         assert!(c.limiter);
