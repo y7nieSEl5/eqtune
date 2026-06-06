@@ -16,4 +16,12 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
     println!("cargo:rustc-link-lib=framework=CoreAudio");
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
+
+    // Embed an Info.plist into the binary so macOS shows a proper audio-capture
+    // permission prompt (no code signing needed); applies to bin targets only.
+    println!("cargo:rerun-if-changed=resources/Info.plist");
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    println!(
+        "cargo:rustc-link-arg-bins=-Wl,-sectcreate,__TEXT,__info_plist,{manifest}/resources/Info.plist"
+    );
 }

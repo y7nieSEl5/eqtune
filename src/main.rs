@@ -62,11 +62,16 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Daemon => Daemon::new()?.run(),
         Command::Install => {
-            println!("install: not implemented yet (LaunchAgent setup) — task #8");
+            eqtune::launchd::install()?;
+            println!("eqtune installed; the daemon runs now and at login.");
+            println!("Grant audio-capture permission when prompted (or in System Settings ›");
+            println!("Privacy & Security), then run `eqtune on`.");
             Ok(())
         }
         Command::Uninstall => {
-            println!("uninstall: not implemented yet (LaunchAgent teardown) — task #8");
+            eqtune::launchd::uninstall()?;
+            println!("eqtune daemon removed. (Config kept; delete");
+            println!("~/Library/Application Support/eqtune to remove everything.)");
             Ok(())
         }
         Command::Probe => {
