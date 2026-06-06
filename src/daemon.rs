@@ -1,28 +1,28 @@
-//! The long-running daemon.
-//!
-//! For now it owns the [`Config`] plus an enabled flag and serves the control socket.
-//! The Core Audio capture/replay engine (Spike 0) plugs into the marked TODO points:
-//! `enable`/`disable` will start/stop it, and `persist_and_apply` will push fresh
-//! filter coefficients to it live.
+//! The long-running daemon: owns the config and the audio engine, and serves the
+//! control socket. `on`/`off` start/stop the Core Audio tap; live edits push fresh
+//! settings to the running engine lock-free (no audio restart).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 use crate::config::{Config, Preset};
-use crate::dsp::{Band, BandKind};
+use crate::dsp::{Band, BandKind, EqSettings};
 use crate::ipc::{self, Request, Response, Status};
+use crate::sys::{self, EqHandle, TapSession};
 
 /// Two bands count as "the same band" if their frequencies are this close (Hz).
 const BAND_MATCH_HZ: f32 = 0.5;
+/// Channel count for the processor (stereo).
+const CHANNELS: usize = 2;
 
 pub struct Daemon {
     config: Config,
-    enabled: bool,
+    engine: Option<(TapSession, EqHandle)>,
 }
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self { config: Config::load()?, enabled: false })
+        Ok(Self { config: Config::load()?, engine: None })
     }
 
     /// Bind the control socket and serve requests until the process is terminated.
@@ -31,8 +31,7 @@ impl Daemon {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Clear any stale socket left by a previous run before binding.
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path); // clear any stale socket
         let listener = UnixListener::bind(&path)?;
         eprintln!("eqtune daemon listening on {}", path.display());
 
@@ -79,13 +78,11 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
-                self.enabled = true;
-                // TODO(Spike 0): start the Core Audio tap + replay engine.
+                self.start_engine()?;
                 Ok(Response::Ok)
             }
             Request::Disable => {
-                self.enabled = false;
-                // TODO(Spike 0): stop the engine; CATapMutedWhenTapped restores audio.
+                self.engine = None; // drops TapSession -> stops the audio thread
                 Ok(Response::Ok)
             }
             Request::ListPresets => Ok(Response::Presets {
@@ -140,21 +137,55 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("active preset '{name}' is missing"))
     }
 
+    /// Build engine settings from the active preset and the output device's rate.
+    fn current_settings(&self) -> EqSettings {
+        let fs = sys::default_output_sample_rate().unwrap_or(48_000.0) as f32;
+        let active = self.config.active();
+        let bands: &[Band] = active.map(|p| p.bands.as_slice()).unwrap_or(&[]);
+        let preamp = active.map(|p| p.preamp_db).unwrap_or(0.0);
+        EqSettings::new(bands, fs, preamp, self.config.limiter)
+    }
+
+    fn start_engine(&mut self) -> anyhow::Result<()> {
+        if self.engine.is_some() {
+            return Ok(());
+        }
+        let settings = self.current_settings();
+        match TapSession::start(CHANNELS, settings) {
+            Some(pair) => {
+                self.engine = Some(pair);
+                Ok(())
+            }
+            None => Err(anyhow::anyhow!(
+                "could not start the audio tap — needs macOS 14.2+ and audio-capture permission"
+            )),
+        }
+    }
+
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save()?;
-        // TODO(Spike 0): if the engine is running, re-design coefficients live.
+        if self.engine.is_some() {
+            let settings = self.current_settings();
+            if let Some((_, handle)) = &self.engine {
+                handle.store(settings); // lock-free live update
+            }
+        }
         Ok(())
     }
 
     fn status(&self) -> Status {
         let active = self.config.active();
+        let output_device = self.engine.as_ref().map(|_| match sys::default_output_device() {
+            Some(id) => format!("#{id}"),
+            None => "unknown".to_string(),
+        });
         Status {
-            enabled: self.enabled,
+            enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
             preamp_db: active.map(|p| p.preamp_db).unwrap_or(0.0),
             band_count: active.map(|p| p.bands.len()).unwrap_or(0),
             limiter: self.config.limiter,
-            output_device: None,
+            output_device,
         }
     }
 }

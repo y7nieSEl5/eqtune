@@ -253,6 +253,71 @@ impl Equalizer {
     }
 }
 
+/// An immutable snapshot of everything the real-time processor needs: a biquad
+/// coefficient set per band, a linear preamp gain, and the limiter flag. Cheap to
+/// share and swapped atomically, so the control thread can update the EQ live without
+/// ever locking the audio thread.
+#[derive(Clone, Debug)]
+pub struct EqSettings {
+    pub coeffs: Vec<Coeffs>,
+    pub preamp: f32,
+    pub limiter: bool,
+}
+
+impl EqSettings {
+    /// Design coefficients for `bands` at sample rate `fs` (Hz).
+    pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
+        Self {
+            coeffs: bands.iter().map(|b| Coeffs::design(b, fs)).collect(),
+            preamp: db_to_lin(preamp_db),
+            limiter,
+        }
+    }
+}
+
+/// Real-time, audio-thread-local filter state. Each block it syncs its biquad
+/// coefficients to the supplied [`EqSettings`] (filter memory persists across updates
+/// of the same band count, so live edits don't click) and processes in place.
+pub struct Processor {
+    channels: Vec<Vec<Biquad>>,
+}
+
+impl Processor {
+    pub fn new(channels: usize) -> Self {
+        Self { channels: vec![Vec::new(); channels] }
+    }
+
+    pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) {
+        if channels == 0 {
+            return;
+        }
+        let n = settings.coeffs.len();
+        for cascade in self.channels.iter_mut() {
+            if cascade.len() != n {
+                cascade.resize(n, Biquad::new(Coeffs::identity()));
+            }
+            for (bq, c) in cascade.iter_mut().zip(settings.coeffs.iter()) {
+                bq.set_coeffs(*c);
+            }
+        }
+        let frames = buf.len() / channels;
+        let active = channels.min(self.channels.len());
+        for frame in 0..frames {
+            for ch in 0..active {
+                let idx = frame * channels + ch;
+                let mut s = buf[idx] * settings.preamp;
+                for bq in self.channels[ch].iter_mut() {
+                    s = bq.process(s);
+                }
+                if settings.limiter {
+                    s = soft_clip(s);
+                }
+                buf[idx] = s;
+            }
+        }
+    }
+}
+
 /// The built-in "default" curve — a 9-band, graphic-EQ-style tuning from the user:
 /// a broad ~-5 dB low/low-mid cut, a scoop through 1-2 kHz to tame harsh mids, a small
 /// lift of air up top, with +7 dB make-up gain ([`DEFAULT_PREAMP_DB`]).
@@ -323,6 +388,24 @@ mod tests {
         let c = Coeffs::design(&band, fs);
         assert!((db(c.magnitude(5.0, fs)) - (-5.0)).abs() < 0.5, "dc shelf");
         assert!(db(c.magnitude(20_000.0, fs)).abs() < 0.5, "near nyquist flat");
+    }
+
+    #[test]
+    fn processor_applies_and_handles_band_count_change() {
+        let mut p = Processor::new(2);
+        let s9 = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let mut buf = vec![0.3f32; 512 * 2];
+        p.run(&s9, &mut buf, 2);
+        assert!(buf.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
+        // Shrink to one band — the cascade must resize without panicking.
+        let s1 = EqSettings::new(
+            &[Band { kind: BandKind::Peaking, freq: 3000.0, gain_db: 4.0, q: 2.0 }],
+            48_000.0,
+            0.0,
+            false,
+        );
+        p.run(&s1, &mut buf, 2);
+        assert!(buf.iter().all(|x| x.is_finite()));
     }
 
     #[test]
