@@ -7,3 +7,4 @@ pub mod config;
 pub mod daemon;
 pub mod dsp;
 pub mod ipc;
+pub mod sys;
