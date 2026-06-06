@@ -78,15 +78,9 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Spike => {
             let fs = eqtune::sys::default_output_sample_rate().unwrap_or(48_000.0) as f32;
-            let eq = Box::new(dsp::Equalizer::new(
-                fs,
-                2,
-                dsp::default_bands(),
-                dsp::DEFAULT_PREAMP_DB,
-                true,
-            ));
-            match TapSession::start(eq) {
-                Some(_session) => {
+            let settings = dsp::EqSettings::new(&dsp::default_bands(), fs, dsp::DEFAULT_PREAMP_DB, true);
+            match TapSession::start(2, settings) {
+                Some((_session, _handle)) => {
                     println!("eqtune spike: system audio -> default-curve EQ -> output ({fs} Hz).");
                     println!("Play some audio. Press Ctrl-C to stop.");
                     loop {

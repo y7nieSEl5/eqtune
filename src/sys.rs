@@ -2,8 +2,11 @@
 //! This is the boundary between Rust and the macOS audio system.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
-use crate::dsp::Equalizer;
+use arc_swap::ArcSwap;
+
+use crate::dsp::{EqSettings, Processor};
 
 /// Matches `eqtune_process_cb` in `tap_shim.h`.
 type ProcessCb = extern "C" fn(ctx: *mut c_void, buffer: *mut f32, frames: u32, channels: u32);
@@ -34,43 +37,66 @@ pub fn default_output_sample_rate() -> Option<f64> {
     (rate > 0.0).then_some(rate)
 }
 
+/// Owned by the audio thread (via the raw pointer handed to the shim): the filter
+/// state plus a reader of the atomically-swappable settings.
+struct AudioState {
+    processor: Processor,
+    settings: Arc<ArcSwap<EqSettings>>,
+}
+
 /// Real-time callback invoked by the shim's IOProc to EQ one block in place.
 extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32, channels: u32) {
     if ctx.is_null() || buffer.is_null() || frames == 0 || channels == 0 {
         return;
     }
-    // SAFETY: `ctx` is the `Box<Equalizer>` interior owned by the live `TapSession`;
-    // the audio thread is its only accessor while the session is running.
-    let eq = unsafe { &mut *(ctx as *mut Equalizer) };
+    // SAFETY: `ctx` is the `Box<AudioState>` owned by the live `TapSession`; the audio
+    // thread is the only accessor of `processor` while the session is running.
+    let state = unsafe { &mut *(ctx as *mut AudioState) };
+    let settings = state.settings.load_full(); // cheap atomic Arc clone, no lock
     let len = frames as usize * channels as usize;
     let buf = unsafe { std::slice::from_raw_parts_mut(buffer, len) };
-    eq.process_interleaved(buf, channels as usize);
+    state.processor.run(&settings, buf, channels as usize);
+}
+
+/// Control-thread handle used to push fresh EQ settings to a running session,
+/// lock-free, without restarting the audio engine.
+#[derive(Clone)]
+pub struct EqHandle(Arc<ArcSwap<EqSettings>>);
+
+impl EqHandle {
+    pub fn store(&self, settings: EqSettings) {
+        self.0.store(Arc::new(settings));
+    }
 }
 
 /// A running capture→EQ→replay session. Audio stops when this is dropped.
 pub struct TapSession {
     raw: *mut RawSession,
-    // Keeps the Equalizer alive (and at a stable heap address) for the audio thread.
-    _eq: Box<Equalizer>,
+    // Keeps the audio-thread state alive (at a stable heap address) until stop.
+    _state: Box<AudioState>,
 }
 
 impl TapSession {
-    /// Start tapping system audio, applying `eq`, and replaying to the default output.
-    /// Returns `None` if the tap could not be created (see stderr for the reason).
-    pub fn start(mut eq: Box<Equalizer>) -> Option<Self> {
-        let ctx = (&mut *eq as *mut Equalizer).cast::<c_void>();
+    /// Start tapping system audio, applying `initial` settings, and replaying to the
+    /// default output. Returns the session plus an [`EqHandle`] for live updates, or
+    /// `None` if the tap could not be created (reason logged to stderr).
+    pub fn start(channels: usize, initial: EqSettings) -> Option<(Self, EqHandle)> {
+        let shared = Arc::new(ArcSwap::from_pointee(initial));
+        let handle = EqHandle(shared.clone());
+        let mut state = Box::new(AudioState { processor: Processor::new(channels), settings: shared });
+        let ctx = (&mut *state as *mut AudioState).cast::<c_void>();
         let raw = unsafe { eqtune_tap_start(process_trampoline, ctx) };
         if raw.is_null() {
             None
         } else {
-            Some(Self { raw, _eq: eq })
+            Some((Self { raw, _state: state }, handle))
         }
     }
 }
 
 impl Drop for TapSession {
     fn drop(&mut self) {
-        // Stops the audio thread before `_eq` is freed (no use-after-free).
+        // Stops the audio thread before `_state` is freed (no use-after-free).
         unsafe { eqtune_tap_stop(self.raw) };
     }
 }
