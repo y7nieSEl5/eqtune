@@ -1,22 +1,12 @@
 # eqtune
 
-A lightweight, system-wide audio equalizer for macOS — a single Rust binary you build
-and run yourself.
+A lightweight, system-wide audio equalizer for macOS.
 
 ## Why
 
-Mac speakers and headphone outputs are tuned conservatively out of the box — often
-mid-heavy and a bit flat, so music can sound closed-in. macOS has **no built-in
-system-wide EQ**, and the existing tools tend to be heavyweight: they install
-loopback/kernel drivers and *replace* your default output device, which breaks macOS's
-normal "switch to the headphones when I plug them in" behaviour.
+Mac speakers and headphone outputs are tuned conservatively out of the box — often mid-heavy and a bit flat, so music can sound closed-in. macOS has **no built-in system-wide EQ**, and the existing tools tend to be heavyweight: they install loopback/kernel drivers and *replace* your default output device, which breaks macOS's normal "switch to the headphones when I plug them in" behaviour.
 
-eqtune is the minimal alternative. It taps the system audio mix with Apple's modern
-**Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no code
-signing), applies a parametric EQ, and plays the result back to your **current** output
-device. Because it never hijacks the default device, plugging in EarPods or Bluetooth
-keeps working normally — eqtune just follows. It ships a few curated presets and lets
-you tweak any frequency yourself.
+eqtune taps the system audio mix with Apple's modern **Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no code signing), applies a parametric EQ, and plays the result back to your **current** output device. Because it never hijacks the default device, plugging in EarPods or Bluetooth keeps working normally. It ships a few curated presets and lets you tweak any frequency yourself.
 
 ## Requirements
 
@@ -24,29 +14,26 @@ you tweak any frequency yourself.
 - Xcode Command Line Tools — `xcode-select --install` (clang + CoreAudio)
 - Rust — https://rustup.rs
 
-No Apple Developer account, signing, or notarization: you build from source, and locally
-built code is never quarantined, so Gatekeeper never gets involved.
-
 ## Install
 
 From crates.io (once published):
 
 ```sh
-cargo install eqtune     # builds from source on your Mac
-eqtune install           # set up the launchd daemon (runs at login)
-eqtune on                # grant the audio-capture prompt, then enjoy
+cargo install eqtune     
+eqtune install           
+eqtune on                
 ```
 
 Or from a clone:
 
 ```sh
-git clone <repo> && cd eqtune
-make install             # cargo build --release + load the daemon
+cd eqtune
+make install             
 eqtune on
 ```
 
-On the first `eqtune on`, macOS asks for audio-capture permission — grant it.
-(Rebuilding changes the binary's ad-hoc signature, so macOS may re-ask; that's expected.)
+On the first `eqtune on`, macOS asks for audio-capture permission.
+(Rebuilding changes the binary's ad-hoc signature, so macOS may re-ask. That's expected.)
 
 ## Usage
 
@@ -60,24 +47,22 @@ eqtune reset                          # restore the shipped presets
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
-- Edits apply **live** (no audio restart) and persist to
-  `~/Library/Application Support/eqtune/config.toml`.
-- For the stock, no-eqtune Apple sound, use `eqtune off`.
+- Edits apply **live** (no audio restart) and persist to  `~/Library/Application Support/eqtune/config.toml`.
+- For the no-eqtune native Apple sound, use `eqtune off`.
 
 ## Presets
 
 | Preset | Character |
 |--------|-----------|
-| `bright` *(default)* | brighter, more presence; ships with −8 dB preamp to tame loudness |
-| `mellow` | warmer, bassier |
-| `pro` | crisp and detailed (a 28-band engineer curve) |
+| `bright` *(default)* | brighter, more presence |
+| `mellow` | warmer |
+| `pro` | crisp and detailed |
 
 Switch with `eqtune preset <name>`, then fine-tune live with `eqtune band` / `eqtune preamp`.
 
 ## Tweak your own
 
-The EQ is fully editable. `eqtune band` adds or updates a peaking filter at any
-frequency on the active preset:
+The EQ is fully editable. `eqtune band` adds or updates a peaking filter at any frequency on the active preset:
 
 ```sh
 eqtune band 2000 -6        # cut 2 kHz by 6 dB (default Q 1.41)
