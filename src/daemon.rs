@@ -1,9 +1,12 @@
 //! The long-running daemon: owns the config and the audio engine, and serves the
 //! control socket. `on`/`off` start/stop the Core Audio tap; live edits push fresh
-//! settings to the running engine lock-free (no audio restart).
+//! settings to the running engine lock-free; and a lightweight poll makes the engine
+//! follow the system default output device (so plugging in EarPods/Bluetooth "just
+//! works" without manually re-selecting output).
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::time::Duration;
 
 use crate::config::{Config, Preset};
 use crate::dsp::{Band, BandKind, EqSettings};
@@ -14,18 +17,22 @@ use crate::sys::{self, EqHandle, TapSession};
 const BAND_MATCH_HZ: f32 = 0.5;
 /// Channel count for the processor (stereo).
 const CHANNELS: usize = 2;
+/// How often the idle loop accepts connections and checks the default device.
+const POLL: Duration = Duration::from_millis(100);
 
 pub struct Daemon {
     config: Config,
     engine: Option<(TapSession, EqHandle)>,
+    /// (output device id, sample rate Hz) the running engine was built for.
+    engine_target: Option<(u32, u32)>,
 }
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self { config: Config::load()?, engine: None })
+        Ok(Self { config: Config::load()?, engine: None, engine_target: None })
     }
 
-    /// Bind the control socket and serve requests until the process is terminated.
+    /// Bind the control socket and serve requests; also follow default-device changes.
     pub fn run(mut self) -> anyhow::Result<()> {
         let path = ipc::socket_path();
         if let Some(parent) = path.parent() {
@@ -33,19 +40,23 @@ impl Daemon {
         }
         let _ = std::fs::remove_file(&path); // clear any stale socket
         let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
 
-        for conn in listener.incoming() {
-            match conn {
-                Ok(stream) => {
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false); // blocking for the short req/resp
                     if let Err(e) = self.handle(stream) {
                         eprintln!("connection error: {e}");
                     }
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => eprintln!("accept error: {e}"),
             }
+            self.follow_default_device();
+            std::thread::sleep(POLL);
         }
-        Ok(())
     }
 
     fn handle(&mut self, stream: UnixStream) -> anyhow::Result<()> {
@@ -83,6 +94,7 @@ impl Daemon {
             }
             Request::Disable => {
                 self.engine = None; // drops TapSession -> stops the audio thread
+                self.engine_target = None;
                 Ok(Response::Ok)
             }
             Request::ListPresets => Ok(Response::Presets {
@@ -137,9 +149,8 @@ impl Daemon {
             .ok_or_else(|| anyhow::anyhow!("active preset '{name}' is missing"))
     }
 
-    /// Build engine settings from the active preset and the output device's rate.
-    fn current_settings(&self) -> EqSettings {
-        let fs = sys::default_output_sample_rate().unwrap_or(48_000.0) as f32;
+    /// Build engine settings from the active preset at sample rate `fs` (Hz).
+    fn settings_for(&self, fs: f32) -> EqSettings {
         let active = self.config.active();
         let bands: &[Band] = active.map(|p| p.bands.as_slice()).unwrap_or(&[]);
         let preamp = active.map(|p| p.preamp_db).unwrap_or(0.0);
@@ -150,10 +161,12 @@ impl Daemon {
         if self.engine.is_some() {
             return Ok(());
         }
-        let settings = self.current_settings();
+        let (dev, rate) = current_target();
+        let settings = self.settings_for(rate as f32);
         match TapSession::start(CHANNELS, settings) {
             Some(pair) => {
                 self.engine = Some(pair);
+                self.engine_target = Some((dev, rate));
                 Ok(())
             }
             None => Err(anyhow::anyhow!(
@@ -162,10 +175,28 @@ impl Daemon {
         }
     }
 
+    /// Rebuild the engine if the system default output device (or its sample rate)
+    /// changed, so replay follows wherever audio is now meant to go.
+    fn follow_default_device(&mut self) {
+        if self.engine.is_none() {
+            return;
+        }
+        let current = current_target();
+        if self.engine_target != Some(current) {
+            eprintln!("default output changed to {current:?} — rebuilding engine");
+            self.engine = None;
+            self.engine_target = None;
+            if let Err(e) = self.start_engine() {
+                eprintln!("engine rebuild failed: {e}");
+            }
+        }
+    }
+
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save()?;
         if self.engine.is_some() {
-            let settings = self.current_settings();
+            let fs = self.engine_target.map(|(_, r)| r as f32).unwrap_or(48_000.0);
+            let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
                 handle.store(settings); // lock-free live update
             }
@@ -175,10 +206,10 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let active = self.config.active();
-        let output_device = self.engine.as_ref().map(|_| match sys::default_output_device() {
-            Some(id) => format!("#{id}"),
-            None => "unknown".to_string(),
-        });
+        let output_device = self
+            .engine_target
+            .filter(|_| self.engine.is_some())
+            .map(|(dev, _)| format!("#{dev}"));
         Status {
             enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
@@ -188,4 +219,11 @@ impl Daemon {
             output_device,
         }
     }
+}
+
+/// The current default output device and its (rounded) sample rate.
+fn current_target() -> (u32, u32) {
+    let dev = sys::default_output_device().unwrap_or(0);
+    let rate = sys::default_output_sample_rate().unwrap_or(48_000.0).round() as u32;
+    (dev, rate)
 }
