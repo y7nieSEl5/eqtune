@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.eqtune</string>
+    <key>CFBundleName</key>
+    <string>eqtune</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>eqtune captures system audio so it can apply your equalizer and play it back to your speakers or headphones.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>eqtune captures system audio so it can apply your equalizer and play it back to your speakers or headphones.</string>
+</dict>
+</plist>
