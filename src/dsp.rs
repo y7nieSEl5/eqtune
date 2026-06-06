@@ -253,17 +253,28 @@ impl Equalizer {
     }
 }
 
-/// The built-in "default" curve: scoop the low-mids to open up the soundstage, trim the
-/// lows to clean up distortion, and make up level with a preamp.
+/// The built-in "default" curve — a 9-band, graphic-EQ-style tuning from the user:
+/// a broad ~-5 dB low/low-mid cut, a scoop through 1-2 kHz to tame harsh mids, a small
+/// lift of air up top, with +7 dB make-up gain ([`DEFAULT_PREAMP_DB`]).
 ///
-/// NOTE: the exact 2 kHz cut depth came from the user's listening experiments ("pull
-/// 1–2 kHz down hard"); confirm freq/gain in tuning before release. It is pure data.
+/// Modeled as peaking filters at ~octave Q (the conventional graphic-EQ shape); pure
+/// data, tunable live via `eqtune band`.
 pub fn default_bands() -> Vec<Band> {
-    vec![
-        Band { kind: BandKind::LowShelf, freq: 110.0, gain_db: -5.0, q: 0.7 },
-        Band { kind: BandKind::Peaking, freq: 1000.0, gain_db: -10.0, q: 1.0 },
-        Band { kind: BandKind::Peaking, freq: 2000.0, gain_db: -25.0, q: 1.0 },
+    const Q: f32 = 1.41;
+    [
+        (32.0, -5.0),
+        (64.0, -5.0),
+        (125.0, -5.0),
+        (500.0, -5.0),
+        (1_000.0, -10.0),
+        (2_000.0, -15.0),
+        (4_000.0, -4.0),
+        (8_000.0, 2.0),
+        (16_000.0, 0.0),
     ]
+    .into_iter()
+    .map(|(freq, gain_db)| Band { kind: BandKind::Peaking, freq, gain_db, q: Q })
+    .collect()
 }
 
 /// Default make-up gain that pairs with [`default_bands`].
@@ -338,7 +349,7 @@ mod tests {
     #[test]
     fn live_band_edit_preserves_cascade() {
         let mut eq = Equalizer::new(44_100.0, 2, default_bands(), 0.0, false);
-        assert_eq!(eq.bands().len(), 3);
+        assert_eq!(eq.bands().len(), default_bands().len());
         eq.set_bands(vec![Band { kind: BandKind::Peaking, freq: 3000.0, gain_db: 4.0, q: 2.0 }]);
         assert_eq!(eq.bands().len(), 1);
         let mut buf = vec![0.25f32; 256 * 2];

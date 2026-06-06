@@ -94,7 +94,7 @@ mod tests {
     fn default_ships_user_curve() {
         let c = Config::default();
         let p = c.active().unwrap();
-        assert_eq!(p.bands.len(), 3);
+        assert_eq!(p.bands.len(), dsp::default_bands().len());
         assert_eq!(p.preamp_db, dsp::DEFAULT_PREAMP_DB);
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
