@@ -27,6 +27,16 @@ pub struct Config {
     pub presets: BTreeMap<String, Preset>,
 }
 
+/// Build a graphic-EQ-style preset (peaking filters at ~octave Q) from (freq_hz,
+/// gain_db) points.
+fn graphic(points: &[(f32, f32)]) -> Vec<Band> {
+    const Q: f32 = 1.41;
+    points
+        .iter()
+        .map(|&(freq, gain_db)| Band { kind: dsp::BandKind::Peaking, freq, gain_db, q: Q })
+        .collect()
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut presets = BTreeMap::new();
@@ -35,6 +45,55 @@ impl Default for Config {
             Preset { bands: dsp::default_bands(), preamp_db: dsp::DEFAULT_PREAMP_DB },
         );
         presets.insert("flat".to_string(), Preset { bands: Vec::new(), preamp_db: 0.0 });
+        // Candidate device tunings supplied by users (provisional names).
+        // NOTE: "air-desk" is all boosts — loud by design; it drives the limiter, so
+        // lower the preamp (e.g. `eqtune preamp -8`) while it's active if it distorts.
+        presets.insert(
+            "air-desk".to_string(),
+            Preset {
+                bands: graphic(&[
+                    (32.0, 7.5), (64.0, 9.0), (125.0, 11.0), (250.0, 7.5), (500.0, 4.0),
+                    (1000.0, 4.5), (2000.0, 7.5), (4000.0, 7.5), (8000.0, 9.5), (16000.0, 7.0),
+                ]),
+                preamp_db: 0.0,
+            },
+        );
+        presets.insert(
+            "air-lap".to_string(),
+            Preset {
+                bands: graphic(&[
+                    (32.0, 3.0), (64.0, 2.0), (125.0, 1.0), (250.0, -2.0), (500.0, -3.0),
+                    (1000.0, -4.0), (2000.0, -7.0), (4000.0, -1.0), (8000.0, 2.0), (16000.0, 2.0),
+                ]),
+                preamp_db: 0.0,
+            },
+        );
+        presets.insert(
+            "macbook-pro".to_string(),
+            Preset {
+                bands: graphic(&[
+                    (32.0, 3.0), (64.0, 4.0), (125.0, 3.0), (250.0, 2.0), (500.0, 0.0),
+                    (1000.0, -2.0), (2000.0, -4.0), (4000.0, 3.0), (8000.0, 6.0), (16000.0, 4.0),
+                ]),
+                preamp_db: 0.0,
+            },
+        );
+        // Sound-engineer 31-band 1/3-octave curve (sub-bass lift + deep 125 Hz notch).
+        // Best-effort parse of a hand-supplied spec; tweak by ear with `eqtune band`.
+        presets.insert(
+            "engineer".to_string(),
+            Preset {
+                bands: graphic(&[
+                    (20.0, 0.0), (25.0, 1.0), (31.5, 2.0), (40.0, 1.5), (50.0, 1.5), (63.0, 1.5),
+                    (80.0, -2.0), (100.0, -6.0), (125.0, -15.0), (160.0, -7.0), (200.0, -3.0),
+                    (250.0, -2.0), (315.0, -1.0), (400.0, -1.0), (500.0, 0.0), (630.0, 0.0),
+                    (800.0, 0.5), (1000.0, 0.75), (1250.0, 1.0), (1600.0, 0.75), (2000.0, 0.0),
+                    (2500.0, 0.75), (3150.0, 1.0), (4000.0, 1.0), (5000.0, 0.0), (6300.0, -1.0),
+                    (8000.0, 0.5), (10000.0, 0.5),
+                ]),
+                preamp_db: 0.0,
+            },
+        );
         Self {
             active_preset: "default".to_string(),
             limiter: true,
@@ -98,6 +157,17 @@ mod tests {
         assert_eq!(p.preamp_db, dsp::DEFAULT_PREAMP_DB);
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
+    }
+
+    #[test]
+    fn library_has_device_presets() {
+        let c = Config::default();
+        for name in ["default", "flat", "air-desk", "air-lap", "macbook-pro", "engineer"] {
+            assert!(c.presets.contains_key(name), "missing preset {name}");
+        }
+        assert_eq!(c.presets["air-desk"].bands.len(), 10);
+        assert_eq!(c.presets["macbook-pro"].bands.len(), 10);
+        assert_eq!(c.presets["engineer"].bands.len(), 28);
     }
 
     #[test]
