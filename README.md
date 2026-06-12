@@ -73,6 +73,38 @@ eqtune band-rm 2000        # remove the 2 kHz band
 eqtune preamp 4            # set the preamp to +4 dB
 ```
 
+## Battery & energy
+
+eqtune is an always-on background daemon that **taps all system audio and re-processes
+every block in real time**. That continuous work costs CPU, and on battery it adds up
+fast — stream music for a couple of hours and you'll see the charge drop noticeably
+quicker than with Apple's native audio path.
+
+> **FYI:** running a system-wide EQ **increases battery drain, sometimes dramatically.**
+> A continuously-running real-time audio pipeline simply uses more power than native
+> playback. If battery life matters to you, leave the Low Power Mode auto-off enabled
+> (the default) and run `eqtune off` when you don't need the EQ.
+
+**Low Power Mode auto-off.** When macOS switches on Low Power Mode, eqtune now tears the
+audio engine down automatically (the single biggest saving) and brings it back when Low
+Power Mode turns off. An explicit `eqtune on` still overrides and runs even under Low
+Power Mode; disable the behaviour entirely with `eqtune lowpower off`.
+
+**Lighter real-time processing.** Recent versions cut the per-block cost of the EQ so a
+long listening session draws less power:
+
+- **No redundant rebuilds** — filter coefficients are recomputed only when you actually
+  change the EQ, not on every audio block.
+- **No-op bands dropped** — bands sitting at 0 dB are mathematical "do nothing" filters;
+  they're removed from the live processing chain (the `pro` preset alone sheds ~5 of 28).
+- **Silence skipping** — when nothing is playing, the processor detects the silence and
+  does no per-sample work.
+
+These trim the overhead but can't remove it — system-wide real-time audio always costs
+some power. The largest remaining win, fully suspending the engine whenever no audio is
+playing at all, is on the roadmap. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the
+engine and signal path work.
+
 ## How it works
 
 ```
@@ -86,6 +118,9 @@ A launchd LaunchAgent runs the daemon; a Unix-socket CLI controls it. Putting th
 and the output device in a single aggregate device means they share one clock, so
 there's no resampling/drift to fight. A lightweight poll makes the engine follow
 default-device changes (plug in headphones and audio follows).
+
+For a deeper dive — the daemon/CLI split, the lock-free real-time DSP, the Objective-C
+Core Audio shim, and *why* it's built this way — see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Uninstall
 

@@ -1,5 +1,5 @@
 # Build-from-source install for eqtune — no code signing or Apple account needed.
-.PHONY: build install uninstall test
+.PHONY: build install uninstall test clean
 
 build:
 	cargo build --release
@@ -17,3 +17,6 @@ uninstall:
 
 test:
 	cargo test
+
+clean:
+	cargo clean
