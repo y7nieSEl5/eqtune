@@ -253,6 +253,11 @@ impl Equalizer {
     }
 }
 
+/// Bands within this many dB of flat are identity filters; they are dropped from the
+/// realtime coefficient set (see [`EqSettings::new`]) since they would cost a biquad per
+/// sample while contributing nothing audible.
+const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
+
 /// An immutable snapshot of everything the real-time processor needs: a biquad
 /// coefficient set per band, a linear preamp gain, and the limiter flag. Cheap to
 /// share and swapped atomically, so the control thread can update the EQ live without
@@ -265,14 +270,34 @@ pub struct EqSettings {
 }
 
 impl EqSettings {
-    /// Design coefficients for `bands` at sample rate `fs` (Hz).
+    /// Design coefficients for `bands` at sample rate `fs` (Hz). Bands at (essentially)
+    /// 0 dB are skipped: they are mathematically identity, so omitting them saves a
+    /// biquad per sample with no audible change.
     pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
         Self {
-            coeffs: bands.iter().map(|b| Coeffs::design(b, fs)).collect(),
+            coeffs: bands
+                .iter()
+                .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
+                .map(|b| Coeffs::design(b, fs))
+                .collect(),
             preamp: db_to_lin(preamp_db),
             limiter,
         }
     }
+}
+
+/// A block whose samples are all quieter than this (linear, ≈ −80 dBFS) counts as
+/// silent for the [`Processor`]'s silence-skip optimization.
+const SILENCE_THRESHOLD: f32 = 1e-4;
+/// The EQ is skipped only after this many consecutive silent blocks, so a hard cut to
+/// silence still renders the biquads' ring-out before we stop touching the buffer.
+const SILENCE_SKIP_BLOCKS: u32 = 3;
+
+/// Whether every sample in `buf` is below [`SILENCE_THRESHOLD`] (short-circuits on the
+/// first audible sample, so it is cheap on real audio).
+#[inline]
+fn block_is_silent(buf: &[f32]) -> bool {
+    buf.iter().all(|s| s.abs() < SILENCE_THRESHOLD)
 }
 
 /// Real-time, audio-thread-local filter state. Each block it syncs its biquad
@@ -280,26 +305,56 @@ impl EqSettings {
 /// of the same band count, so live edits don't click) and processes in place.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
+    /// Identity of the [`EqSettings`] last synced into the cascades. The daemon publishes
+    /// a fresh `Arc<EqSettings>` on every live edit (and keeps the prior one alive while
+    /// the audio thread holds it), so pointer identity is a sound "did it change?" signal
+    /// — letting us skip the per-block coefficient copy in the common steady state.
+    last_settings: *const EqSettings,
+    /// Consecutive near-silent blocks seen so far (gates the silence-skip).
+    silent_blocks: u32,
 }
 
 impl Processor {
     pub fn new(channels: usize) -> Self {
-        Self { channels: vec![Vec::new(); channels] }
+        Self {
+            channels: vec![Vec::new(); channels],
+            last_settings: std::ptr::null(),
+            silent_blocks: 0,
+        }
     }
 
     pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) {
         if channels == 0 {
             return;
         }
-        let n = settings.coeffs.len();
-        for cascade in self.channels.iter_mut() {
-            if cascade.len() != n {
-                cascade.resize(n, Biquad::new(Coeffs::identity()));
+        // Re-copy biquad coefficients only when `settings` actually changed (see
+        // `last_settings`); in steady state this skips dozens of copies per block.
+        let id = settings as *const EqSettings;
+        if id != self.last_settings {
+            let n = settings.coeffs.len();
+            for cascade in self.channels.iter_mut() {
+                if cascade.len() != n {
+                    cascade.resize(n, Biquad::new(Coeffs::identity()));
+                }
+                for (bq, c) in cascade.iter_mut().zip(settings.coeffs.iter()) {
+                    bq.set_coeffs(*c);
+                }
             }
-            for (bq, c) in cascade.iter_mut().zip(settings.coeffs.iter()) {
-                bq.set_coeffs(*c);
-            }
+            self.last_settings = id;
         }
+
+        // Skip the per-sample EQ on sustained silence: silent in → silent out, so once any
+        // filter ring-out has been rendered (after SILENCE_SKIP_BLOCKS) we can leave the
+        // already-correct buffer untouched and do no per-sample work.
+        if block_is_silent(buf) {
+            self.silent_blocks = self.silent_blocks.saturating_add(1);
+            if self.silent_blocks > SILENCE_SKIP_BLOCKS {
+                return;
+            }
+        } else {
+            self.silent_blocks = 0;
+        }
+
         let frames = buf.len() / channels;
         let active = channels.min(self.channels.len());
         for frame in 0..frames {
@@ -437,6 +492,36 @@ mod tests {
         assert_eq!(eq.bands().len(), 1);
         let mut buf = vec![0.25f32; 256 * 2];
         eq.process_interleaved(&mut buf, 2); // must not panic on resized cascade
+        assert!(buf.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn zero_db_bands_are_dropped_from_coeffs() {
+        let bands = vec![
+            Band { kind: BandKind::Peaking, freq: 100.0, gain_db: 0.0, q: 1.0 }, // identity -> dropped
+            Band { kind: BandKind::Peaking, freq: 1000.0, gain_db: 4.0, q: 1.0 }, // kept
+            Band { kind: BandKind::LowShelf, freq: 80.0, gain_db: 0.0, q: 0.7 }, // identity -> dropped
+        ];
+        let s = EqSettings::new(&bands, 48_000.0, 0.0, false);
+        assert_eq!(s.coeffs.len(), 1, "only the non-zero-gain band should produce a coefficient");
+    }
+
+    #[test]
+    fn sustained_silence_skips_then_resumes() {
+        let mut p = Processor::new(2);
+        let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+
+        // Past the skip threshold: silence stays silent (and the skip path is exercised).
+        for _ in 0..(SILENCE_SKIP_BLOCKS + 5) {
+            let mut buf = vec![0.0f32; 256 * 2];
+            p.run(&s, &mut buf, 2);
+            assert!(buf.iter().all(|x| *x == 0.0), "silent input must stay silent");
+        }
+
+        // Audio after silence must resume processing (preamp/EQ changes the samples).
+        let mut buf = vec![0.5f32; 256 * 2];
+        p.run(&s, &mut buf, 2);
+        assert!(buf.iter().any(|x| (*x - 0.5).abs() > 1e-6), "audio after silence must be EQ'd");
         assert!(buf.iter().all(|x| x.is_finite()));
     }
 }

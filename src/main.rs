@@ -1,7 +1,7 @@
 //! eqtune CLI entry point. Either runs the long-lived daemon or acts as a thin client
 //! that sends a single control request to it over the Unix socket.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use eqtune::daemon::Daemon;
 use eqtune::ipc::{self, Request, Response};
@@ -40,6 +40,8 @@ enum Command {
     /// Set the preamp make-up gain, in dB.
     #[command(allow_negative_numbers = true)]
     Preamp { db: f32 },
+    /// Toggle auto-off while macOS Low Power Mode is active (on/off).
+    Lowpower { state: Toggle },
     /// Reset all settings to the built-in default curve.
     Reset,
     /// Run the audio daemon in the foreground (used by the LaunchAgent).
@@ -55,6 +57,13 @@ enum Command {
     Install,
     /// Stop and remove the LaunchAgent.
     Uninstall,
+}
+
+/// An on/off argument for toggle subcommands (parsed as `on` / `off`).
+#[derive(Clone, Copy, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -126,6 +135,7 @@ fn to_request(cmd: Command) -> Request {
         Command::Band { freq, gain_db, q } => Request::SetBand { freq, gain_db, q },
         Command::BandRm { freq } => Request::RemoveBand { freq },
         Command::Preamp { db } => Request::SetPreamp(db),
+        Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
         Command::Reset => Request::Reset,
         Command::Daemon | Command::Install | Command::Uninstall | Command::Probe | Command::Spike => {
             unreachable!("handled above")
@@ -146,6 +156,8 @@ fn print_response(resp: &Response) {
                 "output device: {}",
                 s.output_device.as_deref().unwrap_or("(engine not running)")
             );
+            println!("low power:     {}", if s.low_power { "on" } else { "off" });
+            println!("auto-off LPM:  {}", if s.auto_off_low_power { "on" } else { "off" });
         }
         Response::Presets { active, names } => {
             for n in names {

@@ -25,11 +25,27 @@ pub struct Daemon {
     engine: Option<(TapSession, EqHandle)>,
     /// (output device id, sample rate Hz) the running engine was built for.
     engine_target: Option<(u32, u32)>,
+    /// The effective target: the audio engine should be running iff this is true.
+    /// `reconcile` starts/stops the engine to match it.
+    engine_target_on: bool,
+    /// The user's last explicit on/off, remembered across a Low-Power-Mode auto-off so it
+    /// can be restored when Low Power Mode clears.
+    user_intent: bool,
+    /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
+    low_power: bool,
 }
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
-        Ok(Self { config: Config::load()?, engine: None, engine_target: None })
+        Ok(Self {
+            config: Config::load()?,
+            engine: None,
+            engine_target: None,
+            engine_target_on: false,
+            user_intent: false,
+            // Seed from the real state so the first poll doesn't fire a spurious edge.
+            low_power: sys::low_power_enabled(),
+        })
     }
 
     /// Bind the control socket and serve requests; also follow default-device changes.
@@ -54,6 +70,7 @@ impl Daemon {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => eprintln!("accept error: {e}"),
             }
+            self.follow_low_power();
             self.follow_default_device();
             std::thread::sleep(POLL);
         }
@@ -89,12 +106,15 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
-                self.start_engine()?;
+                self.user_intent = true;
+                self.engine_target_on = true;
+                self.reconcile()?; // override: starts even while Low Power Mode is active
                 Ok(Response::Ok)
             }
             Request::Disable => {
-                self.engine = None; // drops TapSession -> stops the audio thread
-                self.engine_target = None;
+                self.user_intent = false;
+                self.engine_target_on = false;
+                self.reconcile()?; // drops the TapSession -> large energy drop
                 Ok(Response::Ok)
             }
             Request::ListPresets => Ok(Response::Presets {
@@ -133,6 +153,17 @@ impl Daemon {
                 self.persist_and_apply()?;
                 Ok(Response::Ok)
             }
+            Request::SetAutoOffLowPower(on) => {
+                self.config.auto_off_low_power = on;
+                self.config.save()?;
+                if on && self.low_power {
+                    self.engine_target_on = false; // apply the policy right now
+                } else if !on {
+                    self.engine_target_on = self.user_intent; // lift any LPM suppression
+                }
+                self.reconcile()?;
+                Ok(Response::Ok)
+            }
             Request::Reset => {
                 self.config = Config::default();
                 self.persist_and_apply()?;
@@ -155,6 +186,19 @@ impl Daemon {
         let bands: &[Band] = active.map(|p| p.bands.as_slice()).unwrap_or(&[]);
         let preamp = active.map(|p| p.preamp_db).unwrap_or(0.0);
         EqSettings::new(bands, fs, preamp, self.config.limiter)
+    }
+
+    /// Start or stop the audio engine so its running state matches `engine_target_on`.
+    /// Called on every state change (commands, Low-Power-Mode edges). Starting can fail
+    /// (no tap permission / unsupported macOS); stopping cannot.
+    fn reconcile(&mut self) -> anyhow::Result<()> {
+        if self.engine_target_on && self.engine.is_none() {
+            self.start_engine()?;
+        } else if !self.engine_target_on && self.engine.is_some() {
+            self.engine = None; // drops TapSession -> stops the audio thread
+            self.engine_target = None;
+        }
+        Ok(())
     }
 
     fn start_engine(&mut self) -> anyhow::Result<()> {
@@ -192,6 +236,29 @@ impl Daemon {
         }
     }
 
+    /// Follow macOS Low Power Mode: on entering LPM, auto-off the engine (a large energy
+    /// drop) while remembering the user's intent; on leaving LPM, restore that intent.
+    /// Edge-triggered, so a persistent start failure isn't retried every poll.
+    fn follow_low_power(&mut self) {
+        let now = sys::low_power_enabled();
+        if now == self.low_power {
+            return;
+        }
+        self.low_power = now;
+        if !self.config.auto_off_low_power {
+            return; // policy disabled: track the state but don't act
+        }
+        self.engine_target_on = if now { false } else { self.user_intent };
+        eprintln!(
+            "low power mode {} — eqtune {}",
+            if now { "on" } else { "off" },
+            if self.engine_target_on { "resuming" } else { "suspended" }
+        );
+        if let Err(e) = self.reconcile() {
+            eprintln!("engine reconcile failed: {e}");
+        }
+    }
+
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save()?;
         if self.engine.is_some() {
@@ -217,6 +284,8 @@ impl Daemon {
             band_count: active.map(|p| p.bands.len()).unwrap_or(0),
             limiter: self.config.limiter,
             output_device,
+            low_power: self.low_power,
+            auto_off_low_power: self.config.auto_off_low_power,
         }
     }
 }

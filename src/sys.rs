@@ -21,6 +21,8 @@ unsafe extern "C" {
     fn eqtune_default_output_device() -> u32;
     /// Nominal sample rate of the current default output device, or 0 on failure.
     fn eqtune_default_output_sample_rate() -> f64;
+    /// Whether macOS Low Power Mode is currently enabled.
+    fn eqtune_low_power_enabled() -> bool;
     fn eqtune_tap_start(cb: ProcessCb, ctx: *mut c_void) -> *mut RawSession;
     fn eqtune_tap_stop(session: *mut RawSession);
 }
@@ -35,6 +37,11 @@ pub fn default_output_device() -> Option<u32> {
 pub fn default_output_sample_rate() -> Option<f64> {
     let rate = unsafe { eqtune_default_output_sample_rate() };
     (rate > 0.0).then_some(rate)
+}
+
+/// Whether macOS Low Power Mode is currently enabled.
+pub fn low_power_enabled() -> bool {
+    unsafe { eqtune_low_power_enabled() }
 }
 
 /// Owned by the audio thread (via the raw pointer handed to the shim): the filter
@@ -52,7 +59,7 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     // SAFETY: `ctx` is the `Box<AudioState>` owned by the live `TapSession`; the audio
     // thread is the only accessor of `processor` while the session is running.
     let state = unsafe { &mut *(ctx as *mut AudioState) };
-    let settings = state.settings.load_full(); // cheap atomic Arc clone, no lock
+    let settings = state.settings.load(); // arc-swap Guard: borrow, no per-block Arc clone
     let len = frames as usize * channels as usize;
     let buf = unsafe { std::slice::from_raw_parts_mut(buffer, len) };
     state.processor.run(&settings, buf, channels as usize);

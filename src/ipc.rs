@@ -17,6 +17,7 @@ pub enum Request {
     SetBand { freq: f32, gain_db: f32, q: f32 },
     RemoveBand { freq: f32 },
     SetPreamp(f32),
+    SetAutoOffLowPower(bool),
     Reset,
 }
 
@@ -39,6 +40,10 @@ pub struct Status {
     pub limiter: bool,
     /// The real output device audio is being sent to (None until the engine runs).
     pub output_device: Option<String>,
+    /// Whether macOS Low Power Mode is currently active.
+    pub low_power: bool,
+    /// Whether the auto-off-on-Low-Power-Mode policy is enabled.
+    pub auto_off_low_power: bool,
 }
 
 /// Location of the control socket.
@@ -83,6 +88,7 @@ mod tests {
             Request::SetBand { freq: 1000.0, gain_db: -10.0, q: 1.0 },
             Request::RemoveBand { freq: 2000.0 },
             Request::SetPreamp(7.0),
+            Request::SetAutoOffLowPower(false),
         ];
         for r in reqs {
             let s = serde_json::to_string(&r).unwrap();
@@ -99,6 +105,8 @@ mod tests {
             band_count: 3,
             limiter: true,
             output_device: Some("MacBook Pro Speakers".into()),
+            low_power: false,
+            auto_off_low_power: true,
         };
         let resps = [
             Response::Ok,

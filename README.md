@@ -43,12 +43,14 @@ eqtune presets | preset <name>        # list / switch preset (applies live)
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
+eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune reset                          # restore the shipped presets
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
 - Edits apply **live** (no audio restart) and persist to  `~/Library/Application Support/eqtune/config.toml`.
 - For the no-eqtune native Apple sound, use `eqtune off`.
+- To save battery, eqtune **auto-disables while macOS Low Power Mode is on** and resumes when it turns off. An explicit `eqtune on` overrides this and runs even under Low Power Mode; turn the behaviour off entirely with `eqtune lowpower off`.
 
 ## Presets
 

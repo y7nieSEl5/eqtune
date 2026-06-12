@@ -24,7 +24,18 @@ pub struct Config {
     pub active_preset: String,
     pub limiter: bool,
     pub auto_follow_new_devices: bool,
+    /// Automatically disable the EQ engine while macOS Low Power Mode is active (an
+    /// explicit `eqtune on` still overrides it). Defaults on; absent in older config
+    /// files, hence the serde default.
+    #[serde(default = "default_true")]
+    pub auto_off_low_power: bool,
     pub presets: BTreeMap<String, Preset>,
+}
+
+/// Serde default for boolean fields that should be enabled when absent from an older
+/// config file.
+fn default_true() -> bool {
+    true
 }
 
 /// Build a graphic-EQ-style preset (peaking filters at ~octave Q) from (freq_hz,
@@ -83,6 +94,7 @@ impl Default for Config {
             active_preset: "bright".to_string(),
             limiter: true,
             auto_follow_new_devices: true,
+            auto_off_low_power: true,
             presets,
         }
     }
@@ -142,6 +154,7 @@ mod tests {
         assert!(!c.presets.contains_key("original"), "original should be removed");
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
+        assert!(c.auto_off_low_power);
     }
 
     #[test]
@@ -170,6 +183,22 @@ mod tests {
     fn load_missing_returns_default() {
         let p = Path::new("/nonexistent/eqtune-xyz/config.toml");
         assert_eq!(Config::load_from(p).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn missing_auto_off_low_power_defaults_true() {
+        // A config written before `auto_off_low_power` existed must still load.
+        let toml = r#"
+active_preset = "bright"
+limiter = true
+auto_follow_new_devices = true
+
+[presets.bright]
+preamp_db = -8.0
+bands = []
+"#;
+        let c: Config = toml::from_str(toml).unwrap();
+        assert!(c.auto_off_low_power, "absent field should default to true");
     }
 
     #[test]

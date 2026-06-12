@@ -54,6 +54,10 @@ double eqtune_default_output_sample_rate(void) {
     return (double)rate;
 }
 
+bool eqtune_low_power_enabled(void) {
+    return [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? true : false;
+}
+
 // --- helpers ---------------------------------------------------------------
 
 static AudioObjectID default_output_device(void) {

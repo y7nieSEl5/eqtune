@@ -1,6 +1,7 @@
 #ifndef EQTUNE_TAP_SHIM_H
 #define EQTUNE_TAP_SHIM_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -12,6 +13,9 @@ uint32_t eqtune_default_output_device(void);
 
 // Nominal sample rate of the current default output device (Hz), or 0 on failure.
 double eqtune_default_output_sample_rate(void);
+
+// true when macOS Low Power Mode is currently enabled.
+bool eqtune_low_power_enabled(void);
 
 // Called from the real-time audio thread to process captured audio in place.
 // `buffer` holds `frames * channels` interleaved 32-bit float samples.
