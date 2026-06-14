@@ -38,8 +38,8 @@ On the first `eqtune on`, macOS asks for audio-capture permission.
 ## Usage
 
 ```
-eqtune on | off | status             # start / stop / inspect
-eqtune presets | preset <name>        # list / switch preset (applies live)
+eqtune on | off | status              # start / stop / inspect
+eqtune presets | preset <name>        # list / switch preset (short: ls / p <name>)
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
@@ -48,6 +48,9 @@ eqtune reset                          # restore the shipped presets
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
+- `eqtune on` and every edit (`preset`/`band`/`band-rm`/`preamp`/`reset`) print the
+  resulting curve — the active preset, preamp, and each band — with the band you just
+  changed flagged. `eqtune off` confirms the native Apple audio path is restored.
 - Edits apply **live** (no audio restart) and persist to  `~/Library/Application Support/eqtune/config.toml`.
 - For the no-eqtune native Apple sound, use `eqtune off`.
 - To save battery, eqtune **auto-disables while macOS Low Power Mode is on** and resumes when it turns off. An explicit `eqtune on` overrides this and runs even under Low Power Mode; turn the behaviour off entirely with `eqtune lowpower off`.
@@ -60,7 +63,7 @@ eqtune install | uninstall            # manage the launchd daemon
 | `mellow` | warmer |
 | `pro` | crisp and detailed |
 
-Switch with `eqtune preset <name>`, then fine-tune live with `eqtune band` / `eqtune preamp`.
+Switch with `eqtune preset <name>` (or just `eqtune p <name>`), then fine-tune live with `eqtune band` / `eqtune preamp`.
 
 ## Tweak your own
 

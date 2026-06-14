@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::config::{Config, Preset};
 use crate::dsp::{Band, BandKind, EqSettings};
-use crate::ipc::{self, Request, Response, Status};
+use crate::ipc::{self, Request, Response, Status, Tuning};
 use crate::sys::{self, EqHandle, TapSession};
 
 /// Two bands count as "the same band" if their frequencies are this close (Hz).
@@ -109,7 +109,7 @@ impl Daemon {
                 self.user_intent = true;
                 self.engine_target_on = true;
                 self.reconcile()?; // override: starts even while Low Power Mode is active
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
                 self.user_intent = false;
@@ -127,7 +127,7 @@ impl Daemon {
                 }
                 self.config.active_preset = name;
                 self.persist_and_apply()?;
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
             Request::SetBand { freq, gain_db, q } => {
                 let preset = self.active_preset_mut()?;
@@ -139,19 +139,19 @@ impl Daemon {
                     preset.bands.sort_by(|a, b| a.freq.total_cmp(&b.freq));
                 }
                 self.persist_and_apply()?;
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
             Request::RemoveBand { freq } => {
                 self.active_preset_mut()?
                     .bands
                     .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
                 self.persist_and_apply()?;
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
             Request::SetPreamp(db) => {
                 self.active_preset_mut()?.preamp_db = db;
                 self.persist_and_apply()?;
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
             Request::SetAutoOffLowPower(on) => {
                 self.config.auto_off_low_power = on;
@@ -167,7 +167,7 @@ impl Daemon {
             Request::Reset => {
                 self.config = Config::default();
                 self.persist_and_apply()?;
-                Ok(Response::Ok)
+                Ok(Response::Tuning(self.tuning()))
             }
         }
     }
@@ -286,6 +286,18 @@ impl Daemon {
             output_device,
             low_power: self.low_power,
             auto_off_low_power: self.config.auto_off_low_power,
+        }
+    }
+
+    /// A snapshot of the active EQ tuning, returned after `on` and edits so the CLI can
+    /// print the resulting curve.
+    fn tuning(&self) -> Tuning {
+        let active = self.config.active();
+        Tuning {
+            enabled: self.engine.is_some(),
+            preset: self.config.active_preset.clone(),
+            preamp_db: active.map(|p| p.preamp_db).unwrap_or(0.0),
+            bands: active.map(|p| p.bands.clone()).unwrap_or_default(),
         }
     }
 }

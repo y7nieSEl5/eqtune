@@ -86,13 +86,15 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
                 SetPreamp(f32), SetAutoOffLowPower(bool), Reset }
-enum Response { Ok, Status(Status), Presets { … }, Error(String) }
+enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … }, Error(String) }
 ```
 
 A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a single line
 to `~/Library/Application Support/eqtune/eqtune.sock`, and reads one `Response` line back.
 The daemon's accept loop (`Daemon::run`) handles each connection, deserializes the
-request, mutates state, and replies.
+request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
+active preset, preamp, and bands) so the CLI can print the resulting curve; `Disable` and
+`SetAutoOffLowPower` reply `Ok` and the client renders the confirmation.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in

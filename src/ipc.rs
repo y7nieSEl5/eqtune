@@ -6,6 +6,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::Band;
+
 /// A command sent from the CLI client to the running daemon.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Request {
@@ -26,8 +28,25 @@ pub enum Request {
 pub enum Response {
     Ok,
     Status(Status),
+    /// The active tuning after `on` or any EQ edit, so the client can show the resulting
+    /// curve (preset, preamp, and bands).
+    Tuning(Tuning),
     Presets { active: String, names: Vec<String> },
     Error(String),
+}
+
+/// The active EQ tuning, returned so the CLI can print the current equalizer params
+/// after `eqtune on` and after each edit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct Tuning {
+    /// Whether the audio engine is currently running.
+    pub enabled: bool,
+    /// Name of the active preset.
+    pub preset: String,
+    /// The preset's preamp make-up gain (dB).
+    pub preamp_db: f32,
+    /// The preset's EQ bands, in frequency order.
+    pub bands: Vec<Band>,
 }
 
 /// A snapshot of daemon state, returned for `eqtune status`.
@@ -111,6 +130,25 @@ mod tests {
         let resps = [
             Response::Ok,
             Response::Status(st),
+            Response::Tuning(Tuning {
+                enabled: true,
+                preset: "bright".into(),
+                preamp_db: -8.0,
+                bands: vec![
+                    crate::dsp::Band {
+                        kind: crate::dsp::BandKind::Peaking,
+                        freq: 1000.0,
+                        gain_db: 4.5,
+                        q: 1.41,
+                    },
+                    crate::dsp::Band {
+                        kind: crate::dsp::BandKind::Peaking,
+                        freq: 8000.0,
+                        gain_db: 9.5,
+                        q: 1.41,
+                    },
+                ],
+            }),
             Response::Presets { active: "default".into(), names: vec!["default".into(), "flat".into()] },
             Response::Error("nope".into()),
         ];
