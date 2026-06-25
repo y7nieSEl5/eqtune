@@ -44,6 +44,8 @@ enum Command {
     Preamp { db: f32 },
     /// Toggle auto-off while macOS Low Power Mode is active (on/off).
     Lowpower { state: Toggle },
+    /// Toggle auto-off while no media is active (on/off).
+    Idle { state: Toggle },
     /// Reset all settings to the built-in default curve.
     Reset,
     /// Run the audio daemon in the foreground (used by the LaunchAgent).
@@ -94,7 +96,8 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Spike => {
             let fs = eqtune::sys::default_output_sample_rate().unwrap_or(48_000.0) as f32;
-            let settings = dsp::EqSettings::new(&dsp::default_bands(), fs, dsp::DEFAULT_PREAMP_DB, true);
+            let settings =
+                dsp::EqSettings::new(&dsp::default_bands(), fs, dsp::DEFAULT_PREAMP_DB, true);
             match TapSession::start(2, settings) {
                 Some((_session, _handle)) => {
                     println!("eqtune spike: system audio -> default-curve EQ -> output ({fs} Hz).");
@@ -134,14 +137,21 @@ fn to_request(cmd: &Command) -> Request {
         Command::Status => Request::Status,
         Command::Presets => Request::ListPresets,
         Command::Preset { name } => Request::SetPreset(name.clone()),
-        Command::Band { freq, gain_db, q } => {
-            Request::SetBand { freq: *freq, gain_db: *gain_db, q: *q }
-        }
+        Command::Band { freq, gain_db, q } => Request::SetBand {
+            freq: *freq,
+            gain_db: *gain_db,
+            q: *q,
+        },
         Command::BandRm { freq } => Request::RemoveBand { freq: *freq },
         Command::Preamp { db } => Request::SetPreamp(*db),
         Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
+        Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
         Command::Reset => Request::Reset,
-        Command::Daemon | Command::Install | Command::Uninstall | Command::Probe | Command::Spike => {
+        Command::Daemon
+        | Command::Install
+        | Command::Uninstall
+        | Command::Probe
+        | Command::Spike => {
             unreachable!("handled above")
         }
     }
@@ -164,7 +174,12 @@ fn print_response(cmd: &Command, resp: &Response) {
                     None
                 }
                 Command::Band { freq, gain_db, q } => {
-                    println!("band {} → {} (Q{})", fmt_freq(*freq), fmt_gain(*gain_db), fmt_q(*q));
+                    println!(
+                        "band {} → {} (Q{})",
+                        fmt_freq(*freq),
+                        fmt_gain(*gain_db),
+                        fmt_q(*q)
+                    );
                     Some(*freq)
                 }
                 Command::BandRm { freq } => {
@@ -186,7 +201,24 @@ fn print_response(cmd: &Command, resp: &Response) {
         Response::Ok => match cmd {
             Command::Off => println!("eqtune off — native Apple audio restored"),
             Command::Lowpower { state } => {
-                println!("auto-off in Low Power Mode: {}", if matches!(state, Toggle::On) { "on" } else { "off" });
+                println!(
+                    "auto-off in Low Power Mode: {}",
+                    if matches!(state, Toggle::On) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+            Command::Idle { state } => {
+                println!(
+                    "auto-off when idle: {}",
+                    if matches!(state, Toggle::On) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
             }
             _ => println!("ok"),
         },
@@ -201,7 +233,18 @@ fn print_response(cmd: &Command, resp: &Response) {
                 s.output_device.as_deref().unwrap_or("(engine not running)")
             );
             println!("low power:     {}", if s.low_power { "on" } else { "off" });
-            println!("auto-off LPM:  {}", if s.auto_off_low_power { "on" } else { "off" });
+            println!(
+                "auto-off LPM:  {}",
+                if s.auto_off_low_power { "on" } else { "off" }
+            );
+            println!(
+                "auto-off idle: {}",
+                if s.auto_off_idle { "on" } else { "off" }
+            );
+            println!(
+                "idle suspend:  {}",
+                if s.idle_suspended { "yes" } else { "no" }
+            );
         }
         Response::Presets { active, names } => {
             for n in names {
@@ -234,8 +277,17 @@ fn print_curve(t: &Tuning, changed: Option<f32>) {
             .map(|(i, _)| i)
     });
     for (i, b) in t.bands.iter().enumerate() {
-        let mark = if Some(i) == marked { "   ← changed" } else { "" };
-        println!("  {:>8}  {:>8}  Q{}{mark}", fmt_freq(b.freq), fmt_gain(b.gain_db), trim(b.q));
+        let mark = if Some(i) == marked {
+            "   ← changed"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>8}  {:>8}  Q{}{mark}",
+            fmt_freq(b.freq),
+            fmt_gain(b.gain_db),
+            trim(b.q)
+        );
     }
 }
 

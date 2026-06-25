@@ -19,6 +19,8 @@ const BAND_MATCH_HZ: f32 = 0.5;
 const CHANNELS: usize = 2;
 /// How often the idle loop accepts connections and checks the default device.
 const POLL: Duration = Duration::from_millis(100);
+/// How long captured audio must remain silent before the engine is suspended.
+const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
 
 pub struct Daemon {
     config: Config,
@@ -33,6 +35,9 @@ pub struct Daemon {
     user_intent: bool,
     /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
     low_power: bool,
+    /// Whether the engine is currently off because captured audio was silent long enough
+    /// to count as no active media.
+    idle_suspended: bool,
 }
 
 impl Daemon {
@@ -45,6 +50,7 @@ impl Daemon {
             user_intent: false,
             // Seed from the real state so the first poll doesn't fire a spurious edge.
             low_power: sys::low_power_enabled(),
+            idle_suspended: false,
         })
     }
 
@@ -71,6 +77,7 @@ impl Daemon {
                 Err(e) => eprintln!("accept error: {e}"),
             }
             self.follow_low_power();
+            self.follow_idle_activity();
             self.follow_default_device();
             std::thread::sleep(POLL);
         }
@@ -107,12 +114,14 @@ impl Daemon {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
                 self.user_intent = true;
+                self.idle_suspended = false;
                 self.engine_target_on = true;
                 self.reconcile()?; // override: starts even while Low Power Mode is active
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
                 self.user_intent = false;
+                self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
                 Ok(Response::Ok)
@@ -131,11 +140,20 @@ impl Daemon {
             }
             Request::SetBand { freq, gain_db, q } => {
                 let preset = self.active_preset_mut()?;
-                if let Some(b) = preset.bands.iter_mut().find(|b| (b.freq - freq).abs() < BAND_MATCH_HZ) {
+                if let Some(b) = preset
+                    .bands
+                    .iter_mut()
+                    .find(|b| (b.freq - freq).abs() < BAND_MATCH_HZ)
+                {
                     b.gain_db = gain_db;
                     b.q = q;
                 } else {
-                    preset.bands.push(Band { kind: BandKind::Peaking, freq, gain_db, q });
+                    preset.bands.push(Band {
+                        kind: BandKind::Peaking,
+                        freq,
+                        gain_db,
+                        q,
+                    });
                     preset.bands.sort_by(|a, b| a.freq.total_cmp(&b.freq));
                 }
                 self.persist_and_apply()?;
@@ -164,8 +182,21 @@ impl Daemon {
                 self.reconcile()?;
                 Ok(Response::Ok)
             }
+            Request::SetAutoOffIdle(on) => {
+                self.config.auto_off_idle = on;
+                self.config.save()?;
+                if !on && self.idle_suspended {
+                    self.idle_suspended = false;
+                    if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
+                        self.engine_target_on = true;
+                    }
+                }
+                self.reconcile()?;
+                Ok(Response::Ok)
+            }
             Request::Reset => {
                 self.config = Config::default();
+                self.idle_suspended = false;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -248,21 +279,70 @@ impl Daemon {
         if !self.config.auto_off_low_power {
             return; // policy disabled: track the state but don't act
         }
-        self.engine_target_on = if now { false } else { self.user_intent };
+        self.engine_target_on = if now {
+            false
+        } else {
+            self.user_intent && !self.idle_suspended
+        };
         eprintln!(
             "low power mode {} — eqtune {}",
             if now { "on" } else { "off" },
-            if self.engine_target_on { "resuming" } else { "suspended" }
+            if self.engine_target_on {
+                "resuming"
+            } else {
+                "suspended"
+            }
         );
         if let Err(e) = self.reconcile() {
             eprintln!("engine reconcile failed: {e}");
         }
     }
 
+    /// Suspend on sustained captured silence, then resume when Core Audio reports the
+    /// default output device running again. The resume probe only runs while suspended;
+    /// while the tap is active, eqtune itself keeps the output device running.
+    fn follow_idle_activity(&mut self) {
+        if !self.config.auto_off_idle || !self.user_intent {
+            return;
+        }
+
+        if let Some((_, handle)) = &self.engine {
+            let rate = self.engine_target.map(|(_, r)| r).unwrap_or(48_000);
+            let idle_frames = IDLE_SUSPEND_AFTER.as_secs().saturating_mul(rate as u64);
+            if handle.silent_frames() >= idle_frames {
+                self.idle_suspended = true;
+                self.engine_target_on = false;
+                eprintln!("no active media detected — eqtune suspended");
+                if let Err(e) = self.reconcile() {
+                    eprintln!("engine idle-suspend failed: {e}");
+                }
+            }
+            return;
+        }
+
+        if !self.idle_suspended {
+            return;
+        }
+        if self.config.auto_off_low_power && self.low_power {
+            return;
+        }
+        if sys::default_output_device_running() {
+            self.idle_suspended = false;
+            self.engine_target_on = true;
+            eprintln!("default output active — eqtune resuming");
+            if let Err(e) = self.reconcile() {
+                eprintln!("engine idle-resume failed: {e}");
+            }
+        }
+    }
+
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save()?;
         if self.engine.is_some() {
-            let fs = self.engine_target.map(|(_, r)| r as f32).unwrap_or(48_000.0);
+            let fs = self
+                .engine_target
+                .map(|(_, r)| r as f32)
+                .unwrap_or(48_000.0);
             let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
                 handle.store(settings); // lock-free live update
@@ -286,6 +366,8 @@ impl Daemon {
             output_device,
             low_power: self.low_power,
             auto_off_low_power: self.config.auto_off_low_power,
+            auto_off_idle: self.config.auto_off_idle,
+            idle_suspended: self.idle_suspended,
         }
     }
 
@@ -305,6 +387,8 @@ impl Daemon {
 /// The current default output device and its (rounded) sample rate.
 fn current_target() -> (u32, u32) {
     let dev = sys::default_output_device().unwrap_or(0);
-    let rate = sys::default_output_sample_rate().unwrap_or(48_000.0).round() as u32;
+    let rate = sys::default_output_sample_rate()
+        .unwrap_or(48_000.0)
+        .round() as u32;
     (dev, rate)
 }

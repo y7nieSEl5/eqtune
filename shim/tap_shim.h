@@ -17,6 +17,9 @@ double eqtune_default_output_sample_rate(void);
 // true when macOS Low Power Mode is currently enabled.
 bool eqtune_low_power_enabled(void);
 
+// true when the current default output device is running somewhere.
+bool eqtune_default_output_device_running(void);
+
 // Called from the real-time audio thread to process captured audio in place.
 // `buffer` holds `frames * channels` interleaved 32-bit float samples.
 typedef void (*eqtune_process_cb)(void *ctx, float *buffer, uint32_t frames, uint32_t channels);

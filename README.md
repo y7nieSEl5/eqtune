@@ -44,6 +44,7 @@ eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
+eqtune idle on | off                  # auto-off while no media is active (default on)
 eqtune reset                          # restore the shipped presets
 eqtune install | uninstall            # manage the launchd daemon
 ```
@@ -53,7 +54,10 @@ eqtune install | uninstall            # manage the launchd daemon
   changed flagged. `eqtune off` confirms the native Apple audio path is restored.
 - Edits apply **live** (no audio restart) and persist to  `~/Library/Application Support/eqtune/config.toml`.
 - For the no-eqtune native Apple sound, use `eqtune off`.
-- To save battery, eqtune **auto-disables while macOS Low Power Mode is on** and resumes when it turns off. An explicit `eqtune on` overrides this and runs even under Low Power Mode; turn the behaviour off entirely with `eqtune lowpower off`.
+- To save battery, eqtune **auto-disables while no media is active** and resumes when
+  playback starts again. It also auto-disables while macOS Low Power Mode is on and
+  resumes when it turns off. An explicit `eqtune on` overrides Low Power Mode; turn
+  these behaviours off with `eqtune idle off` or `eqtune lowpower off`.
 
 ## Presets
 
@@ -88,7 +92,11 @@ quicker than with Apple's native audio path.
 > playback. If battery life matters to you, leave the Low Power Mode auto-off enabled
 > (the default) and run `eqtune off` when you don't need the EQ.
 
-**Low Power Mode auto-off.** When macOS switches on Low Power Mode, eqtune now tears the
+**Idle auto-off.** When captured system audio stays silent, eqtune tears the audio engine
+down automatically and brings it back when the default output device reports active I/O
+again. Disable this behaviour with `eqtune idle off`.
+
+**Low Power Mode auto-off.** When macOS switches on Low Power Mode, eqtune tears the
 audio engine down automatically (the single biggest saving) and brings it back when Low
 Power Mode turns off. An explicit `eqtune on` still overrides and runs even under Low
 Power Mode; disable the behaviour entirely with `eqtune lowpower off`.
@@ -100,12 +108,11 @@ long listening session draws less power:
   change the EQ, not on every audio block.
 - **No-op bands dropped** — bands sitting at 0 dB are mathematical "do nothing" filters;
   they're removed from the live processing chain (the `pro` preset alone sheds ~5 of 28).
-- **Silence skipping** — when nothing is playing, the processor detects the silence and
-  does no per-sample work.
+- **Idle suspension and silence skipping** — when nothing is playing, eqtune can suspend
+  the engine entirely; before suspension, sustained silence also skips per-sample work.
 
 These trim the overhead but can't remove it — system-wide real-time audio always costs
-some power. The largest remaining win, fully suspending the engine whenever no audio is
-playing at all, is on the roadmap. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the
+some power while the engine is active. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the
 engine and signal path work.
 
 ## How it works

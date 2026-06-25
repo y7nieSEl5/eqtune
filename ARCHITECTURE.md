@@ -85,7 +85,7 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 ```rust
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
-                SetPreamp(f32), SetAutoOffLowPower(bool), Reset }
+                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool), Reset }
 enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … }, Error(String) }
 ```
 
@@ -93,8 +93,9 @@ A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a sing
 to `~/Library/Application Support/eqtune/eqtune.sock`, and reads one `Response` line back.
 The daemon's accept loop (`Daemon::run`) handles each connection, deserializes the
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
-active preset, preamp, and bands) so the CLI can print the resulting curve; `Disable` and
-`SetAutoOffLowPower` reply `Ok` and the client renders the confirmation.
+active preset, preamp, and bands) so the CLI can print the resulting curve; `Disable`,
+`SetAutoOffLowPower`, and `SetAutoOffIdle` reply `Ok` and the client renders the
+confirmation.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in
@@ -184,6 +185,7 @@ intent and *reconciles*:
 - `engine_target_on` — whether the engine *should* be running right now.
 - `user_intent` — your last explicit `on`/`off`, remembered across an automatic suspend.
 - `low_power` — the last-seen macOS Low Power Mode state.
+- `idle_suspended` — whether the engine is off because captured audio stayed silent.
 
 `reconcile()` simply makes reality match `engine_target_on`: start the engine if it should
 be on and isn't, drop it if it should be off and is. Every event routes through this:
@@ -192,6 +194,9 @@ be on and isn't, drop it if it should be off and is. Every event routes through 
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
   engine off (a large power saving) while remembering `user_intent`; leaving LPM restores
   it. An explicit `eqtune on` overrides and runs even under LPM.
+- `follow_idle_activity()` watches the audio thread's silent-frame counter while the
+  engine is running. After sustained silence it drops the engine; while suspended, it
+  polls Core Audio's default-output-device activity and resumes when playback starts.
 - `follow_default_device()` rebuilds the running engine when the output device changes.
 
 This is the same mechanism the energy work builds on (§7): "don't run the engine when we
@@ -206,16 +211,16 @@ inherently costs more power than Apple's native path — a long listening sessio
 will drain noticeably faster (see the README's *Battery & energy* section). The codebase
 attacks this on two fronts:
 
-- **Run the engine less.** Auto-off in Low Power Mode and on `eqtune off` tear the whole
-  Core Audio pipeline down — the biggest lever.
+- **Run the engine less.** Idle auto-off, Low Power Mode auto-off, and `eqtune off` tear
+  the whole Core Audio pipeline down — the biggest lever.
 - **Make each block cheaper.** The real-time `Processor` (a) re-copies filter coefficients
   only when the settings pointer actually changes (steady-state blocks do zero coefficient
   work), (b) drops 0 dB "identity" bands at design time so they cost no biquad, and (c)
   skips per-sample processing entirely during sustained silence.
 
-The largest remaining win — fully suspending the engine whenever *nothing at all* is
-playing (via a Core Audio "is anything playing" listener) — is future work, and the
-reconcile machine in §6 is built to extend into it.
+Idle suspension uses captured silence while running and Core Audio output-device activity
+while suspended. That keeps the implementation small, but it is still a practical proxy
+for "media is streaming" rather than a per-app media-session API.
 
 ---
 
@@ -223,7 +228,8 @@ reconcile machine in §6 is built to extend into it.
 
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
   named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
-  `auto_off_low_power`, …). It ships working defaults, so a first run needs no file.
+  `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
+  needs no file.
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
   binary to a stable location and bootstraps the agent.
@@ -302,11 +308,12 @@ practically reachable from Objective-C/C:
   uint32_t eqtune_default_output_device(void);
   double   eqtune_default_output_sample_rate(void);
   bool     eqtune_low_power_enabled(void);            // Foundation's NSProcessInfo
+  bool     eqtune_default_output_device_running(void);
   eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx);
   void     eqtune_tap_stop(eqtune_tap_session *session);
   ```
 
-  Rust calls these five functions through a small `extern "C"` block in `sys.rs`. The shim
+  Rust calls these functions through a small `extern "C"` block in `sys.rs`. The shim
   also gives us Low Power Mode detection (`NSProcessInfo.isLowPowerModeEnabled`) for free,
   since we're already in Foundation.
 

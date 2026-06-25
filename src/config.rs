@@ -29,6 +29,10 @@ pub struct Config {
     /// files, hence the serde default.
     #[serde(default = "default_true")]
     pub auto_off_low_power: bool,
+    /// Automatically disable the EQ engine after sustained silence and resume when the
+    /// default output device becomes active again.
+    #[serde(default = "default_true")]
+    pub auto_off_idle: bool,
     pub presets: BTreeMap<String, Preset>,
 }
 
@@ -44,7 +48,12 @@ fn graphic(points: &[(f32, f32)]) -> Vec<Band> {
     const Q: f32 = 1.41;
     points
         .iter()
-        .map(|&(freq, gain_db)| Band { kind: dsp::BandKind::Peaking, freq, gain_db, q: Q })
+        .map(|&(freq, gain_db)| Band {
+            kind: dsp::BandKind::Peaking,
+            freq,
+            gain_db,
+            q: Q,
+        })
         .collect()
 }
 
@@ -58,8 +67,16 @@ impl Default for Config {
             "bright".to_string(),
             Preset {
                 bands: graphic(&[
-                    (32.0, 7.5), (64.0, 9.0), (125.0, 11.0), (250.0, 7.5), (500.0, 4.0),
-                    (1000.0, 4.5), (2000.0, 7.5), (4000.0, 7.5), (8000.0, 9.5), (16000.0, 7.0),
+                    (32.0, 7.5),
+                    (64.0, 9.0),
+                    (125.0, 11.0),
+                    (250.0, 7.5),
+                    (500.0, 4.0),
+                    (1000.0, 4.5),
+                    (2000.0, 7.5),
+                    (4000.0, 7.5),
+                    (8000.0, 9.5),
+                    (16000.0, 7.0),
                 ]),
                 preamp_db: -8.0,
             },
@@ -68,8 +85,16 @@ impl Default for Config {
             "mellow".to_string(),
             Preset {
                 bands: graphic(&[
-                    (32.0, 3.0), (64.0, 2.0), (125.0, 1.0), (250.0, -2.0), (500.0, -3.0),
-                    (1000.0, -4.0), (2000.0, -7.0), (4000.0, -1.0), (8000.0, 2.0), (16000.0, 2.0),
+                    (32.0, 3.0),
+                    (64.0, 2.0),
+                    (125.0, 1.0),
+                    (250.0, -2.0),
+                    (500.0, -3.0),
+                    (1000.0, -4.0),
+                    (2000.0, -7.0),
+                    (4000.0, -1.0),
+                    (8000.0, 2.0),
+                    (16000.0, 2.0),
                 ]),
                 preamp_db: 0.0,
             },
@@ -80,12 +105,34 @@ impl Default for Config {
             "pro".to_string(),
             Preset {
                 bands: graphic(&[
-                    (20.0, 0.0), (25.0, 1.0), (31.5, 2.0), (40.0, 1.5), (50.0, 1.5), (63.0, 1.5),
-                    (80.0, -2.0), (100.0, -6.0), (125.0, -15.0), (160.0, -7.0), (200.0, -3.0),
-                    (250.0, -2.0), (315.0, -1.0), (400.0, -1.0), (500.0, 0.0), (630.0, 0.0),
-                    (800.0, 0.5), (1000.0, 0.75), (1250.0, 1.0), (1600.0, 0.75), (2000.0, 0.0),
-                    (2500.0, 0.75), (3150.0, 1.0), (4000.0, 1.0), (5000.0, 0.0), (6300.0, -1.0),
-                    (8000.0, 0.5), (10000.0, 0.5),
+                    (20.0, 0.0),
+                    (25.0, 1.0),
+                    (31.5, 2.0),
+                    (40.0, 1.5),
+                    (50.0, 1.5),
+                    (63.0, 1.5),
+                    (80.0, -2.0),
+                    (100.0, -6.0),
+                    (125.0, -15.0),
+                    (160.0, -7.0),
+                    (200.0, -3.0),
+                    (250.0, -2.0),
+                    (315.0, -1.0),
+                    (400.0, -1.0),
+                    (500.0, 0.0),
+                    (630.0, 0.0),
+                    (800.0, 0.5),
+                    (1000.0, 0.75),
+                    (1250.0, 1.0),
+                    (1600.0, 0.75),
+                    (2000.0, 0.0),
+                    (2500.0, 0.75),
+                    (3150.0, 1.0),
+                    (4000.0, 1.0),
+                    (5000.0, 0.0),
+                    (6300.0, -1.0),
+                    (8000.0, 0.5),
+                    (10000.0, 0.5),
                 ]),
                 preamp_db: 0.0,
             },
@@ -95,6 +142,7 @@ impl Default for Config {
             limiter: true,
             auto_follow_new_devices: true,
             auto_off_low_power: true,
+            auto_off_idle: true,
             presets,
         }
     }
@@ -151,10 +199,14 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.active_preset, "bright");
         assert_eq!(c.active().unwrap().bands.len(), 10);
-        assert!(!c.presets.contains_key("original"), "original should be removed");
+        assert!(
+            !c.presets.contains_key("original"),
+            "original should be removed"
+        );
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
         assert!(c.auto_off_low_power);
+        assert!(c.auto_off_idle);
     }
 
     #[test]
@@ -163,7 +215,14 @@ mod tests {
         for name in ["bright", "mellow", "pro"] {
             assert!(c.presets.contains_key(name), "missing preset {name}");
         }
-        for gone in ["flat", "macbook-pro", "original", "air-desk", "air-lap", "engineer"] {
+        for gone in [
+            "flat",
+            "macbook-pro",
+            "original",
+            "air-desk",
+            "air-lap",
+            "engineer",
+        ] {
             assert!(!c.presets.contains_key(gone), "{gone} should be gone");
         }
         assert_eq!(c.presets["bright"].bands.len(), 10);
@@ -187,7 +246,7 @@ mod tests {
 
     #[test]
     fn missing_auto_off_low_power_defaults_true() {
-        // A config written before `auto_off_low_power` existed must still load.
+        // A config written before `auto_off_low_power`/`auto_off_idle` existed must still load.
         let toml = r#"
 active_preset = "bright"
 limiter = true
@@ -199,6 +258,7 @@ bands = []
 "#;
         let c: Config = toml::from_str(toml).unwrap();
         assert!(c.auto_off_low_power, "absent field should default to true");
+        assert!(c.auto_off_idle, "absent field should default to true");
     }
 
     #[test]

@@ -40,7 +40,13 @@ pub struct Coeffs {
 impl Coeffs {
     /// Pass-through filter (unity at all frequencies).
     pub fn identity() -> Self {
-        Self { b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0 }
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        }
     }
 
     /// RBJ cookbook coefficients for `band` at sample rate `fs` (Hz).
@@ -100,7 +106,13 @@ impl Coeffs {
     }
 
     fn normalized(b0: f32, b1: f32, b2: f32, a0: f32, a1: f32, a2: f32) -> Self {
-        Self { b0: b0 / a0, b1: b1 / a0, b2: b2 / a0, a1: a1 / a0, a2: a2 / a0 }
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+        }
     }
 
     /// Magnitude response `|H(e^{jw})|` at frequency `f` (Hz). Used by tests and any
@@ -130,7 +142,11 @@ pub struct Biquad {
 
 impl Biquad {
     pub fn new(coeffs: Coeffs) -> Self {
-        Self { coeffs, z1: 0.0, z2: 0.0 }
+        Self {
+            coeffs,
+            z1: 0.0,
+            z2: 0.0,
+        }
     }
 
     pub fn set_coeffs(&mut self, coeffs: Coeffs) {
@@ -296,7 +312,7 @@ const SILENCE_SKIP_BLOCKS: u32 = 3;
 /// Whether every sample in `buf` is below [`SILENCE_THRESHOLD`] (short-circuits on the
 /// first audible sample, so it is cheap on real audio).
 #[inline]
-fn block_is_silent(buf: &[f32]) -> bool {
+pub(crate) fn block_is_silent(buf: &[f32]) -> bool {
     buf.iter().all(|s| s.abs() < SILENCE_THRESHOLD)
 }
 
@@ -393,7 +409,12 @@ pub fn default_bands() -> Vec<Band> {
         (16_000.0, 0.0),
     ]
     .into_iter()
-    .map(|(freq, gain_db)| Band { kind: BandKind::Peaking, freq, gain_db, q: Q })
+    .map(|(freq, gain_db)| Band {
+        kind: BandKind::Peaking,
+        freq,
+        gain_db,
+        q: Q,
+    })
     .collect()
 }
 
@@ -420,7 +441,12 @@ mod tests {
     fn peaking_center_gain_matches_design() {
         let fs = 48_000.0;
         for gain in [-25.0, -10.0, -5.0, 6.0, 12.0] {
-            let band = Band { kind: BandKind::Peaking, freq: 1000.0, gain_db: gain, q: 1.0 };
+            let band = Band {
+                kind: BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: gain,
+                q: 1.0,
+            };
             let c = Coeffs::design(&band, fs);
             let got = db(c.magnitude(1000.0, fs));
             assert!((got - gain).abs() < 0.1, "design {gain} dB, got {got} dB");
@@ -430,7 +456,12 @@ mod tests {
     #[test]
     fn peaking_is_unity_far_from_center() {
         let fs = 48_000.0;
-        let band = Band { kind: BandKind::Peaking, freq: 1000.0, gain_db: -25.0, q: 1.0 };
+        let band = Band {
+            kind: BandKind::Peaking,
+            freq: 1000.0,
+            gain_db: -25.0,
+            q: 1.0,
+        };
         let c = Coeffs::design(&band, fs);
         assert!(db(c.magnitude(60.0, fs)).abs() < 1.0);
         assert!(db(c.magnitude(16_000.0, fs)).abs() < 1.0);
@@ -439,10 +470,18 @@ mod tests {
     #[test]
     fn low_shelf_dc_and_nyquist() {
         let fs = 48_000.0;
-        let band = Band { kind: BandKind::LowShelf, freq: 110.0, gain_db: -5.0, q: 0.7 };
+        let band = Band {
+            kind: BandKind::LowShelf,
+            freq: 110.0,
+            gain_db: -5.0,
+            q: 0.7,
+        };
         let c = Coeffs::design(&band, fs);
         assert!((db(c.magnitude(5.0, fs)) - (-5.0)).abs() < 0.5, "dc shelf");
-        assert!(db(c.magnitude(20_000.0, fs)).abs() < 0.5, "near nyquist flat");
+        assert!(
+            db(c.magnitude(20_000.0, fs)).abs() < 0.5,
+            "near nyquist flat"
+        );
     }
 
     #[test]
@@ -454,7 +493,12 @@ mod tests {
         assert!(buf.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
         // Shrink to one band — the cascade must resize without panicking.
         let s1 = EqSettings::new(
-            &[Band { kind: BandKind::Peaking, freq: 3000.0, gain_db: 4.0, q: 2.0 }],
+            &[Band {
+                kind: BandKind::Peaking,
+                freq: 3000.0,
+                gain_db: 4.0,
+                q: 2.0,
+            }],
             48_000.0,
             0.0,
             false,
@@ -488,7 +532,12 @@ mod tests {
     fn live_band_edit_preserves_cascade() {
         let mut eq = Equalizer::new(44_100.0, 2, default_bands(), 0.0, false);
         assert_eq!(eq.bands().len(), default_bands().len());
-        eq.set_bands(vec![Band { kind: BandKind::Peaking, freq: 3000.0, gain_db: 4.0, q: 2.0 }]);
+        eq.set_bands(vec![Band {
+            kind: BandKind::Peaking,
+            freq: 3000.0,
+            gain_db: 4.0,
+            q: 2.0,
+        }]);
         assert_eq!(eq.bands().len(), 1);
         let mut buf = vec![0.25f32; 256 * 2];
         eq.process_interleaved(&mut buf, 2); // must not panic on resized cascade
@@ -498,12 +547,31 @@ mod tests {
     #[test]
     fn zero_db_bands_are_dropped_from_coeffs() {
         let bands = vec![
-            Band { kind: BandKind::Peaking, freq: 100.0, gain_db: 0.0, q: 1.0 }, // identity -> dropped
-            Band { kind: BandKind::Peaking, freq: 1000.0, gain_db: 4.0, q: 1.0 }, // kept
-            Band { kind: BandKind::LowShelf, freq: 80.0, gain_db: 0.0, q: 0.7 }, // identity -> dropped
+            Band {
+                kind: BandKind::Peaking,
+                freq: 100.0,
+                gain_db: 0.0,
+                q: 1.0,
+            }, // identity -> dropped
+            Band {
+                kind: BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: 4.0,
+                q: 1.0,
+            }, // kept
+            Band {
+                kind: BandKind::LowShelf,
+                freq: 80.0,
+                gain_db: 0.0,
+                q: 0.7,
+            }, // identity -> dropped
         ];
         let s = EqSettings::new(&bands, 48_000.0, 0.0, false);
-        assert_eq!(s.coeffs.len(), 1, "only the non-zero-gain band should produce a coefficient");
+        assert_eq!(
+            s.coeffs.len(),
+            1,
+            "only the non-zero-gain band should produce a coefficient"
+        );
     }
 
     #[test]
@@ -515,13 +583,19 @@ mod tests {
         for _ in 0..(SILENCE_SKIP_BLOCKS + 5) {
             let mut buf = vec![0.0f32; 256 * 2];
             p.run(&s, &mut buf, 2);
-            assert!(buf.iter().all(|x| *x == 0.0), "silent input must stay silent");
+            assert!(
+                buf.iter().all(|x| *x == 0.0),
+                "silent input must stay silent"
+            );
         }
 
         // Audio after silence must resume processing (preamp/EQ changes the samples).
         let mut buf = vec![0.5f32; 256 * 2];
         p.run(&s, &mut buf, 2);
-        assert!(buf.iter().any(|x| (*x - 0.5).abs() > 1e-6), "audio after silence must be EQ'd");
+        assert!(
+            buf.iter().any(|x| (*x - 0.5).abs() > 1e-6),
+            "audio after silence must be EQ'd"
+        );
         assert!(buf.iter().all(|x| x.is_finite()));
     }
 }

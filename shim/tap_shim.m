@@ -58,6 +58,22 @@ bool eqtune_low_power_enabled(void) {
     return [[NSProcessInfo processInfo] isLowPowerModeEnabled] ? true : false;
 }
 
+bool eqtune_default_output_device_running(void) {
+    AudioObjectID dev = (AudioObjectID)eqtune_default_output_device();
+    if (dev == kAudioObjectUnknown || dev == 0) {
+        return false;
+    }
+    UInt32 running = 0;
+    UInt32 size = sizeof(running);
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    OSStatus status = AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &running);
+    return status == noErr && running != 0;
+}
+
 // --- helpers ---------------------------------------------------------------
 
 static AudioObjectID default_output_device(void) {

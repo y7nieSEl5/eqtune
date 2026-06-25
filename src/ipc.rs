@@ -20,6 +20,7 @@ pub enum Request {
     RemoveBand { freq: f32 },
     SetPreamp(f32),
     SetAutoOffLowPower(bool),
+    SetAutoOffIdle(bool),
     Reset,
 }
 
@@ -31,7 +32,10 @@ pub enum Response {
     /// The active tuning after `on` or any EQ edit, so the client can show the resulting
     /// curve (preset, preamp, and bands).
     Tuning(Tuning),
-    Presets { active: String, names: Vec<String> },
+    Presets {
+        active: String,
+        names: Vec<String>,
+    },
     Error(String),
 }
 
@@ -63,6 +67,10 @@ pub struct Status {
     pub low_power: bool,
     /// Whether the auto-off-on-Low-Power-Mode policy is enabled.
     pub auto_off_low_power: bool,
+    /// Whether sustained no-media/no-signal idle suspension is enabled.
+    pub auto_off_idle: bool,
+    /// Whether the engine is currently suspended because no media is active.
+    pub idle_suspended: bool,
 }
 
 /// Location of the control socket.
@@ -104,10 +112,15 @@ mod tests {
             Request::Reset,
             Request::ListPresets,
             Request::SetPreset("flat".into()),
-            Request::SetBand { freq: 1000.0, gain_db: -10.0, q: 1.0 },
+            Request::SetBand {
+                freq: 1000.0,
+                gain_db: -10.0,
+                q: 1.0,
+            },
             Request::RemoveBand { freq: 2000.0 },
             Request::SetPreamp(7.0),
             Request::SetAutoOffLowPower(false),
+            Request::SetAutoOffIdle(false),
         ];
         for r in reqs {
             let s = serde_json::to_string(&r).unwrap();
@@ -126,6 +139,8 @@ mod tests {
             output_device: Some("MacBook Pro Speakers".into()),
             low_power: false,
             auto_off_low_power: true,
+            auto_off_idle: true,
+            idle_suspended: false,
         };
         let resps = [
             Response::Ok,
@@ -149,7 +164,10 @@ mod tests {
                     },
                 ],
             }),
-            Response::Presets { active: "default".into(), names: vec!["default".into(), "flat".into()] },
+            Response::Presets {
+                active: "default".into(),
+                names: vec!["default".into(), "flat".into()],
+            },
             Response::Error("nope".into()),
         ];
         for r in resps {
