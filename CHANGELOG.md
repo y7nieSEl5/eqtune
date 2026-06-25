@@ -13,11 +13,12 @@ This project follows [Semantic Versioning](https://semver.org/).
   reports active I/O again.
 - Safer validation for EQ edits: band frequency, band gain, Q, and preamp values must be
   finite and inside practical audio ranges before they are persisted or applied live.
+- Preset management commands: `preset-save`, `preset-clone`, `preset-rename`, and
+  `preset-rm` for creating and managing user-tuned variants.
 
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.
-- Preset clone/save/delete/rename commands for managing user-tuned variants.
 - `eqtune curve` / `eqtune preset-show [name]` to print EQ bands without changing state.
 - CLI support for low-shelf and high-shelf bands, not just peaking filters.
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.

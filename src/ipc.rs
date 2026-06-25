@@ -16,6 +16,10 @@ pub enum Request {
     Disable,
     ListPresets,
     SetPreset(String),
+    SavePreset { name: String },
+    ClonePreset { source: String, dest: String },
+    DeletePreset { name: String },
+    RenamePreset { from: String, to: String },
     SetBand { freq: f32, gain_db: f32, q: f32 },
     RemoveBand { freq: f32 },
     SetPreamp(f32),
@@ -112,6 +116,18 @@ mod tests {
             Request::Reset,
             Request::ListPresets,
             Request::SetPreset("flat".into()),
+            Request::SavePreset { name: "car".into() },
+            Request::ClonePreset {
+                source: "bright".into(),
+                dest: "desk".into(),
+            },
+            Request::DeletePreset {
+                name: "desk".into(),
+            },
+            Request::RenamePreset {
+                from: "car".into(),
+                to: "car-v2".into(),
+            },
             Request::SetBand {
                 freq: 1000.0,
                 gain_db: -10.0,

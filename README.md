@@ -40,6 +40,10 @@ On the first `eqtune on`, macOS asks for audio-capture permission.
 ```
 eqtune on | off | status              # start / stop / inspect
 eqtune presets | preset <name>        # list / switch preset (short: ls / p <name>)
+eqtune preset-save <name>             # save active tuning as a new preset
+eqtune preset-clone <src> <name>      # clone a preset and switch to the clone
+eqtune preset-rename <old> <new>      # rename a preset
+eqtune preset-rm <name>               # delete a preset
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
@@ -68,6 +72,10 @@ eqtune install | uninstall            # manage the launchd daemon
 | `pro` | crisp and detailed |
 
 Switch with `eqtune preset <name>` (or just `eqtune p <name>`), then fine-tune live with `eqtune band` / `eqtune preamp`.
+Use `eqtune preset-clone bright my-bright` before editing if you want to keep the shipped
+preset untouched, or `eqtune preset-save <name>` to save the current active tuning under
+a new name. New preset names use ASCII letters, digits, `-`, `_`, or `.`, and never
+overwrite an existing preset.
 
 ## Tweak your own
 

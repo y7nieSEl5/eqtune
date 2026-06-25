@@ -29,6 +29,7 @@ const MIN_Q: f32 = 0.1;
 const MAX_Q: f32 = 10.0;
 const MIN_PREAMP_DB: f32 = -60.0;
 const MAX_PREAMP_DB: f32 = 12.0;
+const MAX_PRESET_NAME_LEN: usize = 64;
 
 pub struct Daemon {
     config: Config,
@@ -143,6 +144,29 @@ impl Daemon {
                     return Ok(Response::Error(format!("no such preset: {name}")));
                 }
                 self.config.active_preset = name;
+                self.persist_and_apply()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::SavePreset { name } => {
+                save_active_preset(&mut self.config, &name)?;
+                self.persist_and_apply()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::ClonePreset { source, dest } => {
+                clone_preset(&mut self.config, &source, &dest)?;
+                self.persist_and_apply()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::DeletePreset { name } => {
+                delete_preset(&mut self.config, &name)?;
+                self.persist_and_apply()?;
+                Ok(Response::Presets {
+                    active: self.config.active_preset.clone(),
+                    names: self.config.presets.keys().cloned().collect(),
+                })
+            }
+            Request::RenamePreset { from, to } => {
+                rename_preset(&mut self.config, &from, &to)?;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -419,6 +443,97 @@ fn validate_preamp(db: f32) -> anyhow::Result<()> {
     validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
 }
 
+fn save_active_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
+    validate_new_preset_name(config, name)?;
+    let preset = config
+        .active()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no active preset to save"))?;
+    config.presets.insert(name.to_string(), preset);
+    config.active_preset = name.to_string();
+    Ok(())
+}
+
+fn clone_preset(config: &mut Config, source: &str, dest: &str) -> anyhow::Result<()> {
+    validate_new_preset_name(config, dest)?;
+    let preset = config
+        .presets
+        .get(source)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no such preset: {source}"))?;
+    config.presets.insert(dest.to_string(), preset);
+    config.active_preset = dest.to_string();
+    Ok(())
+}
+
+fn delete_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
+    if !config.presets.contains_key(name) {
+        return Err(anyhow::anyhow!("no such preset: {name}"));
+    }
+    if config.presets.len() == 1 {
+        return Err(anyhow::anyhow!("cannot delete the last preset"));
+    }
+    config.presets.remove(name);
+    if config.active_preset == name {
+        config.active_preset = config
+            .presets
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no presets remain"))?;
+    }
+    Ok(())
+}
+
+fn rename_preset(config: &mut Config, from: &str, to: &str) -> anyhow::Result<()> {
+    let preset = config
+        .presets
+        .remove(from)
+        .ok_or_else(|| anyhow::anyhow!("no such preset: {from}"))?;
+    if let Err(e) = validate_new_preset_name(config, to) {
+        config.presets.insert(from.to_string(), preset);
+        return Err(e);
+    }
+    config.presets.insert(to.to_string(), preset);
+    if config.active_preset == from {
+        config.active_preset = to.to_string();
+    }
+    Ok(())
+}
+
+fn validate_new_preset_name(config: &Config, name: &str) -> anyhow::Result<()> {
+    validate_preset_name(name)?;
+    if config.presets.contains_key(name) {
+        return Err(anyhow::anyhow!("preset already exists: {name}"));
+    }
+    Ok(())
+}
+
+fn validate_preset_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() {
+        return Err(anyhow::anyhow!("preset name must not be empty"));
+    }
+    if name.len() > MAX_PRESET_NAME_LEN {
+        return Err(anyhow::anyhow!(
+            "preset name must be at most {MAX_PRESET_NAME_LEN} characters"
+        ));
+    }
+    if name != name.trim() {
+        return Err(anyhow::anyhow!(
+            "preset name must not have leading or trailing whitespace"
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(anyhow::anyhow!(
+            "preset name may only contain ASCII letters, digits, '-', '_', or '.'"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_range(name: &str, value: f32, min: f32, max: f32, unit: &str) -> anyhow::Result<()> {
     if !value.is_finite() {
         return Err(anyhow::anyhow!("{name} must be a finite number"));
@@ -486,5 +601,62 @@ mod tests {
         for db in [-60.1, 12.1, f32::NAN, f32::INFINITY] {
             assert!(validate_preamp(db).is_err());
         }
+    }
+
+    #[test]
+    fn preset_save_clones_active_and_selects_new_preset() {
+        let mut c = Config::default();
+        let active = c.active().cloned().unwrap();
+        save_active_preset(&mut c, "car").unwrap();
+        assert_eq!(c.active_preset, "car");
+        assert_eq!(c.presets["car"], active);
+    }
+
+    #[test]
+    fn preset_clone_copies_source_and_selects_dest() {
+        let mut c = Config::default();
+        let source = c.presets["mellow"].clone();
+        clone_preset(&mut c, "mellow", "night").unwrap();
+        assert_eq!(c.active_preset, "night");
+        assert_eq!(c.presets["night"], source);
+    }
+
+    #[test]
+    fn preset_delete_removes_active_and_selects_another() {
+        let mut c = Config::default();
+        c.active_preset = "mellow".into();
+        delete_preset(&mut c, "mellow").unwrap();
+        assert!(!c.presets.contains_key("mellow"));
+        assert!(c.presets.contains_key(&c.active_preset));
+    }
+
+    #[test]
+    fn preset_delete_rejects_last_preset() {
+        let mut c = Config::default();
+        c.presets.retain(|name, _| name == "bright");
+        c.active_preset = "bright".into();
+        assert!(delete_preset(&mut c, "bright").is_err());
+        assert!(c.presets.contains_key("bright"));
+    }
+
+    #[test]
+    fn preset_rename_moves_preset_and_updates_active_name() {
+        let mut c = Config::default();
+        c.active_preset = "bright".into();
+        let bright = c.presets["bright"].clone();
+        rename_preset(&mut c, "bright", "daily").unwrap();
+        assert!(!c.presets.contains_key("bright"));
+        assert_eq!(c.active_preset, "daily");
+        assert_eq!(c.presets["daily"], bright);
+    }
+
+    #[test]
+    fn preset_names_are_restricted_for_new_presets() {
+        let c = Config::default();
+        for name in ["", "two words", " lead", "trail ", "emoji-☃"] {
+            assert!(validate_new_preset_name(&c, name).is_err());
+        }
+        assert!(validate_new_preset_name(&c, "bright").is_err());
+        assert!(validate_new_preset_name(&c, "daily.v2").is_ok());
     }
 }

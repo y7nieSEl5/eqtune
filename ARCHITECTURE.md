@@ -84,6 +84,8 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 
 ```rust
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
+                SavePreset { name }, ClonePreset { source, dest },
+                DeletePreset { name }, RenamePreset { from, to },
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
                 SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool), Reset }
 enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … }, Error(String) }
@@ -93,16 +95,18 @@ A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a sing
 to `~/Library/Application Support/eqtune/eqtune.sock`, and reads one `Response` line back.
 The daemon's accept loop (`Daemon::run`) handles each connection, deserializes the
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
-active preset, preamp, and bands) so the CLI can print the resulting curve; `Disable`,
-`SetAutoOffLowPower`, and `SetAutoOffIdle` reply `Ok` and the client renders the
-confirmation.
+active preset, preamp, and bands) so the CLI can print the resulting curve. Preset
+save/clone/rename also reply with `Tuning` because they switch to the resulting preset;
+deleting a preset replies with the updated preset list. `Disable`, `SetAutoOffLowPower`,
+and `SetAutoOffIdle` reply `Ok` and the client renders the confirmation.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in
 `ipc.rs`). There's no long-lived connection, no streaming, no versioning headache — the
 client is stateless and the daemon is the single source of truth.
 
-**Live edits.** Mutating commands (`SetBand`, `SetPreamp`, `SetPreset`, …) call
+**Live edits.** Mutating commands (`SetBand`, `SetPreamp`, `SetPreset`, preset
+save/clone/delete/rename, …) call
 `persist_and_apply`: it writes the new config to disk *and*, if the engine is running,
 pushes freshly-designed coefficients to the audio thread via `EqHandle::store` — without
 restarting playback. (How that's lock-free is §5.)
@@ -229,7 +233,9 @@ for "media is streaming" rather than a per-app media-session API.
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
   named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
   `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
-  needs no file.
+  needs no file. Preset-management commands mutate this preset map directly: new preset
+  names cannot overwrite existing names, deleting the last preset is rejected, and deleting
+  the active preset selects another remaining preset before live settings are applied.
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
   binary to a stable location and bootstraps the agent.

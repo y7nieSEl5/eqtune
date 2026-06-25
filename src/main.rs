@@ -28,6 +28,18 @@ enum Command {
     /// Switch the active preset.
     #[command(visible_alias = "p")]
     Preset { name: String },
+    /// Save the active tuning as a new preset and switch to it.
+    #[command(name = "preset-save")]
+    PresetSave { name: String },
+    /// Clone an existing preset to a new name and switch to it.
+    #[command(name = "preset-clone", visible_alias = "preset-copy")]
+    PresetClone { source: String, dest: String },
+    /// Delete a preset.
+    #[command(name = "preset-rm", visible_alias = "preset-delete")]
+    PresetRm { name: String },
+    /// Rename a preset.
+    #[command(name = "preset-rename")]
+    PresetRename { from: String, to: String },
     /// Set or update a band: <freq_hz> <gain_db> [q].
     #[command(allow_negative_numbers = true)]
     Band {
@@ -137,6 +149,16 @@ fn to_request(cmd: &Command) -> Request {
         Command::Status => Request::Status,
         Command::Presets => Request::ListPresets,
         Command::Preset { name } => Request::SetPreset(name.clone()),
+        Command::PresetSave { name } => Request::SavePreset { name: name.clone() },
+        Command::PresetClone { source, dest } => Request::ClonePreset {
+            source: source.clone(),
+            dest: dest.clone(),
+        },
+        Command::PresetRm { name } => Request::DeletePreset { name: name.clone() },
+        Command::PresetRename { from, to } => Request::RenamePreset {
+            from: from.clone(),
+            to: to.clone(),
+        },
         Command::Band { freq, gain_db, q } => Request::SetBand {
             freq: *freq,
             gain_db: *gain_db,
@@ -171,6 +193,18 @@ fn print_response(cmd: &Command, resp: &Response) {
                 }
                 Command::Preset { name } => {
                     println!("preset → {name}");
+                    None
+                }
+                Command::PresetSave { name } => {
+                    println!("saved preset → {name}");
+                    None
+                }
+                Command::PresetClone { source, dest } => {
+                    println!("cloned preset {source} → {dest}");
+                    None
+                }
+                Command::PresetRename { from, to } => {
+                    println!("renamed preset {from} → {to}");
                     None
                 }
                 Command::Band { freq, gain_db, q } => {
@@ -247,6 +281,9 @@ fn print_response(cmd: &Command, resp: &Response) {
             );
         }
         Response::Presets { active, names } => {
+            if let Command::PresetRm { name } = cmd {
+                println!("deleted preset {name}");
+            }
             for n in names {
                 let marker = if n == active { "*" } else { " " };
                 println!("{marker} {n}");
