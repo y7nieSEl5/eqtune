@@ -240,7 +240,9 @@ for "media is streaming" rather than a per-app media-session API.
   names cannot overwrite existing names, deleting the last preset is rejected, and deleting
   the active preset selects another remaining preset before live settings are applied.
   Import/export use a smaller single-preset TOML format (`name`, `preamp_db`, and
-  `bands`) for sharing settings without copying the whole config file.
+  `bands`) for sharing settings without copying the whole config file. The CLI resolves
+  relative import/export paths against the user's current directory before sending the
+  request to the daemon; omitted export paths default to `<preset>.toml` in that directory.
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
   binary to a stable location and bootstraps the agent.

@@ -44,7 +44,7 @@ enum Command {
     PresetRename { from: String, to: String },
     /// Export a preset to a shareable TOML file.
     #[command(name = "preset-export")]
-    PresetExport { name: String, path: PathBuf },
+    PresetExport { name: String, path: Option<PathBuf> },
     /// Import a preset TOML file, optionally overriding its name.
     #[command(name = "preset-import")]
     PresetImport { path: PathBuf, name: Option<String> },
@@ -135,7 +135,13 @@ fn main() -> anyhow::Result<()> {
             }
         }
         client_cmd => {
-            let req = to_request(&client_cmd);
+            let req = match to_request(&client_cmd) {
+                Ok(req) => req,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            };
             match ipc::send(&req) {
                 Ok(resp) => {
                     print_response(&client_cmd, &resp);
@@ -150,8 +156,8 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn to_request(cmd: &Command) -> Request {
-    match cmd {
+fn to_request(cmd: &Command) -> anyhow::Result<Request> {
+    Ok(match cmd {
         Command::On => Request::Enable,
         Command::Off => Request::Disable,
         Command::Status => Request::Status,
@@ -169,10 +175,10 @@ fn to_request(cmd: &Command) -> Request {
         },
         Command::PresetExport { name, path } => Request::ExportPreset {
             name: name.clone(),
-            path: path.clone(),
+            path: export_path(name, path.as_ref())?,
         },
         Command::PresetImport { path, name } => Request::ImportPreset {
-            path: path.clone(),
+            path: absolute_path(path)?,
             name: name.clone(),
         },
         Command::Band { freq, gain_db, q } => Request::SetBand {
@@ -192,7 +198,7 @@ fn to_request(cmd: &Command) -> Request {
         | Command::Spike => {
             unreachable!("handled above")
         }
-    }
+    })
 }
 
 /// Render the daemon's reply, tailored to the command that produced it: `on` and edits
@@ -224,6 +230,7 @@ fn print_response(cmd: &Command, resp: &Response) {
                     None
                 }
                 Command::PresetImport { path, name } => {
+                    let path = absolute_path(path).unwrap_or_else(|_| path.clone());
                     if let Some(name) = name {
                         println!("imported preset {name} ← {}", path.display());
                     } else {
@@ -279,6 +286,10 @@ fn print_response(cmd: &Command, resp: &Response) {
                 );
             }
             Command::PresetExport { name, path } => {
+                let path = export_path(name, path.as_ref()).unwrap_or_else(|_| {
+                    path.clone()
+                        .unwrap_or_else(|| PathBuf::from(format!("{name}.toml")))
+                });
                 println!("exported preset {name} → {}", path.display());
             }
             _ => println!("ok"),
@@ -383,6 +394,21 @@ fn trim(v: f32) -> String {
     s.to_string()
 }
 
+fn export_path(name: &str, path: Option<&PathBuf>) -> anyhow::Result<PathBuf> {
+    match path {
+        Some(path) => absolute_path(path),
+        None => absolute_path(&PathBuf::from(format!("{name}.toml"))),
+    }
+}
+
+fn absolute_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.clone())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +436,20 @@ mod tests {
         assert_eq!(fmt_q(1.41), "1.41");
         assert_eq!(fmt_q(2.0), "2");
         assert_eq!(fmt_q(0.7), "0.7");
+    }
+
+    #[test]
+    fn export_path_defaults_to_current_directory() {
+        let got = export_path("daily", None).unwrap();
+        assert_eq!(got, std::env::current_dir().unwrap().join("daily.toml"));
+    }
+
+    #[test]
+    fn relative_paths_are_resolved_against_current_directory() {
+        let got = absolute_path(&PathBuf::from("presets/daily.toml")).unwrap();
+        assert_eq!(
+            got,
+            std::env::current_dir().unwrap().join("presets/daily.toml")
+        );
     }
 }

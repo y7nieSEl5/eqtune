@@ -17,6 +17,8 @@ This project follows [Semantic Versioning](https://semver.org/).
   `preset-rm` for creating and managing user-tuned variants.
 - Preset sharing commands: `preset-export` writes a single-preset TOML file and
   `preset-import` reads one back, with an optional name override.
+- `preset-export` can omit the file path; it defaults to `<preset>.toml` in the current
+  directory and prints the resolved path.
 
 ### Waiting to be implemented
 
