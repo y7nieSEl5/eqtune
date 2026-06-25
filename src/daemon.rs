@@ -6,7 +6,10 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::Path;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Preset};
 use crate::dsp::{Band, BandKind, EqSettings};
@@ -30,6 +33,13 @@ const MAX_Q: f32 = 10.0;
 const MIN_PREAMP_DB: f32 = -60.0;
 const MAX_PREAMP_DB: f32 = 12.0;
 const MAX_PRESET_NAME_LEN: usize = 64;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PresetFile {
+    name: String,
+    bands: Vec<Band>,
+    preamp_db: f32,
+}
 
 pub struct Daemon {
     config: Config,
@@ -167,6 +177,15 @@ impl Daemon {
             }
             Request::RenamePreset { from, to } => {
                 rename_preset(&mut self.config, &from, &to)?;
+                self.persist_and_apply()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::ExportPreset { name, path } => {
+                export_preset(&self.config, &name, &path)?;
+                Ok(Response::Ok)
+            }
+            Request::ImportPreset { path, name } => {
+                import_preset(&mut self.config, &path, name.as_deref())?;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -501,10 +520,58 @@ fn rename_preset(config: &mut Config, from: &str, to: &str) -> anyhow::Result<()
     Ok(())
 }
 
+fn export_preset(config: &Config, name: &str, path: &Path) -> anyhow::Result<()> {
+    let preset = config
+        .presets
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("no such preset: {name}"))?;
+    let file = PresetFile {
+        name: name.to_string(),
+        bands: preset.bands.clone(),
+        preamp_db: preset.preamp_db,
+    };
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, toml::to_string_pretty(&file)?)?;
+    Ok(())
+}
+
+fn import_preset(
+    config: &mut Config,
+    path: &Path,
+    name_override: Option<&str>,
+) -> anyhow::Result<()> {
+    let file: PresetFile = toml::from_str(&std::fs::read_to_string(path)?)?;
+    let name = name_override.unwrap_or(&file.name);
+    validate_new_preset_name(config, name)?;
+    validate_preset(&file.preset())?;
+    config.presets.insert(name.to_string(), file.preset());
+    config.active_preset = name.to_string();
+    Ok(())
+}
+
+impl PresetFile {
+    fn preset(&self) -> Preset {
+        Preset {
+            bands: self.bands.clone(),
+            preamp_db: self.preamp_db,
+        }
+    }
+}
+
 fn validate_new_preset_name(config: &Config, name: &str) -> anyhow::Result<()> {
     validate_preset_name(name)?;
     if config.presets.contains_key(name) {
         return Err(anyhow::anyhow!("preset already exists: {name}"));
+    }
+    Ok(())
+}
+
+fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
+    validate_preamp(preset.preamp_db)?;
+    for band in &preset.bands {
+        validate_band(band.freq, band.gain_db, band.q)?;
     }
     Ok(())
 }
@@ -658,5 +725,90 @@ mod tests {
         }
         assert!(validate_new_preset_name(&c, "bright").is_err());
         assert!(validate_new_preset_name(&c, "daily.v2").is_ok());
+    }
+
+    #[test]
+    fn preset_export_writes_shareable_toml() {
+        let c = Config::default();
+        let path = tmp_path("export.toml");
+        export_preset(&c, "bright", &path).unwrap();
+        let file: PresetFile = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(file.name, "bright");
+        assert_eq!(file.preset(), c.presets["bright"]);
+    }
+
+    #[test]
+    fn preset_import_reads_file_and_selects_preset() {
+        let mut c = Config::default();
+        let path = tmp_path("import.toml");
+        let file = PresetFile {
+            name: "shared".into(),
+            bands: c.presets["mellow"].bands.clone(),
+            preamp_db: c.presets["mellow"].preamp_db,
+        };
+        std::fs::write(&path, toml::to_string_pretty(&file).unwrap()).unwrap();
+
+        import_preset(&mut c, &path, None).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(c.active_preset, "shared");
+        assert_eq!(c.presets["shared"], file.preset());
+    }
+
+    #[test]
+    fn preset_import_name_override_wins() {
+        let mut c = Config::default();
+        let path = tmp_path("import-override.toml");
+        let file = PresetFile {
+            name: "shared".into(),
+            bands: c.presets["mellow"].bands.clone(),
+            preamp_db: c.presets["mellow"].preamp_db,
+        };
+        std::fs::write(&path, toml::to_string_pretty(&file).unwrap()).unwrap();
+
+        import_preset(&mut c, &path, Some("renamed-share")).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!c.presets.contains_key("shared"));
+        assert_eq!(c.active_preset, "renamed-share");
+        assert_eq!(c.presets["renamed-share"], file.preset());
+    }
+
+    #[test]
+    fn preset_import_rejects_duplicate_or_invalid_values() {
+        let mut c = Config::default();
+        let duplicate = tmp_path("import-duplicate.toml");
+        let invalid = tmp_path("import-invalid.toml");
+        let file = PresetFile {
+            name: "bright".into(),
+            bands: c.presets["mellow"].bands.clone(),
+            preamp_db: c.presets["mellow"].preamp_db,
+        };
+        std::fs::write(&duplicate, toml::to_string_pretty(&file).unwrap()).unwrap();
+
+        let invalid_file = PresetFile {
+            name: "too-loud".into(),
+            bands: c.presets["mellow"].bands.clone(),
+            preamp_db: 99.0,
+        };
+        std::fs::write(&invalid, toml::to_string_pretty(&invalid_file).unwrap()).unwrap();
+
+        assert!(import_preset(&mut c, &duplicate, None).is_err());
+        assert!(import_preset(&mut c, &invalid, None).is_err());
+        let _ = std::fs::remove_file(&duplicate);
+        let _ = std::fs::remove_file(&invalid);
+    }
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "eqtune-test-{}-{unique}-{name}",
+            std::process::id()
+        ))
     }
 }

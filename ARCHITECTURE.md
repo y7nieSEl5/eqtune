@@ -86,6 +86,7 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SavePreset { name }, ClonePreset { source, dest },
                 DeletePreset { name }, RenamePreset { from, to },
+                ExportPreset { name, path }, ImportPreset { path, name },
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
                 SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool), Reset }
 enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … }, Error(String) }
@@ -97,8 +98,10 @@ The daemon's accept loop (`Daemon::run`) handles each connection, deserializes t
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
 active preset, preamp, and bands) so the CLI can print the resulting curve. Preset
 save/clone/rename also reply with `Tuning` because they switch to the resulting preset;
-deleting a preset replies with the updated preset list. `Disable`, `SetAutoOffLowPower`,
-and `SetAutoOffIdle` reply `Ok` and the client renders the confirmation.
+import also replies with `Tuning` because it activates the imported preset; deleting a
+preset replies with the updated preset list. Export writes a single-preset TOML file and
+replies `Ok`. `Disable`, `SetAutoOffLowPower`, and `SetAutoOffIdle` reply `Ok` and the
+client renders the confirmation.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in
@@ -106,7 +109,7 @@ to extend (add an enum variant) and trivial to test (`serde_json` round-trip tes
 client is stateless and the daemon is the single source of truth.
 
 **Live edits.** Mutating commands (`SetBand`, `SetPreamp`, `SetPreset`, preset
-save/clone/delete/rename, …) call
+save/clone/delete/rename/import, …) call
 `persist_and_apply`: it writes the new config to disk *and*, if the engine is running,
 pushes freshly-designed coefficients to the audio thread via `EqHandle::store` — without
 restarting playback. (How that's lock-free is §5.)
@@ -236,6 +239,8 @@ for "media is streaming" rather than a per-app media-session API.
   needs no file. Preset-management commands mutate this preset map directly: new preset
   names cannot overwrite existing names, deleting the last preset is rejected, and deleting
   the active preset selects another remaining preset before live settings are applied.
+  Import/export use a smaller single-preset TOML format (`name`, `preamp_db`, and
+  `bands`) for sharing settings without copying the whole config file.
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
   binary to a stable location and bootstraps the agent.

@@ -15,6 +15,8 @@ This project follows [Semantic Versioning](https://semver.org/).
   finite and inside practical audio ranges before they are persisted or applied live.
 - Preset management commands: `preset-save`, `preset-clone`, `preset-rename`, and
   `preset-rm` for creating and managing user-tuned variants.
+- Preset sharing commands: `preset-export` writes a single-preset TOML file and
+  `preset-import` reads one back, with an optional name override.
 
 ### Waiting to be implemented
 
@@ -22,7 +24,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 - `eqtune curve` / `eqtune preset-show [name]` to print EQ bands without changing state.
 - CLI support for low-shelf and high-shelf bands, not just peaking filters.
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
-- Preset import/export for sharing or backing up individual tunings.
 - `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
 - `eqtune response` to print a frequency-response table using the existing DSP math.
 - Shell completion generation for zsh, bash, and fish.

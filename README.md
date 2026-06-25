@@ -44,6 +44,8 @@ eqtune preset-save <name>             # save active tuning as a new preset
 eqtune preset-clone <src> <name>      # clone a preset and switch to the clone
 eqtune preset-rename <old> <new>      # rename a preset
 eqtune preset-rm <name>               # delete a preset
+eqtune preset-export <name> <file>    # write a shareable preset TOML file
+eqtune preset-import <file> [name]    # import a preset, optionally renaming it
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
@@ -76,6 +78,8 @@ Use `eqtune preset-clone bright my-bright` before editing if you want to keep th
 preset untouched, or `eqtune preset-save <name>` to save the current active tuning under
 a new name. New preset names use ASCII letters, digits, `-`, `_`, or `.`, and never
 overwrite an existing preset.
+Share presets with `eqtune preset-export my-bright my-bright.toml`; import them with
+`eqtune preset-import my-bright.toml` or `eqtune preset-import my-bright.toml other-name`.
 
 ## Tweak your own
 

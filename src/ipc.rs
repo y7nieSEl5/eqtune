@@ -20,6 +20,8 @@ pub enum Request {
     ClonePreset { source: String, dest: String },
     DeletePreset { name: String },
     RenamePreset { from: String, to: String },
+    ExportPreset { name: String, path: PathBuf },
+    ImportPreset { path: PathBuf, name: Option<String> },
     SetBand { freq: f32, gain_db: f32, q: f32 },
     RemoveBand { freq: f32 },
     SetPreamp(f32),
@@ -127,6 +129,14 @@ mod tests {
             Request::RenamePreset {
                 from: "car".into(),
                 to: "car-v2".into(),
+            },
+            Request::ExportPreset {
+                name: "car-v2".into(),
+                path: PathBuf::from("/tmp/car-v2.toml"),
+            },
+            Request::ImportPreset {
+                path: PathBuf::from("/tmp/car-v2.toml"),
+                name: Some("shared-car".into()),
             },
             Request::SetBand {
                 freq: 1000.0,

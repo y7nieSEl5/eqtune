@@ -1,6 +1,8 @@
 //! eqtune CLI entry point. Either runs the long-lived daemon or acts as a thin client
 //! that sends a single control request to it over the Unix socket.
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 use eqtune::daemon::Daemon;
@@ -40,6 +42,12 @@ enum Command {
     /// Rename a preset.
     #[command(name = "preset-rename")]
     PresetRename { from: String, to: String },
+    /// Export a preset to a shareable TOML file.
+    #[command(name = "preset-export")]
+    PresetExport { name: String, path: PathBuf },
+    /// Import a preset TOML file, optionally overriding its name.
+    #[command(name = "preset-import")]
+    PresetImport { path: PathBuf, name: Option<String> },
     /// Set or update a band: <freq_hz> <gain_db> [q].
     #[command(allow_negative_numbers = true)]
     Band {
@@ -159,6 +167,14 @@ fn to_request(cmd: &Command) -> Request {
             from: from.clone(),
             to: to.clone(),
         },
+        Command::PresetExport { name, path } => Request::ExportPreset {
+            name: name.clone(),
+            path: path.clone(),
+        },
+        Command::PresetImport { path, name } => Request::ImportPreset {
+            path: path.clone(),
+            name: name.clone(),
+        },
         Command::Band { freq, gain_db, q } => Request::SetBand {
             freq: *freq,
             gain_db: *gain_db,
@@ -207,6 +223,14 @@ fn print_response(cmd: &Command, resp: &Response) {
                     println!("renamed preset {from} → {to}");
                     None
                 }
+                Command::PresetImport { path, name } => {
+                    if let Some(name) = name {
+                        println!("imported preset {name} ← {}", path.display());
+                    } else {
+                        println!("imported preset ← {}", path.display());
+                    }
+                    None
+                }
                 Command::Band { freq, gain_db, q } => {
                     println!(
                         "band {} → {} (Q{})",
@@ -253,6 +277,9 @@ fn print_response(cmd: &Command, resp: &Response) {
                         "off"
                     }
                 );
+            }
+            Command::PresetExport { name, path } => {
+                println!("exported preset {name} → {}", path.display());
             }
             _ => println!("ok"),
         },
