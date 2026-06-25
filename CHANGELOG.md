@@ -11,6 +11,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 - Idle auto-off via `eqtune idle on|off`: when captured system audio stays silent, the
   daemon suspends the Core Audio engine and resumes when the default output device
   reports active I/O again.
+- Safer validation for EQ edits: band frequency, band gain, Q, and preamp values must be
+  finite and inside practical audio ranges before they are persisted or applied live.
 
 ### Waiting to be implemented
 
@@ -20,7 +22,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 - CLI support for low-shelf and high-shelf bands, not just peaking filters.
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
 - Preset import/export for sharing or backing up individual tunings.
-- Safer validation and warnings for extreme frequency, Q, gain, and preamp values.
 - `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
 - `eqtune response` to print a frequency-response table using the existing DSP math.
 - Shell completion generation for zsh, bash, and fish.

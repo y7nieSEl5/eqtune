@@ -21,6 +21,14 @@ const CHANNELS: usize = 2;
 const POLL: Duration = Duration::from_millis(100);
 /// How long captured audio must remain silent before the engine is suspended.
 const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
+const MIN_BAND_FREQ_HZ: f32 = 20.0;
+const MAX_BAND_FREQ_HZ: f32 = 20_000.0;
+const MIN_BAND_GAIN_DB: f32 = -24.0;
+const MAX_BAND_GAIN_DB: f32 = 24.0;
+const MIN_Q: f32 = 0.1;
+const MAX_Q: f32 = 10.0;
+const MIN_PREAMP_DB: f32 = -60.0;
+const MAX_PREAMP_DB: f32 = 12.0;
 
 pub struct Daemon {
     config: Config,
@@ -139,6 +147,7 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetBand { freq, gain_db, q } => {
+                validate_band(freq, gain_db, q)?;
                 let preset = self.active_preset_mut()?;
                 if let Some(b) = preset
                     .bands
@@ -160,6 +169,7 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::RemoveBand { freq } => {
+                validate_freq(freq)?;
                 self.active_preset_mut()?
                     .bands
                     .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
@@ -167,6 +177,7 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetPreamp(db) => {
+                validate_preamp(db)?;
                 self.active_preset_mut()?.preamp_db = db;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
@@ -391,4 +402,89 @@ fn current_target() -> (u32, u32) {
         .unwrap_or(48_000.0)
         .round() as u32;
     (dev, rate)
+}
+
+fn validate_band(freq: f32, gain_db: f32, q: f32) -> anyhow::Result<()> {
+    validate_freq(freq)?;
+    validate_range("gain", gain_db, MIN_BAND_GAIN_DB, MAX_BAND_GAIN_DB, "dB")?;
+    validate_range("Q", q, MIN_Q, MAX_Q, "")?;
+    Ok(())
+}
+
+fn validate_freq(freq: f32) -> anyhow::Result<()> {
+    validate_range("frequency", freq, MIN_BAND_FREQ_HZ, MAX_BAND_FREQ_HZ, "Hz")
+}
+
+fn validate_preamp(db: f32) -> anyhow::Result<()> {
+    validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
+}
+
+fn validate_range(name: &str, value: f32, min: f32, max: f32, unit: &str) -> anyhow::Result<()> {
+    if !value.is_finite() {
+        return Err(anyhow::anyhow!("{name} must be a finite number"));
+    }
+    if !(min..=max).contains(&value) {
+        return Err(anyhow::anyhow!(
+            "{name} must be between {} and {}",
+            format_bound(min, unit),
+            format_bound(max, unit)
+        ));
+    }
+    Ok(())
+}
+
+fn format_bound(value: f32, unit: &str) -> String {
+    if unit.is_empty() {
+        trim_number(value)
+    } else {
+        format!("{} {unit}", trim_number(value))
+    }
+}
+
+fn trim_number(n: f32) -> String {
+    let s = format!("{n:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn band_validation_accepts_practical_values() {
+        validate_band(20.0, -24.0, 0.1).unwrap();
+        validate_band(20_000.0, 24.0, 10.0).unwrap();
+        validate_band(1000.0, 0.0, 1.41).unwrap();
+    }
+
+    #[test]
+    fn band_validation_rejects_invalid_values() {
+        for (freq, gain, q) in [
+            (0.0, 0.0, 1.0),
+            (20_001.0, 0.0, 1.0),
+            (1000.0, -24.1, 1.0),
+            (1000.0, 24.1, 1.0),
+            (1000.0, 0.0, 0.0),
+            (1000.0, 0.0, 10.1),
+            (f32::NAN, 0.0, 1.0),
+            (1000.0, f32::INFINITY, 1.0),
+            (1000.0, 0.0, f32::NEG_INFINITY),
+        ] {
+            assert!(validate_band(freq, gain, q).is_err());
+        }
+    }
+
+    #[test]
+    fn preamp_validation_accepts_safe_range() {
+        validate_preamp(-60.0).unwrap();
+        validate_preamp(0.0).unwrap();
+        validate_preamp(12.0).unwrap();
+    }
+
+    #[test]
+    fn preamp_validation_rejects_invalid_values() {
+        for db in [-60.1, 12.1, f32::NAN, f32::INFINITY] {
+            assert!(validate_preamp(db).is_err());
+        }
+    }
 }

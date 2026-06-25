@@ -80,6 +80,9 @@ eqtune band-rm 2000        # remove the 2 kHz band
 eqtune preamp 4            # set the preamp to +4 dB
 ```
 
+Editable values are validated before they reach the audio engine: band frequencies must
+be 20-20000 Hz, band gains -24 to +24 dB, Q 0.1-10, and preamp -60 to +12 dB.
+
 ## Battery & energy
 
 eqtune is an always-on background daemon that **taps all system audio and re-processes
