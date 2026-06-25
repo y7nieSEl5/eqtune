@@ -85,22 +85,31 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 ```rust
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SavePreset { name }, ClonePreset { source, dest },
-                DeletePreset { name }, RenamePreset { from, to },
+                DeletePresets { names }, RenamePreset { from, to },
                 ExportPreset { name, path }, ImportPreset { path, name },
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
-                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool), Reset }
-enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … }, Error(String) }
+                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
+                SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
+                ResetPreset { name }, ConfirmResetPreset { name, backups },
+                Reset, ConfirmReset { backups } }
+enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
+                ResetWouldOverwrite { names }, UnsavedSession(Tuning), Error(String) }
 ```
 
 A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a single line
 to `~/Library/Application Support/eqtune/eqtune.sock`, and reads one `Response` line back.
 The daemon's accept loop (`Daemon::run`) handles each connection, deserializes the
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
-active preset, preamp, and bands) so the CLI can print the resulting curve. Preset
-save/clone/rename also reply with `Tuning` because they switch to the resulting preset;
-import also replies with `Tuning` because it activates the imported preset; deleting a
-preset replies with the updated preset list. Export writes a single-preset TOML file and
-replies `Ok`. `Disable`, `SetAutoOffLowPower`, and `SetAutoOffIdle` reply `Ok` and the
+active preset, preamp, and bands) so the CLI can print the resulting curve. `Disable`
+returns `UnsavedSession` instead of `Ok` when live tuning edits have not been resolved;
+the CLI then asks whether to save as a new preset, overwrite the active preset, or
+discard. Preset save/clone/rename/import reply with `Tuning` because they switch to the
+resulting preset. Preset deletion replies with the updated preset list. Multi-delete
+requests are prevalidated before mutation, so missing/duplicate names or attempts to
+delete every preset leave the config unchanged. Reset requests return
+`ResetWouldOverwrite` when modified shipped presets would be replaced; the CLI can then
+send a confirm request with optional backup preset names. Export writes a single-preset
+TOML file and replies `Ok`. `SetAutoOffLowPower` and `SetAutoOffIdle` reply `Ok` and the
 client renders the confirmation.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
@@ -108,11 +117,12 @@ to extend (add an enum variant) and trivial to test (`serde_json` round-trip tes
 `ipc.rs`). There's no long-lived connection, no streaming, no versioning headache — the
 client is stateless and the daemon is the single source of truth.
 
-**Live edits.** Mutating commands (`SetBand`, `SetPreamp`, `SetPreset`, preset
-save/clone/delete/rename/import, …) call
-`persist_and_apply`: it writes the new config to disk *and*, if the engine is running,
-pushes freshly-designed coefficients to the audio thread via `EqHandle::store` — without
-restarting playback. (How that's lock-free is §5.)
+**Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
+daemon's working config and, if the engine is running, push freshly-designed coefficients
+to the audio thread via `EqHandle::store` — without restarting playback. The daemon keeps
+a separate snapshot of the last saved config; on `eqtune off`, any difference becomes an
+interactive save/overwrite/discard prompt. Explicit library-management commands
+(`preset-save`, import, rename, delete, reset, …) persist immediately.
 
 ---
 
@@ -236,19 +246,54 @@ for "media is streaming" rather than a per-app media-session API.
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
   named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
   `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
-  needs no file. Preset-management commands mutate this preset map directly: new preset
-  names cannot overwrite existing names, deleting the last preset is rejected, and deleting
-  the active preset selects another remaining preset before live settings are applied.
+  needs no file. The daemon holds both a working config and the last saved config: live
+  tuning edits affect only the working config until the `off` prompt resolves them.
+  Preset-management commands mutate the saved preset map directly: new preset names cannot
+  overwrite existing custom names, deleting the last preset is rejected, and deleting the
+  active preset selects another remaining preset before live settings are applied.
+  `reset <name>` restores one shipped preset from `Config::default()`; `reset` without a
+  name restores all shipped presets while preserving user-created presets and global
+  toggles.
   Import/export use a smaller single-preset TOML format (`name`, `preamp_db`, and
   `bands`) for sharing settings without copying the whole config file. The CLI resolves
   relative import/export paths against the user's current directory before sending the
   request to the daemon; omitted export paths default to `<preset>.toml` in that directory.
+
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
   binary to a stable location and bootstraps the agent.
 - **No code signing.** Locally-built binaries aren't quarantined, so Gatekeeper never
   applies. `build.rs` embeds an `Info.plist` into the binary so macOS shows a proper
   audio-capture permission prompt without an Apple Developer account.
+
+### Session drafts and shipped presets
+
+The daemon deliberately separates "what is playing now" from "what is saved":
+
+- `config` is the working config. `preset`, `band`, `band-rm`, and `preamp` mutate this
+  copy and immediately push new `EqSettings` to the audio thread, but do not write TOML.
+- `saved_config` mirrors the last config written to disk. It is the source for discard,
+  save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
+- `eqtune off` stops the audio engine first. If `config != saved_config`, the daemon
+  returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
+- Save by name (`SaveSessionAs`) takes the active working preset and writes it into a
+  clone of `saved_config`. If the name is unused, it creates a user preset. If the name is
+  one of the shipped names (`bright`, `mellow`, `pro`), it overwrites that local shipped
+  preset copy. Existing non-shipped names are rejected to prevent accidental loss.
+- Overwrite (`SaveSessionOverwrite`) writes the entire working config as-is, preserving
+  the active preset name. This is the direct path for "I tuned bright; make my device's
+  bright sound like this now."
+- Discard (`DiscardSession`) replaces the working config with `saved_config` and pushes
+  those saved settings back to the audio handle if audio is running again later.
+- Reset commands first reject unresolved live drafts, then compare existing target shipped
+  preset(s) in `saved_config` against `Config::default()`. If a local shipped preset has
+  been modified, the daemon returns `ResetWouldOverwrite`; the CLI warns and offers to
+  save the current local version under a user preset name before confirming. Deleted
+  shipped presets are recreated directly because there is no local version to preserve.
+- `eqtune reset bright`, `eqtune reset mellow`, and `eqtune reset pro` replace exactly
+  that preset with the shipped preset from `Config::default()`, recreating it if deleted.
+- `eqtune reset` replaces all shipped presets from `Config::default()` and sets the active
+  preset to the shipped default (`bright`), while preserving user-created presets.
 
 ---
 
@@ -342,10 +387,10 @@ at a glance and stable enough that the audio internals can change without touchi
 control thread (daemon)                 real-time thread (Core Audio IOProc)
 ───────────────────────                 ────────────────────────────────────
 parse Request                           load() current EqSettings   (wait-free)
-mutate Config                           copy coeffs only if changed  (cheap)
+mutate working Config                   copy coeffs only if changed  (cheap)
 design new EqSettings                   skip work if silent          (cheap)
 ArcSwap::store(Arc::new(settings)) ───▶  preamp → biquads → limiter   (in place)
-save TOML to disk
+save/discard draft on request
 ```
 
 The only thing shared between the threads is the atomically-swapped `Arc<EqSettings>`. The

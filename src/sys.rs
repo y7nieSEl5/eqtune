@@ -2,8 +2,8 @@
 //! This is the boundary between Rust and the macOS audio system.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 

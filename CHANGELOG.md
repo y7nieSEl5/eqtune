@@ -6,6 +6,18 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Waiting to be implemented
+
+- `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.
+- `eqtune curve` / `eqtune preset-show [name]` to print EQ bands without changing state.
+- CLI support for low-shelf and high-shelf bands, not just peaking filters.
+- A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
+- `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
+- `eqtune response` to print a frequency-response table using the existing DSP math.
+- Shell completion generation for zsh, bash, and fish.
+
+## [0.3.0] - 2026-06-25
+
 ### Added
 
 - Idle auto-off via `eqtune idle on|off`: when captured system audio stays silent, the
@@ -19,16 +31,15 @@ This project follows [Semantic Versioning](https://semver.org/).
   `preset-import` reads one back, with an optional name override.
 - `preset-export` can omit the file path; it defaults to `<preset>.toml` in the current
   directory and prints the resolved path.
-
-### Waiting to be implemented
-
-- `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.
-- `eqtune curve` / `eqtune preset-show [name]` to print EQ bands without changing state.
-- CLI support for low-shelf and high-shelf bands, not just peaking filters.
-- A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
-- `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
-- `eqtune response` to print a frequency-response table using the existing DSP math.
-- Shell completion generation for zsh, bash, and fish.
+- Live tuning edits are now session drafts: `eqtune off` asks whether to save by name,
+  overwrite the active preset name, or discard the changes. Saving by name may create a
+  new preset or overwrite a shipped preset name (`bright`, `mellow`, `pro`).
+- `eqtune reset <preset>` restores one shipped preset, such as `bright`, after local
+  overwrites or deletion.
+- `eqtune reset` restores all shipped presets while preserving user-created presets.
+- Reset commands warn before replacing modified local shipped presets and can save those
+  local versions under custom names first.
+- `preset-rm` now accepts multiple preset names and removes them in one persisted update.
 
 ## [0.2.0] - 2026-06-12
 

@@ -6,14 +6,14 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Preset};
 use crate::dsp::{Band, BandKind, EqSettings};
-use crate::ipc::{self, Request, Response, Status, Tuning};
+use crate::ipc::{self, PresetBackup, Request, Response, Status, Tuning};
 use crate::sys::{self, EqHandle, TapSession};
 
 /// Two bands count as "the same band" if their frequencies are this close (Hz).
@@ -42,7 +42,12 @@ struct PresetFile {
 }
 
 pub struct Daemon {
+    /// Working config: includes live, unsaved tuning edits for the current session.
     config: Config,
+    /// Last persisted config on disk. Used to discard drafts or save drafts as a new
+    /// preset without overwriting the preset being edited.
+    saved_config: Config,
+    config_path: PathBuf,
     engine: Option<(TapSession, EqHandle)>,
     /// (output device id, sample rate Hz) the running engine was built for.
     engine_target: Option<(u32, u32)>,
@@ -61,8 +66,11 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
+        let config = Config::load()?;
         Ok(Self {
-            config: Config::load()?,
+            saved_config: config.clone(),
+            config,
+            config_path: Config::path(),
             engine: None,
             engine_target: None,
             engine_target_on: false,
@@ -143,7 +151,11 @@ impl Daemon {
                 self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
-                Ok(Response::Ok)
+                if self.has_unsaved_session() {
+                    Ok(Response::UnsavedSession(self.tuning()))
+                } else {
+                    Ok(Response::Ok)
+                }
             }
             Request::ListPresets => Ok(Response::Presets {
                 active: self.config.active_preset.clone(),
@@ -154,21 +166,20 @@ impl Daemon {
                     return Ok(Response::Error(format!("no such preset: {name}")));
                 }
                 self.config.active_preset = name;
-                self.persist_and_apply()?;
+                self.apply_current_settings();
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SavePreset { name } => {
-                save_active_preset(&mut self.config, &name)?;
-                self.persist_and_apply()?;
+                self.save_session_as(&name)?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ClonePreset { source, dest } => {
-                clone_preset(&mut self.config, &source, &dest)?;
-                self.persist_and_apply()?;
+                self.clone_preset(&source, &dest)?;
                 Ok(Response::Tuning(self.tuning()))
             }
-            Request::DeletePreset { name } => {
-                delete_preset(&mut self.config, &name)?;
+            Request::DeletePresets { names } => {
+                self.ensure_no_unsaved_session()?;
+                delete_presets(&mut self.config, &names)?;
                 self.persist_and_apply()?;
                 Ok(Response::Presets {
                     active: self.config.active_preset.clone(),
@@ -176,6 +187,7 @@ impl Daemon {
                 })
             }
             Request::RenamePreset { from, to } => {
+                self.ensure_no_unsaved_session()?;
                 rename_preset(&mut self.config, &from, &to)?;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
@@ -185,6 +197,7 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::ImportPreset { path, name } => {
+                self.ensure_no_unsaved_session()?;
                 import_preset(&mut self.config, &path, name.as_deref())?;
                 self.persist_and_apply()?;
                 Ok(Response::Tuning(self.tuning()))
@@ -208,7 +221,7 @@ impl Daemon {
                     });
                     preset.bands.sort_by(|a, b| a.freq.total_cmp(&b.freq));
                 }
-                self.persist_and_apply()?;
+                self.apply_current_settings();
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::RemoveBand { freq } => {
@@ -216,18 +229,19 @@ impl Daemon {
                 self.active_preset_mut()?
                     .bands
                     .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
-                self.persist_and_apply()?;
+                self.apply_current_settings();
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetPreamp(db) => {
                 validate_preamp(db)?;
                 self.active_preset_mut()?.preamp_db = db;
-                self.persist_and_apply()?;
+                self.apply_current_settings();
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetAutoOffLowPower(on) => {
                 self.config.auto_off_low_power = on;
-                self.config.save()?;
+                self.saved_config.auto_off_low_power = on;
+                self.saved_config.save_to(&self.config_path)?;
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
                 } else if !on {
@@ -238,7 +252,8 @@ impl Daemon {
             }
             Request::SetAutoOffIdle(on) => {
                 self.config.auto_off_idle = on;
-                self.config.save()?;
+                self.saved_config.auto_off_idle = on;
+                self.saved_config.save_to(&self.config_path)?;
                 if !on && self.idle_suspended {
                     self.idle_suspended = false;
                     if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
@@ -248,10 +263,48 @@ impl Daemon {
                 self.reconcile()?;
                 Ok(Response::Ok)
             }
-            Request::Reset => {
-                self.config = Config::default();
-                self.idle_suspended = false;
+            Request::SaveSessionAs { name } => {
+                self.save_session_as(&name)?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::SaveSessionOverwrite => {
                 self.persist_and_apply()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::DiscardSession => {
+                self.discard_session();
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::ResetPreset { name } => {
+                self.ensure_no_unsaved_session()?;
+                let changed =
+                    modified_shipped_presets(&self.saved_config, std::slice::from_ref(&name))?;
+                if changed.is_empty() {
+                    self.confirm_reset_preset(&name, &[])?;
+                    Ok(Response::Tuning(self.tuning()))
+                } else {
+                    Ok(Response::ResetWouldOverwrite { names: changed })
+                }
+            }
+            Request::ConfirmResetPreset { name, backups } => {
+                self.ensure_no_unsaved_session()?;
+                self.confirm_reset_preset(&name, &backups)?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::Reset => {
+                self.ensure_no_unsaved_session()?;
+                let names = shipped_preset_names();
+                let changed = modified_shipped_presets(&self.saved_config, &names)?;
+                if changed.is_empty() {
+                    self.confirm_reset_all(&[])?;
+                    Ok(Response::Tuning(self.tuning()))
+                } else {
+                    Ok(Response::ResetWouldOverwrite { names: changed })
+                }
+            }
+            Request::ConfirmReset { backups } => {
+                self.ensure_no_unsaved_session()?;
+                self.confirm_reset_all(&backups)?;
                 Ok(Response::Tuning(self.tuning()))
             }
         }
@@ -391,7 +444,13 @@ impl Daemon {
     }
 
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
-        self.config.save()?;
+        self.config.save_to(&self.config_path)?;
+        self.saved_config = self.config.clone();
+        self.apply_current_settings();
+        Ok(())
+    }
+
+    fn apply_current_settings(&mut self) {
         if self.engine.is_some() {
             let fs = self
                 .engine_target
@@ -402,7 +461,71 @@ impl Daemon {
                 handle.store(settings); // lock-free live update
             }
         }
-        Ok(())
+    }
+
+    fn has_unsaved_session(&self) -> bool {
+        self.config != self.saved_config
+    }
+
+    fn ensure_no_unsaved_session(&self) -> anyhow::Result<()> {
+        if self.has_unsaved_session() {
+            Err(anyhow::anyhow!(
+                "unsaved tuning changes are active; run `eqtune off` and save or discard them first"
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn save_session_as(&mut self, name: &str) -> anyhow::Result<()> {
+        validate_session_save_name(&self.saved_config, name)?;
+        let preset = self
+            .config
+            .active()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no active preset to save"))?;
+        let mut next = self.saved_config.clone();
+        next.presets.insert(name.to_string(), preset);
+        next.active_preset = name.to_string();
+        self.config = next;
+        self.persist_and_apply()
+    }
+
+    fn clone_preset(&mut self, source: &str, dest: &str) -> anyhow::Result<()> {
+        validate_new_preset_name(&self.saved_config, dest)?;
+        let preset = self
+            .config
+            .presets
+            .get(source)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no such preset: {source}"))?;
+        let mut next = self.saved_config.clone();
+        next.presets.insert(dest.to_string(), preset);
+        next.active_preset = dest.to_string();
+        self.config = next;
+        self.persist_and_apply()
+    }
+
+    fn discard_session(&mut self) {
+        self.config = self.saved_config.clone();
+        self.apply_current_settings();
+    }
+
+    fn confirm_reset_preset(&mut self, name: &str, backups: &[PresetBackup]) -> anyhow::Result<()> {
+        let mut next = self.saved_config.clone();
+        apply_reset_backups(&mut next, backups)?;
+        reset_preset(&mut next, name)?;
+        self.config = next;
+        self.persist_and_apply()
+    }
+
+    fn confirm_reset_all(&mut self, backups: &[PresetBackup]) -> anyhow::Result<()> {
+        let mut next = self.saved_config.clone();
+        apply_reset_backups(&mut next, backups)?;
+        reset_shipped_presets(&mut next);
+        self.config = next;
+        self.idle_suspended = false;
+        self.persist_and_apply()
     }
 
     fn status(&self) -> Status {
@@ -462,6 +585,7 @@ fn validate_preamp(db: f32) -> anyhow::Result<()> {
     validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
 }
 
+#[cfg(test)]
 fn save_active_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
     validate_new_preset_name(config, name)?;
     let preset = config
@@ -473,6 +597,7 @@ fn save_active_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn clone_preset(config: &mut Config, source: &str, dest: &str) -> anyhow::Result<()> {
     validate_new_preset_name(config, dest)?;
     let preset = config
@@ -485,15 +610,26 @@ fn clone_preset(config: &mut Config, source: &str, dest: &str) -> anyhow::Result
     Ok(())
 }
 
-fn delete_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
-    if !config.presets.contains_key(name) {
-        return Err(anyhow::anyhow!("no such preset: {name}"));
+fn delete_presets(config: &mut Config, names: &[String]) -> anyhow::Result<()> {
+    if names.is_empty() {
+        return Err(anyhow::anyhow!("at least one preset name is required"));
     }
-    if config.presets.len() == 1 {
-        return Err(anyhow::anyhow!("cannot delete the last preset"));
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            return Err(anyhow::anyhow!("duplicate preset name: {name}"));
+        }
+        if !config.presets.contains_key(name) {
+            return Err(anyhow::anyhow!("no such preset: {name}"));
+        }
     }
-    config.presets.remove(name);
-    if config.active_preset == name {
+    if names.len() >= config.presets.len() {
+        return Err(anyhow::anyhow!("cannot delete every preset"));
+    }
+    for name in names {
+        config.presets.remove(name);
+    }
+    if names.iter().any(|name| name == &config.active_preset) {
         config.active_preset = config
             .presets
             .keys()
@@ -551,6 +687,66 @@ fn import_preset(
     Ok(())
 }
 
+fn reset_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
+    let defaults = Config::default();
+    let preset = defaults
+        .presets
+        .get(name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no shipped preset: {name}"))?;
+    config.presets.insert(name.to_string(), preset);
+    if !config.presets.contains_key(&config.active_preset) {
+        config.active_preset = name.to_string();
+    }
+    Ok(())
+}
+
+fn reset_shipped_presets(config: &mut Config) {
+    let defaults = Config::default();
+    for (name, preset) in defaults.presets {
+        config.presets.insert(name, preset);
+    }
+    config.active_preset = defaults.active_preset;
+}
+
+fn apply_reset_backups(config: &mut Config, backups: &[PresetBackup]) -> anyhow::Result<()> {
+    for backup in backups {
+        if !is_shipped_preset_name(&backup.source) {
+            return Err(anyhow::anyhow!(
+                "can only back up shipped presets during reset: {}",
+                backup.source
+            ));
+        }
+        validate_new_preset_name(config, &backup.dest)?;
+        let preset = config
+            .presets
+            .get(&backup.source)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no such preset: {}", backup.source))?;
+        config.presets.insert(backup.dest.clone(), preset);
+    }
+    Ok(())
+}
+
+fn modified_shipped_presets(config: &Config, names: &[String]) -> anyhow::Result<Vec<String>> {
+    let defaults = Config::default();
+    let mut changed = Vec::new();
+    for name in names {
+        let default = defaults
+            .presets
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no shipped preset: {name}"))?;
+        if matches!(config.presets.get(name), Some(current) if current != default) {
+            changed.push(name.clone());
+        }
+    }
+    Ok(changed)
+}
+
+fn shipped_preset_names() -> Vec<String> {
+    Config::default().presets.keys().cloned().collect()
+}
+
 impl PresetFile {
     fn preset(&self) -> Preset {
         Preset {
@@ -566,6 +762,18 @@ fn validate_new_preset_name(config: &Config, name: &str) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("preset already exists: {name}"));
     }
     Ok(())
+}
+
+fn validate_session_save_name(config: &Config, name: &str) -> anyhow::Result<()> {
+    validate_preset_name(name)?;
+    if config.presets.contains_key(name) && !is_shipped_preset_name(name) {
+        return Err(anyhow::anyhow!("preset already exists: {name}"));
+    }
+    Ok(())
+}
+
+fn is_shipped_preset_name(name: &str) -> bool {
+    Config::default().presets.contains_key(name)
 }
 
 fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
@@ -692,7 +900,7 @@ mod tests {
     fn preset_delete_removes_active_and_selects_another() {
         let mut c = Config::default();
         c.active_preset = "mellow".into();
-        delete_preset(&mut c, "mellow").unwrap();
+        delete_presets(&mut c, &["mellow".into()]).unwrap();
         assert!(!c.presets.contains_key("mellow"));
         assert!(c.presets.contains_key(&c.active_preset));
     }
@@ -702,8 +910,40 @@ mod tests {
         let mut c = Config::default();
         c.presets.retain(|name, _| name == "bright");
         c.active_preset = "bright".into();
-        assert!(delete_preset(&mut c, "bright").is_err());
+        assert!(delete_presets(&mut c, &["bright".into()]).is_err());
         assert!(c.presets.contains_key("bright"));
+    }
+
+    #[test]
+    fn preset_delete_removes_multiple_presets_atomically() {
+        let mut c = Config::default();
+        c.presets.insert(
+            "daily".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: 0.0,
+            },
+        );
+        c.active_preset = "daily".into();
+
+        delete_presets(&mut c, &["daily".into(), "mellow".into()]).unwrap();
+
+        assert!(!c.presets.contains_key("daily"));
+        assert!(!c.presets.contains_key("mellow"));
+        assert!(c.presets.contains_key(&c.active_preset));
+    }
+
+    #[test]
+    fn preset_delete_rejects_duplicate_or_all_names_without_mutating() {
+        let mut c = Config::default();
+        let before = c.clone();
+
+        assert!(delete_presets(&mut c, &["bright".into(), "bright".into()]).is_err());
+        assert_eq!(c, before);
+
+        let all = c.presets.keys().cloned().collect::<Vec<_>>();
+        assert!(delete_presets(&mut c, &all).is_err());
+        assert_eq!(c, before);
     }
 
     #[test]
@@ -799,6 +1039,242 @@ mod tests {
         assert!(import_preset(&mut c, &invalid, None).is_err());
         let _ = std::fs::remove_file(&duplicate);
         let _ = std::fs::remove_file(&invalid);
+    }
+
+    #[test]
+    fn tuning_edits_are_unsaved_until_resolved() {
+        let mut d = daemon_with(Config::default());
+        let saved_bright = d.saved_config.presets["bright"].clone();
+
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert_ne!(d.config, d.saved_config);
+
+        d.apply(Request::SaveSessionAs {
+            name: "daily".into(),
+        })
+        .unwrap();
+
+        assert_eq!(d.config, d.saved_config);
+        assert_eq!(d.config.active_preset, "daily");
+        assert_eq!(d.config.presets["bright"], saved_bright);
+        assert_eq!(d.config.presets["daily"].preamp_db, -3.0);
+    }
+
+    #[test]
+    fn session_save_as_can_overwrite_shipped_preset_name() {
+        let mut d = daemon_with(Config::default());
+        let original_bright = d.saved_config.presets["bright"].clone();
+
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        d.apply(Request::SaveSessionAs {
+            name: "bright".into(),
+        })
+        .unwrap();
+
+        assert_eq!(d.config, d.saved_config);
+        assert_eq!(d.config.active_preset, "bright");
+        assert_ne!(d.saved_config.presets["bright"], original_bright);
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -3.0);
+    }
+
+    #[test]
+    fn session_save_as_rejects_existing_custom_preset_name() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SavePreset {
+            name: "daily".into(),
+        })
+        .unwrap();
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        let err = d
+            .apply(Request::SaveSessionAs {
+                name: "daily".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("preset already exists"));
+    }
+
+    #[test]
+    fn session_overwrite_commits_active_preset_name() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        d.apply(Request::SaveSessionOverwrite).unwrap();
+
+        assert_eq!(d.config, d.saved_config);
+        assert_eq!(d.config.active_preset, "bright");
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -3.0);
+    }
+
+    #[test]
+    fn session_discard_reverts_to_saved_config() {
+        let mut d = daemon_with(Config::default());
+        let saved = d.saved_config.clone();
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        d.apply(Request::DiscardSession).unwrap();
+
+        assert_eq!(d.config, saved);
+        assert_eq!(d.saved_config, saved);
+    }
+
+    #[test]
+    fn off_returns_unsaved_session_when_tuning_is_dirty() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        let resp = d.apply(Request::Disable).unwrap();
+        assert!(matches!(resp, Response::UnsavedSession(_)));
+    }
+
+    #[test]
+    fn reset_preset_restores_shipped_preset() {
+        let mut c = Config::default();
+        let defaults = Config::default();
+        for name in ["bright", "mellow", "pro"] {
+            c.presets.get_mut(name).unwrap().preamp_db = -3.0;
+            reset_preset(&mut c, name).unwrap();
+            assert_eq!(c.presets[name], defaults.presets[name]);
+
+            c.presets.remove(name);
+            reset_preset(&mut c, name).unwrap();
+            assert_eq!(c.presets[name], defaults.presets[name]);
+        }
+    }
+
+    #[test]
+    fn reset_all_restores_shipped_presets_and_preserves_custom_presets() {
+        let mut c = Config::default();
+        let defaults = Config::default();
+        c.presets.insert(
+            "daily".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: -4.0,
+            },
+        );
+        for name in ["bright", "mellow", "pro"] {
+            c.presets.get_mut(name).unwrap().preamp_db = -3.0;
+        }
+
+        reset_shipped_presets(&mut c);
+
+        for name in ["bright", "mellow", "pro"] {
+            assert_eq!(c.presets[name], defaults.presets[name]);
+        }
+        assert!(c.presets.contains_key("daily"));
+        assert_eq!(c.active_preset, "bright");
+    }
+
+    #[test]
+    fn reset_requests_restore_shipped_presets_from_saved_config() {
+        let mut config = Config::default();
+        config.presets.insert(
+            "daily".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: -4.0,
+            },
+        );
+        for name in ["bright", "mellow", "pro"] {
+            config.presets.get_mut(name).unwrap().preamp_db = -3.0;
+        }
+        let mut d = daemon_with(config);
+        let defaults = Config::default();
+
+        d.apply(Request::SetPreamp(1.0)).unwrap(); // unsaved draft must block reset.
+        let blocked = d
+            .apply(Request::ResetPreset {
+                name: "bright".into(),
+            })
+            .unwrap_err();
+        assert!(blocked.to_string().contains("unsaved tuning changes"));
+
+        d.apply(Request::DiscardSession).unwrap();
+        let resp = d
+            .apply(Request::ResetPreset {
+                name: "bright".into(),
+            })
+            .unwrap();
+        assert!(matches!(resp, Response::ResetWouldOverwrite { .. }));
+        d.apply(Request::ConfirmResetPreset {
+            name: "bright".into(),
+            backups: vec![],
+        })
+        .unwrap();
+        assert_eq!(d.saved_config.presets["bright"], defaults.presets["bright"]);
+        assert_eq!(d.saved_config.presets["mellow"].preamp_db, -3.0);
+        assert!(d.saved_config.presets.contains_key("daily"));
+
+        let resp = d.apply(Request::Reset).unwrap();
+        assert!(matches!(resp, Response::ResetWouldOverwrite { .. }));
+        d.apply(Request::ConfirmReset { backups: vec![] }).unwrap();
+        for name in ["bright", "mellow", "pro"] {
+            assert_eq!(d.saved_config.presets[name], defaults.presets[name]);
+        }
+        assert!(d.saved_config.presets.contains_key("daily"));
+        assert_eq!(d.saved_config.active_preset, "bright");
+    }
+
+    #[test]
+    fn confirmed_reset_can_save_modified_builtin_copy_first() {
+        let mut config = Config::default();
+        config.presets.get_mut("bright").unwrap().preamp_db = -3.0;
+        let modified_bright = config.presets["bright"].clone();
+        let mut d = daemon_with(config);
+
+        let resp = d
+            .apply(Request::ResetPreset {
+                name: "bright".into(),
+            })
+            .unwrap();
+        assert!(matches!(resp, Response::ResetWouldOverwrite { .. }));
+        d.apply(Request::ConfirmResetPreset {
+            name: "bright".into(),
+            backups: vec![PresetBackup {
+                source: "bright".into(),
+                dest: "my-bright".into(),
+            }],
+        })
+        .unwrap();
+
+        assert_eq!(
+            d.saved_config.presets["bright"],
+            Config::default().presets["bright"]
+        );
+        assert_eq!(d.saved_config.presets["my-bright"], modified_bright);
+    }
+
+    #[test]
+    fn reset_recreates_deleted_shipped_preset_without_overwrite_warning() {
+        let mut config = Config::default();
+        config.presets.remove("bright");
+        let mut d = daemon_with(config);
+
+        let resp = d
+            .apply(Request::ResetPreset {
+                name: "bright".into(),
+            })
+            .unwrap();
+
+        assert!(matches!(resp, Response::Tuning(_)));
+        assert_eq!(
+            d.saved_config.presets["bright"],
+            Config::default().presets["bright"]
+        );
+    }
+
+    fn daemon_with(config: Config) -> Daemon {
+        Daemon {
+            saved_config: config.clone(),
+            config,
+            config_path: tmp_path("daemon-config.toml"),
+            engine: None,
+            engine_target: None,
+            engine_target_on: false,
+            user_intent: false,
+            low_power: false,
+            idle_suspended: false,
+        }
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {

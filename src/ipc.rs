@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::dsp::Band;
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PresetBackup {
+    pub source: String,
+    pub dest: String,
+}
+
 /// A command sent from the CLI client to the running daemon.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Request {
@@ -16,18 +22,55 @@ pub enum Request {
     Disable,
     ListPresets,
     SetPreset(String),
-    SavePreset { name: String },
-    ClonePreset { source: String, dest: String },
-    DeletePreset { name: String },
-    RenamePreset { from: String, to: String },
-    ExportPreset { name: String, path: PathBuf },
-    ImportPreset { path: PathBuf, name: Option<String> },
-    SetBand { freq: f32, gain_db: f32, q: f32 },
-    RemoveBand { freq: f32 },
+    SavePreset {
+        name: String,
+    },
+    ClonePreset {
+        source: String,
+        dest: String,
+    },
+    DeletePresets {
+        names: Vec<String>,
+    },
+    RenamePreset {
+        from: String,
+        to: String,
+    },
+    ExportPreset {
+        name: String,
+        path: PathBuf,
+    },
+    ImportPreset {
+        path: PathBuf,
+        name: Option<String>,
+    },
+    SetBand {
+        freq: f32,
+        gain_db: f32,
+        q: f32,
+    },
+    RemoveBand {
+        freq: f32,
+    },
     SetPreamp(f32),
     SetAutoOffLowPower(bool),
     SetAutoOffIdle(bool),
+    SaveSessionAs {
+        name: String,
+    },
+    SaveSessionOverwrite,
+    DiscardSession,
+    ResetPreset {
+        name: String,
+    },
+    ConfirmResetPreset {
+        name: String,
+        backups: Vec<PresetBackup>,
+    },
     Reset,
+    ConfirmReset {
+        backups: Vec<PresetBackup>,
+    },
 }
 
 /// The daemon's reply to a [`Request`].
@@ -42,6 +85,12 @@ pub enum Response {
         active: String,
         names: Vec<String>,
     },
+    /// Returned by reset commands when modified shipped presets would be replaced.
+    ResetWouldOverwrite {
+        names: Vec<String>,
+    },
+    /// Returned by `off` when live tuning edits have not been persisted yet.
+    UnsavedSession(Tuning),
     Error(String),
 }
 
@@ -123,8 +172,8 @@ mod tests {
                 source: "bright".into(),
                 dest: "desk".into(),
             },
-            Request::DeletePreset {
-                name: "desk".into(),
+            Request::DeletePresets {
+                names: vec!["desk".into(), "car".into()],
             },
             Request::RenamePreset {
                 from: "car".into(),
@@ -147,6 +196,27 @@ mod tests {
             Request::SetPreamp(7.0),
             Request::SetAutoOffLowPower(false),
             Request::SetAutoOffIdle(false),
+            Request::SaveSessionAs {
+                name: "daily".into(),
+            },
+            Request::SaveSessionOverwrite,
+            Request::DiscardSession,
+            Request::ResetPreset {
+                name: "bright".into(),
+            },
+            Request::ConfirmResetPreset {
+                name: "bright".into(),
+                backups: vec![PresetBackup {
+                    source: "bright".into(),
+                    dest: "my-bright".into(),
+                }],
+            },
+            Request::ConfirmReset {
+                backups: vec![PresetBackup {
+                    source: "mellow".into(),
+                    dest: "my-mellow".into(),
+                }],
+            },
         ];
         for r in reqs {
             let s = serde_json::to_string(&r).unwrap();
@@ -194,6 +264,15 @@ mod tests {
                 active: "default".into(),
                 names: vec!["default".into(), "flat".into()],
             },
+            Response::ResetWouldOverwrite {
+                names: vec!["bright".into()],
+            },
+            Response::UnsavedSession(Tuning {
+                enabled: false,
+                preset: "bright".into(),
+                preamp_db: -8.0,
+                bands: vec![],
+            }),
             Response::Error("nope".into()),
         ];
         for r in resps {

@@ -16,12 +16,12 @@ eqtune taps the system audio mix with Apple's modern **Core Audio process-tap AP
 
 ## Install
 
-From crates.io (once published):
+From crates.io:
 
 ```sh
-cargo install eqtune     
-eqtune install           
-eqtune on                
+cargo install eqtune
+eqtune install
+eqtune on
 ```
 
 Or from a clone:
@@ -40,10 +40,10 @@ On the first `eqtune on`, macOS asks for audio-capture permission.
 ```
 eqtune on | off | status              # start / stop / inspect
 eqtune presets | preset <name>        # list / switch preset (short: ls / p <name>)
-eqtune preset-save <name>             # save active tuning as a new preset
+eqtune preset-save <name>             # save active tuning as a preset
 eqtune preset-clone <src> <name>      # clone a preset and switch to the clone
 eqtune preset-rename <old> <new>      # rename a preset
-eqtune preset-rm <name>               # delete a preset
+eqtune preset-rm <name> [name...]     # delete one or more presets
 eqtune preset-export <name> [file]    # write a shareable preset TOML file
 eqtune preset-import <file> [name]    # import a preset, optionally renaming it
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
@@ -51,14 +51,16 @@ eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune idle on | off                  # auto-off while no media is active (default on)
-eqtune reset                          # restore the shipped presets
+eqtune reset [preset]                 # restore all shipped presets, or one preset
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
 - `eqtune on` and every edit (`preset`/`band`/`band-rm`/`preamp`/`reset`) print the
   resulting curve — the active preset, preamp, and each band — with the band you just
   changed flagged. `eqtune off` confirms the native Apple audio path is restored.
-- Edits apply **live** (no audio restart) and persist to  `~/Library/Application Support/eqtune/config.toml`.
+- Tuning edits apply **live** (no audio restart). On `eqtune off`, eqtune asks whether
+  to save the latest tuning as a new preset, overwrite the active preset name, or discard
+  the session changes.
 - For the no-eqtune native Apple sound, use `eqtune off`.
 - To save battery, eqtune **auto-disables while no media is active** and resumes when
   playback starts again. It also auto-disables while macOS Low Power Mode is on and
@@ -74,10 +76,17 @@ eqtune install | uninstall            # manage the launchd daemon
 | `pro` | crisp and detailed |
 
 Switch with `eqtune preset <name>` (or just `eqtune p <name>`), then fine-tune live with `eqtune band` / `eqtune preamp`.
-Use `eqtune preset-clone bright my-bright` before editing if you want to keep the shipped
-preset untouched, or `eqtune preset-save <name>` to save the current active tuning under
-a new name. New preset names use ASCII letters, digits, `-`, `_`, or `.`, and never
-overwrite an existing preset.
+You can temporarily tune any preset, including `bright`, `mellow`, and `pro`; when you
+turn eqtune off, choose whether to save the result as a new preset, overwrite that preset
+name on your device, or discard it. When saving by name, entering `bright`, `mellow`, or
+`pro` overwrites that shipped preset on your device; entering any unused name creates your
+own preset. If you later regret overwriting a shipped preset, run
+`eqtune reset bright` (or `mellow` / `pro`) to restore the original shipped tuning;
+`eqtune reset` restores all three shipped presets while keeping your custom presets. If a
+reset would replace a modified local shipped preset, eqtune warns first and can save that
+local version under a new custom preset name before restoring the original.
+New custom preset names use ASCII letters, digits, `-`, `_`, or `.`, and never overwrite
+an existing custom preset.
 Share presets with `eqtune preset-export my-bright`, which writes `my-bright.toml` in the
 current directory, or pass an explicit path. Import them with `eqtune preset-import
 my-bright.toml` or `eqtune preset-import my-bright.toml other-name`.

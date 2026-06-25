@@ -20,7 +20,9 @@ fn installed_bin() -> PathBuf {
 }
 
 fn plist_path() -> PathBuf {
-    home().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
+    home()
+        .join("Library/LaunchAgents")
+        .join(format!("{LABEL}.plist"))
 }
 
 fn uid() -> u32 {
@@ -61,7 +63,11 @@ pub fn install() -> anyhow::Result<()> {
         .status()?;
     if !status.success() {
         // Fall back to the legacy verb on older systems.
-        Command::new("launchctl").arg("load").arg("-w").arg(&plist).status()?;
+        Command::new("launchctl")
+            .arg("load")
+            .arg("-w")
+            .arg(&plist)
+            .status()?;
     }
     Ok(())
 }

@@ -1,12 +1,13 @@
 //! eqtune CLI entry point. Either runs the long-lived daemon or acts as a thin client
 //! that sends a single control request to it over the Unix socket.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
 use eqtune::daemon::Daemon;
-use eqtune::ipc::{self, Request, Response, Tuning};
+use eqtune::ipc::{self, PresetBackup, Request, Response, Tuning};
 use eqtune::{dsp, sys::TapSession};
 
 #[derive(Parser)]
@@ -36,9 +37,12 @@ enum Command {
     /// Clone an existing preset to a new name and switch to it.
     #[command(name = "preset-clone", visible_alias = "preset-copy")]
     PresetClone { source: String, dest: String },
-    /// Delete a preset.
+    /// Delete one or more presets.
     #[command(name = "preset-rm", visible_alias = "preset-delete")]
-    PresetRm { name: String },
+    PresetRm {
+        #[arg(required = true, num_args = 1..)]
+        names: Vec<String>,
+    },
     /// Rename a preset.
     #[command(name = "preset-rename")]
     PresetRename { from: String, to: String },
@@ -66,8 +70,8 @@ enum Command {
     Lowpower { state: Toggle },
     /// Toggle auto-off while no media is active (on/off).
     Idle { state: Toggle },
-    /// Reset all settings to the built-in default curve.
-    Reset,
+    /// Reset all settings, or one shipped preset by name.
+    Reset { name: Option<String> },
     /// Run the audio daemon in the foreground (used by the LaunchAgent).
     #[command(hide = true)]
     Daemon,
@@ -144,7 +148,13 @@ fn main() -> anyhow::Result<()> {
             };
             match ipc::send(&req) {
                 Ok(resp) => {
-                    print_response(&client_cmd, &resp);
+                    if matches!(client_cmd, Command::Off) {
+                        handle_off_response(&resp)?;
+                    } else if matches!(client_cmd, Command::Reset { .. }) {
+                        handle_reset_response(&client_cmd, &resp)?;
+                    } else {
+                        print_response(&client_cmd, &resp);
+                    }
                     Ok(())
                 }
                 Err(e) => {
@@ -168,7 +178,9 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
             source: source.clone(),
             dest: dest.clone(),
         },
-        Command::PresetRm { name } => Request::DeletePreset { name: name.clone() },
+        Command::PresetRm { names } => Request::DeletePresets {
+            names: names.clone(),
+        },
         Command::PresetRename { from, to } => Request::RenamePreset {
             from: from.clone(),
             to: to.clone(),
@@ -190,7 +202,8 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         Command::Preamp { db } => Request::SetPreamp(*db),
         Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
-        Command::Reset => Request::Reset,
+        Command::Reset { name: Some(name) } => Request::ResetPreset { name: name.clone() },
+        Command::Reset { name: None } => Request::Reset,
         Command::Daemon
         | Command::Install
         | Command::Uninstall
@@ -255,8 +268,12 @@ fn print_response(cmd: &Command, resp: &Response) {
                     println!("preamp → {}", fmt_gain(*db));
                     None
                 }
-                Command::Reset => {
+                Command::Reset { name: None } => {
                     println!("reset to shipped defaults");
+                    None
+                }
+                Command::Reset { name: Some(name) } => {
+                    println!("reset preset → {name}");
                     None
                 }
                 _ => None,
@@ -319,8 +336,11 @@ fn print_response(cmd: &Command, resp: &Response) {
             );
         }
         Response::Presets { active, names } => {
-            if let Command::PresetRm { name } = cmd {
-                println!("deleted preset {name}");
+            if let Command::PresetRm {
+                names: deleted_names,
+            } = cmd
+            {
+                println!("deleted presets: {}", deleted_names.join(", "));
             }
             for n in names {
                 let marker = if n == active { "*" } else { " " };
@@ -330,6 +350,174 @@ fn print_response(cmd: &Command, resp: &Response) {
         Response::Error(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
+        }
+        Response::UnsavedSession(t) => {
+            println!("unsaved tuning changes");
+            print_curve(t, None);
+        }
+        Response::ResetWouldOverwrite { names } => {
+            println!(
+                "reset would replace modified shipped presets: {}",
+                names.join(", ")
+            );
+        }
+    }
+}
+
+fn handle_off_response(resp: &Response) -> anyhow::Result<()> {
+    match resp {
+        Response::UnsavedSession(t) => {
+            println!("eqtune off — native Apple audio restored");
+            println!("unsaved tuning changes for preset '{}'", t.preset);
+            print_curve(t, None);
+            resolve_unsaved_session(&t.preset)
+        }
+        _ => {
+            print_response(&Command::Off, resp);
+            Ok(())
+        }
+    }
+}
+
+fn resolve_unsaved_session(active_preset: &str) -> anyhow::Result<()> {
+    loop {
+        print!("Preserve this tuning? [s]ave by name / [o]verwrite {active_preset} / [d]iscard: ");
+        io::stdout().flush()?;
+        let choice = read_line_trimmed()?;
+        let req = match choice.as_str() {
+            "s" | "save" => {
+                print!("Preset name (new name, or bright/mellow/pro to overwrite that built-in): ");
+                io::stdout().flush()?;
+                let name = read_line_trimmed()?;
+                if name.is_empty() {
+                    eprintln!("preset name must not be empty");
+                    continue;
+                }
+                Request::SaveSessionAs { name }
+            }
+            "o" | "overwrite" => Request::SaveSessionOverwrite,
+            "d" | "discard" | "" => Request::DiscardSession,
+            _ => {
+                eprintln!("enter s, o, or d");
+                continue;
+            }
+        };
+
+        match ipc::send(&req)? {
+            Response::Error(e) => {
+                eprintln!("error: {e}");
+                continue;
+            }
+            Response::Tuning(t) => {
+                match req {
+                    Request::SaveSessionAs { .. } => println!("saved tuning"),
+                    Request::SaveSessionOverwrite => println!("overwrote preset {active_preset}"),
+                    Request::DiscardSession => println!("discarded tuning changes"),
+                    _ => {}
+                }
+                print_curve(&t, None);
+                return Ok(());
+            }
+            other => {
+                print_response(&Command::Off, &other);
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn read_line_trimmed() -> anyhow::Result<String> {
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line)?;
+    if read == 0 {
+        return Ok(String::new());
+    }
+    Ok(line.trim().to_string())
+}
+
+fn handle_reset_response(cmd: &Command, resp: &Response) -> anyhow::Result<()> {
+    match resp {
+        Response::ResetWouldOverwrite { names } => resolve_reset_overwrite(cmd, names),
+        _ => {
+            print_response(cmd, resp);
+            Ok(())
+        }
+    }
+}
+
+fn resolve_reset_overwrite(cmd: &Command, names: &[String]) -> anyhow::Result<()> {
+    println!(
+        "reset will restore shipped preset values for: {}",
+        names.join(", ")
+    );
+    println!("The current local versions of those presets differ from the shipped originals.");
+    loop {
+        print!("Save copies before reset? [s]ave copies / [r]eset without saving / [c]ancel: ");
+        io::stdout().flush()?;
+        let choice = read_line_trimmed()?;
+        match choice.as_str() {
+            "s" | "save" => {
+                let backups = prompt_reset_backups(names)?;
+                send_confirm_reset(cmd, backups)?;
+                return Ok(());
+            }
+            "r" | "reset" | "" => {
+                send_confirm_reset(cmd, vec![])?;
+                return Ok(());
+            }
+            "c" | "cancel" => {
+                println!("reset canceled");
+                return Ok(());
+            }
+            _ => eprintln!("enter s, r, or c"),
+        }
+    }
+}
+
+fn prompt_reset_backups(names: &[String]) -> anyhow::Result<Vec<PresetBackup>> {
+    let mut backups = Vec::new();
+    for source in names {
+        let default = format!("{source}-custom");
+        loop {
+            print!("Save current {source} as [{default}]: ");
+            io::stdout().flush()?;
+            let entered = read_line_trimmed()?;
+            let dest = if entered.is_empty() {
+                default.clone()
+            } else {
+                entered
+            };
+            if backups.iter().any(|b: &PresetBackup| b.dest == dest) {
+                eprintln!("backup name already used in this reset: {dest}");
+                continue;
+            }
+            backups.push(PresetBackup {
+                source: source.clone(),
+                dest,
+            });
+            break;
+        }
+    }
+    Ok(backups)
+}
+
+fn send_confirm_reset(cmd: &Command, backups: Vec<PresetBackup>) -> anyhow::Result<()> {
+    let req = match cmd {
+        Command::Reset { name: Some(name) } => Request::ConfirmResetPreset {
+            name: name.clone(),
+            backups,
+        },
+        Command::Reset { name: None } => Request::ConfirmReset { backups },
+        _ => unreachable!("only reset commands need reset confirmation"),
+    };
+    match ipc::send(&req)? {
+        Response::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(())
+        }
+        resp => {
+            print_response(cmd, &resp);
+            Ok(())
         }
     }
 }
@@ -451,5 +639,19 @@ mod tests {
             got,
             std::env::current_dir().unwrap().join("presets/daily.toml")
         );
+    }
+
+    #[test]
+    fn preset_rm_accepts_multiple_names() {
+        let cli = Cli::try_parse_from(["eqtune", "preset-rm", "daily", "desk"]).unwrap();
+        match cli.command {
+            Command::PresetRm { names } => assert_eq!(names, ["daily", "desk"]),
+            _ => panic!("expected preset-rm command"),
+        }
+    }
+
+    #[test]
+    fn preset_rm_requires_at_least_one_name() {
+        assert!(Cli::try_parse_from(["eqtune", "preset-rm"]).is_err());
     }
 }
