@@ -1,0 +1,152 @@
+# eqtune
+
+[eqtune on crates.io](https://crates.io/crates/eqtune)
+
+## why eqtune
+
+众所周知，Mac扬声器的原生调教非常保守，特别是在MacBook Air的丐版扬声器中表现明显，表现为中频率音量相对较大进而导致播放音乐时有扁平感。
+
+现有的第三方equalizer都倾向于通过安装loopback/kernel drivers来替换掉原生扬声器。这会导致项目体型庞大，且在连接蓝牙耳机或有线耳机后，并不会及时切换输出设备。
+
+eqtune通过利用Apple从MacOS 14.2开始支持的**Core Audio Process API**来实现对系统级别音频的调衡。
+
+## general 
+
+```
+   you ── eqtune on/off/band/… ─▶    ┌─────────────────────┐
+   (CLI client, short-lived)         │  thin client        │
+                                     └──────────┬──────────┘
+                                                │  one JSON request / reply
+                                                │  over a Unix domain socket
+                                                ▼
+   launchd ── runs at login ──▶      ┌─────────────────────┐
+   (KeepAlive)                       │  daemon (long-lived)│  owns config + audio engine        
+                                     └──────────┬──────────┘
+                                                │  Rust → C FFI (tap_shim.h)
+                                                ▼
+                                     ┌─────────────────────┐
+                                     │  Objective-C shim   │  Core Audio / Foundation
+                                     └──────────┬──────────┘
+                                                │  process-tap API
+                                                ▼
+   system audio ─▶ global tap ─▶ aggregate device ─▶ IOProc ─▶ default output device
+                                         (capture → EQ → replay, one shared clock)
+```
+> 是的，这个项目没能完全用Rust实现：因为process-tap API更偏Objective-C形态，且目前缺少成熟的Rust封装🤷
+
+`eqtune daemon`是一个隐藏的，在开机时即一直运行的进程。
+而其它的命令，如（`on`, `off`, `band`, `preset`, ...）都是一个用于打开socket的client，它在发送一条指令并打印出返回结果后就退出了。
+
+## modules
+
+| File | Responsibility |
+|------|----------------|
+| `src/main.rs` | CLI parsing |
+| `src/ipc.rs` | Control: `Request`/`Response`/`Status` enums, socket path, send/recv. |
+| `src/daemon.rs` | long-lived process. 包括config, engine, 对engine的lifecycle的控制等 |
+| `src/dsp.rs` | 信号处理: RBJ biquad设计, preamp实现, 用于防止过于激进的调教造成扭曲的`soft_clip`, 和实时的`Processor`. |
+| `src/sys.rs` | Raw FFI到Objective C转换，外加一些safety wrappers (`TapSession`, `EqHandle`) |
+| `src/config.rs` | 用TOML保存自定义调教: presets (bands和preamp) 和一些全局开关 |
+| `src/launchd.rs` | LaunchAgent的安装和移除 |
+| `shim/tap_shim.{h,m}` |Objective-C Core Audio shim, 以C ABI的形式暴露给项目的Rust部分 |
+| `build.rs` | 编译shim，嵌入了`Info.plist`. |
+
+TLDR：`src/sys.rs`和shim里面集中了没法优雅故障恢复、带`unsafe`、且仅macOS需要的代码。
+
+## two planes
+
+### control plane
+
+`src/ipc.rs`中实现了用户命令与engine交互的途径：
+
+```rs
+enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
+                SavePreset { name }, ClonePreset { source, dest },
+                DeletePresets { names }, RenamePreset { from, to },
+                ExportPreset { name, path }, ImportPreset { path, name },
+                SetBand { freq, gain_db, q }, RemoveBand { freq },
+                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
+                SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
+                ResetPreset { name }, ConfirmResetPreset { name, backups },
+                Reset, ConfirmReset { backups } }
+enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
+                ResetWouldOverwrite { names }, UnsavedSession(Tuning), Error(String) }
+```
+
+一个client（比如`eqtune band 2000 -6`这行命令）会把一个`Request`改写成JSON，并把一行写入`~/Library/Application Support/eqtune/eqtune.sock`，再读到一个返回的`Response`。
+daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令，改变状态，然后回复。
+`Enable`下，会回复`Tuning`，让CLI打印当前调教曲线；`Disable`下，如果存在未保存的实时改动，会返回`UnsavedSession`并由CLI继续询问保存/覆盖/丢弃；若没有未保存改动，才返回`Ok`。
+另外，`export`命令会导出单preset TOML并返回`Ok`；而保存/克隆/重命名/import等命令会根据语义返回`Tuning`或预设列表，而不都是`Ok`。
+
+因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。
+
+### audio plane
+
+Apple提供的**Core Audio process-tap API**允许一个来自user-space的进程获得系统的audio mix。eqtune利用这一点设置了三个对象：
+
+1. global process tap
+
+需要注意的是，这个tap里不包含eqtune自己的进程，否则我们捕获后重新播放的音频会被再次捕获，造成一个邪恶的死循环（我们其实通过`kAudioHardwarePropertyTranslatePIDToProcessObject`来获得我们自己的音频对象，但这不是重点）。
+另外，我们用`CATapMutedWhenTapped`来实现只在我们悄悄截走了音频的时候才把原生音频静音，否则关闭了daemon，原生的音频也没了。
+
+2. private aggregate device
+
+`AudioHardwareCreateAggregateDevice`把当前默认输出设备（clock和playback）和我们自己的tap绑定。这样二者共享同一个clock，可以保证捕获音频与回放音频之间没有漂移。
+
+3. I/O callback
+
+`AudioDeviceCreateIOProcID`和`AudioDeviceStart`中，每一个循环里，`io_proc`把系统音频导入output buffer，再调用Rust部分中的`eqtune_process_cb`来原位调衡那个部分的音频。
+
+> daemon每100ms轮询一次默认输出设备和其sample rate。当你插入有线耳机或连接蓝牙耳机时，它会拆掉当前aggregate，并围绕新设备重建aggregate device。
+
+### dsp and lock-free hand-off
+
+`src/dsp.rs`中，EQ采用RBJ [*Audio EQ Cookbook*](https://webaudio.github.io/Audio-EQ-Cookbook/Audio-EQ-Cookbook.txt) 中的系数设计。
+
+请注意
+`EqSettings`（音频线程中所需全部参数的不可变快照）和`Processor`（音频线程本地的filter状态）通过`Arc<ArcSwap<EqSettings>>`相连接。control线程通过一次原子指针交换发布新快照，audio线程在每个block中用`load()`读取快照，无需等待。**audio线程是lock-free的**，这很重要，因为实时音频处理中阻塞或等待互斥锁可能引发优先级反转和掉帧。
+`src/sys.rs`负责把它俩连起来。`process-trampoline`是shim调用的`extern "C"`函数。它加载当前设置之后在buffer中运行processor。`TapSession`拥有原生session，在`Drop`的时候可以停止音频，所以这顺便很好地实现了`eqtune off`，本质就是drop掉`TapSession`，而且这可以避免泄露Core Audio对象或者以错误的方式终止它们。
+
+## engine lifecycle
+
+这部分的存在是因为本人在试用这玩意儿的期间发现，equalizer是一个很费电的事情。正常来说，MacBook Air的续航允许我连续播放数小时音乐。但在一个阴雨连绵的下午，我惊恐地发现，听歌2小时，电量从50%直接叠到了20%。
+
+于是，我需要在合适的时候让daemon自己停止运行engine。
+
+- `engine_target_on`：engine现在该在运行
+- `user_intent`：用户明确指令的on/off
+- `low_power`：MacBook在低电量模式下吗？都低电量模式了，就别调衡了吧。
+- `idle_suspended`: 没有捕获到任何音频呢？没放音乐，engine运行着干嘛呢？
+
+`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。
+
+> 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教改变时重新计算filter的coeffs; (b) 0dB被忽略，因此不消耗biquad。
+
+## persistence & packaging
+
+- **Config** 全部是存放在`~/Library/Application Support/eqtune/config.toml`的TOML。
+  我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
+  daemon拥有实时调教和上一个被保存的调教。只改变当前正在运行的config，只有实时调教会被改变。`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。
+  这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
+
+- **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置。
+
+## FAQ
+
+1. 为什么不用Apple自带的Equalizer？
+
+macOS里的graphic equalizer只对Apple Music自己的播放有效。对Safari, Spotify, 视频、游戏、系统声音都不起作用。
+而现有的第三方方案通常选择安装loopback/kernel audio driver，把它自己变成默认输出设备，所有声音都经过这个虚拟设备处理。这会破坏macOS的正常设备切换，需要内核扩展和随之而来的signing/notarization。
+
+2. 为什么用Rust？
+
+因为这是Rust程序设计这门课的大作业（bushi）
+
+- Rust没有GC。对音频作出实时修改肯定不能接受突然apocalypse的GC存在。Rust的所有权也让**lock-free `ArcSwap` hand-off**非常容易实现。
+- daemon需要长时间运行。臭名昭著的Microsoft Office全家桶已经造成了难以计数的内存泄露。Rust能保证这个项目的内存不安全部分只有`sys.rs`里面的一小部分代码。
+- 我爱`cargo`
+
+3. 为什么不能只用Rust？
+
+DSP, config, IPC, daemon, lifecycle等都完全用Rust实现。唯一的Objective-C代码是shim/tap_shim.m，它存在是因为eqtune依赖的API只能从Objective-C/C调用。
+这大约250行Objective-C代码用ARC(`-fobjc-arc`)编译，以确保内存管理的正确性，对外暴露一个很小的C ABI，而Rust通过`sys.rs`中的一小段`extern "C"`接口和它交互。
