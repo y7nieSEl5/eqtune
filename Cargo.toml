@@ -11,6 +11,7 @@ keywords = ["audio", "equalizer", "macos", "coreaudio", "eq"]
 categories = ["multimedia::audio", "command-line-utilities"]
 include = [
     "ARCHITECTURE.md",
+    "ARCHITECTURE_zh.md",
     "CHANGELOG.md",
     "Cargo.lock",
     "Cargo.toml",
