@@ -321,7 +321,7 @@ const SILENCE_SKIP_BLOCKS: u32 = 3;
 /// Whether every sample in `buf` is below [`SILENCE_THRESHOLD`] (short-circuits on the
 /// first audible sample, so it is cheap on real audio).
 #[inline]
-pub(crate) fn block_is_silent(buf: &[f32]) -> bool {
+fn block_is_silent(buf: &[f32]) -> bool {
     buf.iter().all(|s| s.abs() < SILENCE_THRESHOLD)
 }
 
@@ -353,9 +353,15 @@ impl Processor {
         }
     }
 
-    pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) {
+    /// Sync coefficients if `settings` changed, EQ the block in place, and return whether
+    /// the block's *input* was silent — scanned once here so the audio callback can drive
+    /// idle detection without walking the buffer a second time.
+    pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) -> bool {
+        // One pass over the untouched input; reused for the silence-skip below and handed
+        // back to the caller.
+        let silent = block_is_silent(buf);
         if channels == 0 {
-            return;
+            return silent;
         }
         // Re-copy biquad coefficients only when `settings` actually changed (see
         // `last_settings`); in steady state this skips dozens of copies per block.
@@ -379,10 +385,10 @@ impl Processor {
         // Skip the per-sample EQ on sustained silence: silent in → silent out, so once any
         // filter ring-out has been rendered (after SILENCE_SKIP_BLOCKS) we can leave the
         // already-correct buffer untouched and do no per-sample work.
-        if block_is_silent(buf) {
+        if silent {
             self.silent_blocks = self.silent_blocks.saturating_add(1);
             if self.silent_blocks > SILENCE_SKIP_BLOCKS {
-                return;
+                return silent;
             }
         } else {
             self.silent_blocks = 0;
@@ -403,6 +409,7 @@ impl Processor {
                 buf[idx] = s;
             }
         }
+        silent
     }
 }
 
@@ -642,5 +649,23 @@ mod tests {
             "audio after silence must be EQ'd"
         );
         assert!(buf.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_reports_input_silence() {
+        // The audio callback drives idle detection off this return value, so it must
+        // reflect the block's input regardless of how the block is processed.
+        let mut p = Processor::new(2);
+        let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let mut quiet = vec![0.0f32; 256 * 2];
+        assert!(
+            p.run(&s, &mut quiet, 2),
+            "all-zero input must report silent"
+        );
+        let mut loud = vec![0.5f32; 256 * 2];
+        assert!(
+            !p.run(&s, &mut loud, 2),
+            "audible input must report not silent"
+        );
     }
 }

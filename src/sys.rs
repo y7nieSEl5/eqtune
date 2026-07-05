@@ -76,7 +76,10 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     let settings = state.settings.load(); // arc-swap Guard: borrow, no per-block Arc clone
     let len = frames as usize * channels as usize;
     let buf = unsafe { std::slice::from_raw_parts_mut(buffer, len) };
-    if crate::dsp::block_is_silent(buf) {
+    // `run` scans the block for input silence once and returns it, so idle accounting
+    // reuses that result instead of walking the buffer a second time here.
+    let silent = state.processor.run(&settings, buf, channels as usize);
+    if silent {
         state
             .activity
             .silent_frames
@@ -84,7 +87,6 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     } else {
         state.activity.silent_frames.store(0, Ordering::Relaxed);
     }
-    state.processor.run(&settings, buf, channels as usize);
 }
 
 /// Control-thread handle used to push fresh EQ settings to a running session,
