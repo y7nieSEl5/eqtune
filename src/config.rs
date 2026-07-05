@@ -179,23 +179,31 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e.into()),
         };
-        match toml::from_str(&contents) {
-            Ok(config) => Ok(config),
-            Err(e) => {
-                // A corrupt config must not brick the daemon: under launchd KeepAlive a
-                // hard parse error would restart it into the same failure forever, and
-                // the user would lose every preset. Preserve the bad file for manual
-                // recovery and continue with defaults instead.
-                let backup = with_suffix(path, ".corrupt");
-                let _ = std::fs::rename(path, &backup);
-                eprintln!(
-                    "eqtune: config at {} is corrupt ({e}); backed up to {} and continuing with defaults",
-                    path.display(),
-                    backup.display()
-                );
-                Ok(Self::default())
-            }
-        }
+        // A config that is unusable — malformed TOML, or parseable but with a preset the
+        // real-time engine could not run without allocating (over dsp::MAX_BANDS) — is
+        // quarantined rather than propagated: under launchd KeepAlive a hard error would
+        // restart the daemon into the same failure forever and lose every preset. Back
+        // the bad file up for manual recovery and continue with defaults.
+        let reason = match toml::from_str::<Config>(&contents) {
+            Ok(config) => match config.max_preset_bands() {
+                over if over > dsp::MAX_BANDS => {
+                    format!(
+                        "a preset has {over} bands, over the maximum of {}",
+                        dsp::MAX_BANDS
+                    )
+                }
+                _ => return Ok(config),
+            },
+            Err(e) => format!("invalid TOML ({e})"),
+        };
+        let backup = with_suffix(path, ".corrupt");
+        let _ = std::fs::rename(path, &backup);
+        eprintln!(
+            "eqtune: config at {} is unusable ({reason}); backed up to {} and continuing with defaults",
+            path.display(),
+            backup.display()
+        );
+        Ok(Self::default())
     }
 
     /// Persist to [`Config::path`], creating the parent directory if needed.
@@ -215,6 +223,17 @@ impl Config {
         std::fs::write(&tmp, contents)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
+    }
+
+    /// The largest band count across all presets (0 if there are none). Used at load
+    /// time to reject a config the real-time engine could not run without allocating on
+    /// the audio thread (see [`crate::dsp::MAX_BANDS`]).
+    fn max_preset_bands(&self) -> usize {
+        self.presets
+            .values()
+            .map(|p| p.bands.len())
+            .max()
+            .unwrap_or(0)
     }
 
     /// The currently selected preset, falling back to "default" then any preset.
@@ -336,6 +355,61 @@ bands = []
         // next save writes a fresh, valid config.
         assert!(dir.join("config.toml.corrupt").exists());
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wide_bands(n: usize) -> Vec<Band> {
+        (0..n)
+            .map(|i| Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 20.0 + i as f32,
+                gain_db: 1.0,
+                q: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn load_from_recovers_from_over_cap_preset() {
+        let dir = unique_dir("overcap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // Valid TOML, but a preset exceeds the band cap — the RT engine could not run it
+        // without allocating, so load must quarantine it and fall back to defaults.
+        let mut c = Config::default();
+        c.presets.insert(
+            "big".into(),
+            Preset {
+                bands: wide_bands(dsp::MAX_BANDS + 1),
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        let recovered = Config::load_from(&path).unwrap();
+        assert_eq!(recovered, Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_accepts_preset_at_the_band_cap() {
+        let dir = unique_dir("atcap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.presets.insert(
+            "full".into(),
+            Preset {
+                bands: wide_bands(dsp::MAX_BANDS),
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.presets["full"].bands.len(), dsp::MAX_BANDS);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
