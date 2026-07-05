@@ -74,6 +74,32 @@ bool eqtune_default_output_device_running(void) {
     return status == noErr && running != 0;
 }
 
+bool eqtune_default_output_device_name(char *buf, size_t buflen) {
+    if (!buf || buflen == 0) {
+        return false;
+    }
+    @autoreleasepool {
+        AudioObjectID dev = (AudioObjectID)eqtune_default_output_device();
+        if (dev == kAudioObjectUnknown || dev == 0) {
+            return false;
+        }
+        CFStringRef name = NULL;
+        UInt32 size = sizeof(name);
+        AudioObjectPropertyAddress addr = {
+            .mSelector = kAudioObjectPropertyName,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        // The Name property returns a +1 CFStringRef the caller owns (like the UID above).
+        if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &name) != noErr || !name) {
+            return false;
+        }
+        bool ok = CFStringGetCString(name, buf, (CFIndex)buflen, kCFStringEncodingUTF8);
+        CFRelease(name);
+        return ok;
+    }
+}
+
 // --- helpers ---------------------------------------------------------------
 
 static AudioObjectID default_output_device(void) {

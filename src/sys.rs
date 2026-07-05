@@ -1,7 +1,7 @@
 //! Raw FFI to the Objective-C Core Audio shim (`shim/tap_shim.m`) plus safe wrappers.
 //! This is the boundary between Rust and the macOS audio system.
 
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,9 @@ unsafe extern "C" {
     fn eqtune_low_power_enabled() -> bool;
     /// Whether the current default output device is running somewhere.
     fn eqtune_default_output_device_running() -> bool;
+    /// Writes the default output device name (NUL-terminated UTF-8) into `buf`; returns
+    /// false if unavailable or the buffer is too small.
+    fn eqtune_default_output_device_name(buf: *mut c_char, buflen: usize) -> bool;
     fn eqtune_tap_start(cb: ProcessCb, ctx: *mut c_void) -> *mut RawSession;
     fn eqtune_tap_stop(session: *mut RawSession);
 }
@@ -40,6 +43,20 @@ pub fn default_output_device() -> Option<u32> {
 pub fn default_output_sample_rate() -> Option<f64> {
     let rate = unsafe { eqtune_default_output_sample_rate() };
     (rate > 0.0).then_some(rate)
+}
+
+/// The current default output device's human-readable name, if available.
+pub fn default_output_device_name() -> Option<String> {
+    // CoreAudio device names are short; 256 bytes is ample for the UTF-8 form.
+    let mut buf = [0u8; 256];
+    let ok =
+        unsafe { eqtune_default_output_device_name(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+    if !ok {
+        return None;
+    }
+    // The shim NUL-terminates on success; decode the bytes up to it.
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
 }
 
 /// Whether macOS Low Power Mode is currently enabled.
@@ -164,6 +181,7 @@ mod tests {
         // Proves the ObjC shim compiles, links CoreAudio, and is callable from Rust.
         let _ = default_output_device();
         let _ = default_output_sample_rate();
+        let _ = default_output_device_name();
         let _ = low_power_enabled();
         let _ = default_output_device_running();
     }

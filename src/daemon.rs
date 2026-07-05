@@ -553,7 +553,7 @@ impl Daemon {
         let output_device = self
             .engine_target
             .filter(|_| self.engine.is_some())
-            .map(|(dev, _)| format!("#{dev}"));
+            .map(|(dev, _)| sys::default_output_device_name().unwrap_or_else(|| format!("#{dev}")));
         Status {
             enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
