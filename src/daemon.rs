@@ -918,8 +918,10 @@ mod tests {
 
     #[test]
     fn preset_delete_removes_active_and_selects_another() {
-        let mut c = Config::default();
-        c.active_preset = "mellow".into();
+        let mut c = Config {
+            active_preset: "mellow".into(),
+            ..Config::default()
+        };
         delete_presets(&mut c, &["mellow".into()]).unwrap();
         assert!(!c.presets.contains_key("mellow"));
         assert!(c.presets.contains_key(&c.active_preset));
@@ -968,8 +970,10 @@ mod tests {
 
     #[test]
     fn preset_rename_moves_preset_and_updates_active_name() {
-        let mut c = Config::default();
-        c.active_preset = "bright".into();
+        let mut c = Config {
+            active_preset: "bright".into(),
+            ..Config::default()
+        };
         let bright = c.presets["bright"].clone();
         rename_preset(&mut c, "bright", "daily").unwrap();
         assert!(!c.presets.contains_key("bright"));

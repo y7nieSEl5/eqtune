@@ -343,8 +343,10 @@ bands = []
     fn save_then_load_roundtrips() {
         let dir = std::env::temp_dir().join(format!("eqtune-cfg-test-{}", std::process::id()));
         let path = dir.join("config.toml");
-        let mut c = Config::default();
-        c.active_preset = "flat".to_string();
+        let c = Config {
+            active_preset: "flat".to_string(),
+            ..Config::default()
+        };
         c.save_to(&path).unwrap();
         let back = Config::load_from(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
