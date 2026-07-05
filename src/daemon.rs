@@ -20,6 +20,9 @@ use crate::sys::{self, EqHandle, TapSession};
 const BAND_MATCH_HZ: f32 = 0.5;
 /// Channel count for the processor (stereo).
 const CHANNELS: usize = 2;
+/// Fallback sample rate (Hz) used only when the default output device's nominal rate is
+/// unavailable. 48 kHz is the near-universal default for macOS output devices.
+const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 /// How often the idle loop accepts connections and checks the default device.
 const POLL: Duration = Duration::from_millis(100);
 /// Upper bound on a single client request/response exchange. A legitimate client sends
@@ -428,7 +431,10 @@ impl Daemon {
         }
 
         if let Some((_, handle)) = &self.engine {
-            let rate = self.engine_target.map(|(_, r)| r).unwrap_or(48_000);
+            let rate = self
+                .engine_target
+                .map(|(_, r)| r)
+                .unwrap_or(DEFAULT_SAMPLE_RATE_HZ);
             let idle_frames = IDLE_SUSPEND_AFTER.as_secs().saturating_mul(rate as u64);
             if handle.silent_frames() >= idle_frames {
                 self.idle_suspended = true;
@@ -469,7 +475,7 @@ impl Daemon {
             let fs = self
                 .engine_target
                 .map(|(_, r)| r as f32)
-                .unwrap_or(48_000.0);
+                .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f32);
             let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
                 handle.store(settings); // lock-free live update
@@ -579,7 +585,7 @@ impl Daemon {
 fn current_target() -> (u32, u32) {
     let dev = sys::default_output_device().unwrap_or(0);
     let rate = sys::default_output_sample_rate()
-        .unwrap_or(48_000.0)
+        .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f64)
         .round() as u32;
     (dev, rate)
 }
