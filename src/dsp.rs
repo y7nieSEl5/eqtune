@@ -283,6 +283,12 @@ pub struct EqSettings {
     pub coeffs: Vec<Coeffs>,
     pub preamp: f32,
     pub limiter: bool,
+    /// Monotonic version stamp, unique per published snapshot. The real-time [`Processor`]
+    /// compares it against the last snapshot it synced to decide whether to re-copy
+    /// coefficients, so an update is detected by value and never by heap address — immune
+    /// to an `Arc` being freed and its address reused between two audio blocks. `0` for the
+    /// initial snapshot; the control thread stamps increasing values on each live update.
+    pub generation: u64,
 }
 
 impl EqSettings {
@@ -298,6 +304,7 @@ impl EqSettings {
                 .collect(),
             preamp: db_to_lin(preamp_db),
             limiter,
+            generation: 0,
         }
     }
 }
@@ -330,11 +337,12 @@ fn block_is_silent(buf: &[f32]) -> bool {
 /// of the same band count, so live edits don't click) and processes in place.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
-    /// Identity of the [`EqSettings`] last synced into the cascades. The daemon publishes
-    /// a fresh `Arc<EqSettings>` on every live edit (and keeps the prior one alive while
-    /// the audio thread holds it), so pointer identity is a sound "did it change?" signal
-    /// — letting us skip the per-block coefficient copy in the common steady state.
-    last_settings: *const EqSettings,
+    /// Generation of the [`EqSettings`] last synced into the cascades, or `None` before the
+    /// first block. The control thread stamps a fresh, monotonically increasing generation
+    /// on every published snapshot, so "did it change?" is a value comparison — immune to
+    /// an `Arc` being freed and its heap address reused between two audio blocks, which a
+    /// pointer-identity check could mistake for "unchanged".
+    last_generation: Option<u64>,
     /// Consecutive near-silent blocks seen so far (gates the silence-skip).
     silent_blocks: u32,
 }
@@ -348,7 +356,7 @@ impl Processor {
             channels: (0..channels)
                 .map(|_| Vec::with_capacity(MAX_BANDS))
                 .collect(),
-            last_settings: std::ptr::null(),
+            last_generation: None,
             silent_blocks: 0,
         }
     }
@@ -363,10 +371,10 @@ impl Processor {
         if channels == 0 {
             return silent;
         }
-        // Re-copy biquad coefficients only when `settings` actually changed (see
-        // `last_settings`); in steady state this skips dozens of copies per block.
-        let id = settings as *const EqSettings;
-        if id != self.last_settings {
+        // Re-copy biquad coefficients only when a newer snapshot arrives, compared by
+        // generation (see `last_generation`); in steady state this skips dozens of copies
+        // per block.
+        if self.last_generation != Some(settings.generation) {
             // `n <= MAX_BANDS` for any preset the mutation paths accept, and each cascade
             // was constructed with that capacity reserved, so this resize stays within
             // capacity and does not allocate on the audio thread.
@@ -379,7 +387,7 @@ impl Processor {
                     bq.set_coeffs(*c);
                 }
             }
-            self.last_settings = id;
+            self.last_generation = Some(settings.generation);
         }
 
         // Skip the per-sample EQ on sustained silence: silent in → silent out, so once any
@@ -453,6 +461,15 @@ mod tests {
         20.0 * mag.log10()
     }
 
+    fn peak(freq: f32) -> Band {
+        Band {
+            kind: BandKind::Peaking,
+            freq,
+            gain_db: 6.0,
+            q: 1.0,
+        }
+    }
+
     #[test]
     fn identity_is_flat() {
         let c = Coeffs::identity();
@@ -515,8 +532,10 @@ mod tests {
         let mut buf = vec![0.3f32; 512 * 2];
         p.run(&s9, &mut buf, 2);
         assert!(buf.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
-        // Shrink to one band — the cascade must resize without panicking.
-        let s1 = EqSettings::new(
+        // Shrink to one band — the cascade must resize without panicking. A distinct
+        // published snapshot carries a distinct generation (as `EqHandle::store` stamps),
+        // so the audio thread picks up the new coefficient count.
+        let mut s1 = EqSettings::new(
             &[Band {
                 kind: BandKind::Peaking,
                 freq: 3000.0,
@@ -527,8 +546,14 @@ mod tests {
             0.0,
             false,
         );
+        s1.generation = 1;
         p.run(&s1, &mut buf, 2);
         assert!(buf.iter().all(|x| x.is_finite()));
+        assert_eq!(
+            p.channels[0].len(),
+            1,
+            "new snapshot must resize the cascade"
+        );
     }
 
     #[test]
@@ -666,6 +691,46 @@ mod tests {
         assert!(
             !p.run(&s, &mut loud, 2),
             "audible input must report not silent"
+        );
+    }
+
+    #[test]
+    fn run_resyncs_cascade_only_on_new_generation() {
+        let mut p = Processor::new(1);
+        let three = EqSettings::new(
+            &[peak(200.0), peak(1000.0), peak(5000.0)],
+            48_000.0,
+            0.0,
+            false,
+        );
+        let mut buf = vec![0.1f32; 128];
+        p.run(&three, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            3,
+            "first snapshot syncs three sections"
+        );
+
+        // Same generation, fewer bands: this is exactly the freed-and-reused-address hazard
+        // the generation stamp closes — the audio thread must treat it as unchanged and NOT
+        // adopt the new coefficient count.
+        let mut one_stale = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
+        one_stale.generation = three.generation;
+        p.run(&one_stale, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            3,
+            "a snapshot with the same generation must be skipped"
+        );
+
+        // A newer generation is adopted, resizing the cascade.
+        let mut one_fresh = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
+        one_fresh.generation = three.generation + 1;
+        p.run(&one_fresh, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            1,
+            "a newer generation must resync to one section"
         );
     }
 }
