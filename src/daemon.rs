@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Preset};
-use crate::dsp::{Band, BandKind, EqSettings};
+use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS};
 use crate::ipc::{self, PresetBackup, Request, Response, Status, Tuning};
 use crate::sys::{self, EqHandle, TapSession};
 
@@ -213,6 +213,11 @@ impl Daemon {
                     b.gain_db = gain_db;
                     b.q = q;
                 } else {
+                    if preset.bands.len() >= MAX_BANDS {
+                        return Ok(Response::Error(format!(
+                            "cannot add band: preset already has the maximum of {MAX_BANDS} bands"
+                        )));
+                    }
                     preset.bands.push(Band {
                         kind: BandKind::Peaking,
                         freq,
@@ -777,6 +782,12 @@ fn is_shipped_preset_name(name: &str) -> bool {
 }
 
 fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
+    if preset.bands.len() > MAX_BANDS {
+        return Err(anyhow::anyhow!(
+            "preset has too many bands ({}); the maximum is {MAX_BANDS}",
+            preset.bands.len()
+        ));
+    }
     validate_preamp(preset.preamp_db)?;
     for band in &preset.bands {
         validate_band(band.freq, band.gain_db, band.q)?;
@@ -1261,6 +1272,74 @@ mod tests {
             d.saved_config.presets["bright"],
             Config::default().presets["bright"]
         );
+    }
+
+    #[test]
+    fn set_band_rejects_exceeding_max_bands() {
+        let mut d = daemon_with(Config::default());
+        // Start from an empty preset so the count is controlled exactly.
+        d.config.presets.insert(
+            "empty".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: 0.0,
+            },
+        );
+        d.config.active_preset = "empty".into();
+        // Fill to MAX_BANDS with distinct frequencies (spaced > BAND_MATCH_HZ apart).
+        for i in 0..MAX_BANDS {
+            let freq = 20.0 + i as f32;
+            d.apply(Request::SetBand {
+                freq,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .unwrap();
+        }
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+        // One more *new* band must be rejected without mutating the preset.
+        let resp = d
+            .apply(Request::SetBand {
+                freq: 19_000.0,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .unwrap();
+        assert!(matches!(resp, Response::Error(_)));
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+        // Editing an existing band is still allowed at the cap.
+        d.apply(Request::SetBand {
+            freq: 20.0,
+            gain_db: -3.0,
+            q: 2.0,
+        })
+        .unwrap();
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+    }
+
+    #[test]
+    fn import_rejects_preset_exceeding_max_bands() {
+        let mut c = Config::default();
+        let bands: Vec<Band> = (0..=MAX_BANDS)
+            .map(|i| Band {
+                kind: BandKind::Peaking,
+                freq: 20.0 + i as f32,
+                gain_db: 1.0,
+                q: 1.0,
+            })
+            .collect();
+        assert_eq!(bands.len(), MAX_BANDS + 1);
+        let path = tmp_path("import-toomany.toml");
+        let file = PresetFile {
+            name: "big".into(),
+            bands,
+            preamp_db: 0.0,
+        };
+        std::fs::write(&path, toml::to_string_pretty(&file).unwrap()).unwrap();
+        let res = import_preset(&mut c, &path, None);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_err());
+        assert!(!c.presets.contains_key("big"));
     }
 
     fn daemon_with(config: Config) -> Daemon {

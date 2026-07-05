@@ -302,6 +302,15 @@ impl EqSettings {
     }
 }
 
+/// Upper bound on the number of biquad sections per channel the real-time [`Processor`]
+/// will ever hold. Each cascade reserves this capacity at construction (on the control
+/// thread), so syncing a new coefficient set on the audio thread never reallocates —
+/// upholding the "audio thread never allocates" invariant by construction. Band-adding
+/// paths (`SetBand`, preset import) reject anything beyond this, so a normal preset can
+/// never exceed the reserved capacity. Well above the densest standard graphic EQ
+/// (31-band ISO 1/3-octave).
+pub const MAX_BANDS: usize = 64;
+
 /// A block whose samples are all quieter than this (linear, ≈ −80 dBFS) counts as
 /// silent for the [`Processor`]'s silence-skip optimization.
 const SILENCE_THRESHOLD: f32 = 1e-4;
@@ -333,7 +342,12 @@ pub struct Processor {
 impl Processor {
     pub fn new(channels: usize) -> Self {
         Self {
-            channels: vec![Vec::new(); channels],
+            // Reserve MAX_BANDS up front (on the control thread) so the per-block
+            // coefficient sync in `run` only ever resizes *within* capacity and never
+            // reallocates on the audio thread.
+            channels: (0..channels)
+                .map(|_| Vec::with_capacity(MAX_BANDS))
+                .collect(),
             last_settings: std::ptr::null(),
             silent_blocks: 0,
         }
@@ -347,6 +361,9 @@ impl Processor {
         // `last_settings`); in steady state this skips dozens of copies per block.
         let id = settings as *const EqSettings;
         if id != self.last_settings {
+            // `n <= MAX_BANDS` for any preset the mutation paths accept, and each cascade
+            // was constructed with that capacity reserved, so this resize stays within
+            // capacity and does not allocate on the audio thread.
             let n = settings.coeffs.len();
             for cascade in self.channels.iter_mut() {
                 if cascade.len() != n {
@@ -571,6 +588,34 @@ mod tests {
             s.coeffs.len(),
             1,
             "only the non-zero-gain band should produce a coefficient"
+        );
+    }
+
+    #[test]
+    fn processor_reserves_capacity_so_run_never_reallocates() {
+        let mut p = Processor::new(2);
+        let cap_before: Vec<usize> = p.channels.iter().map(|c| c.capacity()).collect();
+        assert!(
+            cap_before.iter().all(|&c| c >= MAX_BANDS),
+            "each cascade must reserve MAX_BANDS up front"
+        );
+        // A full MAX_BANDS worth of non-identity bands (none dropped at design time).
+        let bands: Vec<Band> = (0..MAX_BANDS)
+            .map(|i| Band {
+                kind: BandKind::Peaking,
+                freq: 100.0 + i as f32 * 100.0,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .collect();
+        let s = EqSettings::new(&bands, 48_000.0, 0.0, false);
+        assert_eq!(s.coeffs.len(), MAX_BANDS);
+        let mut buf = vec![0.2f32; 128 * 2];
+        p.run(&s, &mut buf, 2);
+        let cap_after: Vec<usize> = p.channels.iter().map(|c| c.capacity()).collect();
+        assert_eq!(
+            cap_before, cap_after,
+            "syncing coefficients must not reallocate the audio-thread cascades"
         );
     }
 
