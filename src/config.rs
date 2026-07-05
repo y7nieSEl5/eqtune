@@ -236,11 +236,11 @@ impl Config {
             .unwrap_or(0)
     }
 
-    /// The currently selected preset, falling back to "default" then any preset.
+    /// The currently selected preset, or any remaining preset if the active name no longer
+    /// resolves (e.g. right after the active preset was deleted).
     pub fn active(&self) -> Option<&Preset> {
         self.presets
             .get(&self.active_preset)
-            .or_else(|| self.presets.get("default"))
             .or_else(|| self.presets.values().next())
     }
 }
@@ -248,6 +248,18 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_falls_back_to_a_remaining_preset_when_name_is_missing() {
+        // No preset is named "default"; a stale active name must still resolve to some
+        // preset (the first by name) rather than returning None.
+        let c = Config {
+            active_preset: "nonexistent".into(),
+            ..Config::default()
+        };
+        assert!(!c.presets.contains_key("nonexistent"));
+        assert!(c.active().is_some(), "must fall back to a remaining preset");
+    }
 
     #[test]
     fn default_active_is_bright() {
