@@ -22,6 +22,10 @@ const BAND_MATCH_HZ: f32 = 0.5;
 const CHANNELS: usize = 2;
 /// How often the idle loop accepts connections and checks the default device.
 const POLL: Duration = Duration::from_millis(100);
+/// Upper bound on a single client request/response exchange. A legitimate client sends
+/// its one line immediately; this only fires on a stalled or half-open connection, so it
+/// can't wedge the single-threaded accept/poll loop.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long captured audio must remain silent before the engine is suspended.
 const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
 const MIN_BAND_FREQ_HZ: f32 = 20.0;
@@ -96,6 +100,11 @@ impl Daemon {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false); // blocking for the short req/resp
+                    // Bound the blocking read/write so a client that connects but never
+                    // finishes its request can't freeze the daemon — a freeze would also
+                    // stall the device-follow, low-power, and idle polling below.
+                    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                     if let Err(e) = self.handle(stream) {
                         eprintln!("connection error: {e}");
                     }
@@ -1340,6 +1349,29 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         assert!(res.is_err());
         assert!(!c.presets.contains_key("big"));
+    }
+
+    #[test]
+    fn handle_does_not_block_on_a_silent_client() {
+        // A client that connects but never sends a full request line must not wedge the
+        // single-threaded daemon: the read timeout `run` sets turns it into an error.
+        let (client, server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut d = daemon_with(Config::default());
+
+        let start = std::time::Instant::now();
+        let res = d.handle(server);
+        assert!(
+            res.is_err(),
+            "a silent client must surface as an error, not a hang"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "handle must return promptly once the read times out"
+        );
+        drop(client);
     }
 
     fn daemon_with(config: Config) -> Daemon {
