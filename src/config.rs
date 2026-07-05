@@ -5,6 +5,7 @@
 //! Ships a working default (the built-in curve) so a first run needs no config file.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,18 @@ pub struct Config {
 /// config file.
 fn default_true() -> bool {
     true
+}
+
+/// A sibling path with `suffix` appended to the file name (e.g. `config.toml` +
+/// `.tmp` -> `config.toml.tmp`), so it lives in the same directory — and thus the same
+/// filesystem — as `path`, which is required for an atomic `rename`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("config"))
+        .to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// Build a graphic-EQ-style preset (peaking filters at ~octave Q) from (freq_hz,
@@ -161,10 +174,27 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Ok(toml::from_str(&s)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e.into()),
+        let contents = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e.into()),
+        };
+        match toml::from_str(&contents) {
+            Ok(config) => Ok(config),
+            Err(e) => {
+                // A corrupt config must not brick the daemon: under launchd KeepAlive a
+                // hard parse error would restart it into the same failure forever, and
+                // the user would lose every preset. Preserve the bad file for manual
+                // recovery and continue with defaults instead.
+                let backup = with_suffix(path, ".corrupt");
+                let _ = std::fs::rename(path, &backup);
+                eprintln!(
+                    "eqtune: config at {} is corrupt ({e}); backed up to {} and continuing with defaults",
+                    path.display(),
+                    backup.display()
+                );
+                Ok(Self::default())
+            }
         }
     }
 
@@ -177,7 +207,13 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let contents = toml::to_string_pretty(self)?;
+        // Write to a sibling temp file, then atomically rename it into place. A crash or
+        // power loss mid-write can then only truncate the throwaway temp file, never the
+        // live config — the rename either fully replaces it or leaves the old one intact.
+        let tmp = with_suffix(path, ".tmp");
+        std::fs::write(&tmp, contents)?;
+        std::fs::rename(&tmp, path)?;
         Ok(())
     }
 
@@ -259,6 +295,48 @@ bands = []
         let c: Config = toml::from_str(toml).unwrap();
         assert!(c.auto_off_low_power, "absent field should default to true");
         assert!(c.auto_off_idle, "absent field should default to true");
+    }
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("eqtune-cfg-{}-{unique}-{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn save_to_is_atomic_and_leaves_no_temp_file() {
+        let dir = unique_dir("atomic");
+        let path = dir.join("config.toml");
+        let c = Config::default();
+        c.save_to(&path).unwrap();
+
+        assert!(path.exists(), "config must be written");
+        assert!(
+            !dir.join("config.toml.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+        assert_eq!(Config::load_from(&path).unwrap(), c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_recovers_from_corrupt_config() {
+        let dir = unique_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "not valid toml {{{").unwrap();
+
+        // Must fall back to defaults instead of erroring (which would crash-loop the
+        // daemon under launchd KeepAlive).
+        let recovered = Config::load_from(&path).unwrap();
+        assert_eq!(recovered, Config::default());
+        // The bad file is preserved for manual recovery, and moved out of the way so the
+        // next save writes a fresh, valid config.
+        assert!(dir.join("config.toml.corrupt").exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
