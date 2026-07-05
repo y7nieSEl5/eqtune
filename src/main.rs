@@ -8,7 +8,6 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use eqtune::daemon::Daemon;
 use eqtune::ipc::{self, PresetBackup, Request, Response, Tuning};
-use eqtune::{dsp, sys::TapSession};
 
 #[derive(Parser)]
 #[command(name = "eqtune", version, about = "System-wide audio EQ for macOS")]
@@ -75,12 +74,6 @@ enum Command {
     /// Run the audio daemon in the foreground (used by the LaunchAgent).
     #[command(hide = true)]
     Daemon,
-    /// Print low-level audio probe info (debug).
-    #[command(hide = true)]
-    Probe,
-    /// Run the capture→EQ→replay tap in the foreground (Spike 0 listen test).
-    #[command(hide = true)]
-    Spike,
     /// Install the LaunchAgent and start the daemon.
     Install,
     /// Stop and remove the LaunchAgent.
@@ -110,33 +103,6 @@ fn main() -> anyhow::Result<()> {
             println!("eqtune daemon removed. (Config kept; delete");
             println!("~/Library/Application Support/eqtune to remove everything.)");
             Ok(())
-        }
-        Command::Probe => {
-            match eqtune::sys::default_output_device() {
-                Some(id) => println!("default output device id: {id}"),
-                None => println!("no default output device found"),
-            }
-            Ok(())
-        }
-        Command::Spike => {
-            let fs = eqtune::sys::default_output_sample_rate().unwrap_or(48_000.0) as f32;
-            let settings =
-                dsp::EqSettings::new(&dsp::default_bands(), fs, dsp::DEFAULT_PREAMP_DB, true);
-            match TapSession::start(2, settings) {
-                Some((_session, _handle)) => {
-                    println!("eqtune spike: system audio -> default-curve EQ -> output ({fs} Hz).");
-                    println!("Play some audio. Press Ctrl-C to stop.");
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(3600));
-                    }
-                }
-                None => {
-                    eprintln!(
-                        "failed to start the audio tap — needs macOS 14.2+ and audio-capture permission."
-                    );
-                    std::process::exit(1);
-                }
-            }
         }
         client_cmd => {
             let req = match to_request(&client_cmd) {
@@ -204,11 +170,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
         Command::Reset { name: Some(name) } => Request::ResetPreset { name: name.clone() },
         Command::Reset { name: None } => Request::Reset,
-        Command::Daemon
-        | Command::Install
-        | Command::Uninstall
-        | Command::Probe
-        | Command::Spike => {
+        Command::Daemon | Command::Install | Command::Uninstall => {
             unreachable!("handled above")
         }
     })
