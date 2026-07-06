@@ -2,6 +2,9 @@
 //! launchd LaunchAgent so the daemon runs at login. No code signing required —
 //! locally built code is not quarantined, so Gatekeeper never applies.
 
+use std::fs;
+use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,21 +37,20 @@ fn uid() -> u32 {
 pub fn install() -> anyhow::Result<()> {
     let current = std::env::current_exe()?;
     let dest = installed_bin();
-    std::fs::create_dir_all(support_dir())?;
-    std::fs::copy(&current, &dest)?;
+    fs::create_dir_all(support_dir())?;
+    copy_install_binary(&current, &dest)?;
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)?.permissions();
+        let mut perms = fs::metadata(&dest)?.permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)?;
+        fs::set_permissions(&dest, perms)?;
     }
 
     let log = support_dir().join("daemon.log");
     let plist = plist_path();
     if let Some(parent) = plist.parent() {
-        std::fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent)?;
     }
-    std::fs::write(&plist, plist_contents(&dest, &log))?;
+    fs::write(&plist, plist_contents(&dest, &log))?;
 
     let domain = format!("gui/{}", uid());
     // Replace any previous instance, then bootstrap the new one.
@@ -81,9 +83,27 @@ pub fn uninstall() -> anyhow::Result<()> {
         .arg(format!("{domain}/{LABEL}"))
         .status();
     let _ = Command::new("launchctl").arg("unload").arg(&plist).status();
-    let _ = std::fs::remove_file(&plist);
-    let _ = std::fs::remove_file(installed_bin());
+    let _ = fs::remove_file(&plist);
+    let _ = fs::remove_file(installed_bin());
     Ok(())
+}
+
+fn copy_install_binary(current: &Path, dest: &Path) -> anyhow::Result<()> {
+    if same_file(current, dest)? {
+        return Ok(());
+    }
+    fs::copy(current, dest)?;
+    Ok(())
+}
+
+fn same_file(a: &Path, b: &Path) -> io::Result<bool> {
+    let a_meta = fs::metadata(a)?;
+    let b_meta = match fs::metadata(b) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
 }
 
 fn plist_contents(bin: &Path, log: &Path) -> String {
@@ -118,6 +138,7 @@ fn plist_contents(bin: &Path, log: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn plist_has_essentials() {
@@ -127,5 +148,61 @@ mod tests {
         assert!(p.contains("<string>daemon</string>"));
         assert!(p.contains("RunAtLoad"));
         assert!(p.contains("KeepAlive"));
+    }
+
+    #[test]
+    fn copy_install_binary_skips_same_source_and_dest() -> anyhow::Result<()> {
+        let dir = test_dir("self-copy");
+        let bin = dir.join("eqtune");
+        fs::write(&bin, b"installed binary")?;
+
+        copy_install_binary(&bin, &bin)?;
+
+        assert_eq!(fs::read(&bin)?, b"installed binary");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_install_binary_skips_symlink_to_dest() -> anyhow::Result<()> {
+        let dir = test_dir("symlink-copy");
+        let bin = dir.join("eqtune");
+        let link = dir.join("eqtune-link");
+        fs::write(&bin, b"installed binary")?;
+        std::os::unix::fs::symlink(&bin, &link)?;
+
+        copy_install_binary(&link, &bin)?;
+
+        assert_eq!(fs::read(&bin)?, b"installed binary");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_install_binary_copies_distinct_source() -> anyhow::Result<()> {
+        let dir = test_dir("distinct-copy");
+        let source = dir.join("target-eqtune");
+        let dest = dir.join("installed-eqtune");
+        fs::write(&source, b"release binary")?;
+        fs::write(&dest, b"old binary")?;
+
+        copy_install_binary(&source, &dest)?;
+
+        assert_eq!(fs::read(&dest)?, b"release binary");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "eqtune-launchd-{}-{name}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
