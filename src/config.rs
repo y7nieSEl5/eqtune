@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::{self, Band};
@@ -53,6 +54,24 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
         .to_os_string();
     name.push(suffix);
     path.with_file_name(name)
+}
+
+/// A sibling backup path for an unusable config that does not already exist, so
+/// quarantining a second bad config never overwrites the first one's backup. The common
+/// case is `config.toml.corrupt`; a prior backup bumps it to `.corrupt.1`, `.corrupt.2`, …
+fn quarantine_path(path: &Path) -> PathBuf {
+    let base = with_suffix(path, ".corrupt");
+    if !base.exists() {
+        return base;
+    }
+    let mut n = 1;
+    loop {
+        let candidate = with_suffix(path, &format!(".corrupt.{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Build a graphic-EQ-style preset (peaking filters at ~octave Q) from (freq_hz,
@@ -192,8 +211,19 @@ impl Config {
             },
             Err(e) => format!("invalid TOML ({e})"),
         };
-        let backup = with_suffix(path, ".corrupt");
-        let _ = std::fs::rename(path, &backup);
+        // Move the bad file aside — both to preserve it for manual recovery and to get it
+        // out of the way so the next save writes a fresh config. If the move fails we must
+        // NOT continue: returning defaults here would let the next save overwrite the
+        // user's only copy with defaults, so propagate instead and leave the file intact.
+        let backup = quarantine_path(path);
+        std::fs::rename(path, &backup).with_context(|| {
+            format!(
+                "config at {} is unusable ({reason}) but could not be moved aside to {}; \
+                 refusing to continue and overwrite it with defaults",
+                path.display(),
+                backup.display(),
+            )
+        })?;
         eprintln!(
             "eqtune: config at {} is unusable ({reason}); backed up to {} and continuing with defaults",
             path.display(),
@@ -438,6 +468,30 @@ bands = []
         // next save writes a fresh, valid config.
         assert!(dir.join("config.toml.corrupt").exists());
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_quarantine_keeps_the_first_backup() {
+        let dir = unique_dir("requarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        std::fs::write(&path, "not valid toml {{{").unwrap();
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+
+        // A second unusable config must get its own backup, not overwrite the first.
+        std::fs::write(&path, "also not valid }}}").unwrap();
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(
+            dir.join("config.toml.corrupt").exists(),
+            "the first backup must survive a second quarantine"
+        );
+        assert!(
+            dir.join("config.toml.corrupt.1").exists(),
+            "the second bad config must be preserved under a distinct name"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
