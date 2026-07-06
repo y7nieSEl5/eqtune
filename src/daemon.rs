@@ -4,10 +4,10 @@
 //! follow the system default output device (so plugging in EarPods/Bluetooth "just
 //! works" without manually re-selecting output).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,10 +27,14 @@ const CHANNELS: usize = 2;
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 /// How often the idle loop accepts connections and checks the default device.
 const POLL: Duration = Duration::from_millis(100);
-/// Upper bound on a single client request/response exchange. A legitimate client sends
-/// its one line immediately; this only fires on a stalled or half-open connection, so it
-/// can't wedge the single-threaded accept/poll loop.
+/// Total budget for one client request/response exchange. `read_request_line` spends this
+/// down across the whole read (not just each recv), so a client that drips bytes just under
+/// the socket timeout still can't hold the single-threaded accept/poll loop open.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest request line the daemon will read before giving up. Requests are single short
+/// JSON lines; this only caps a misbehaving client so a newline-less flood can't grow the
+/// read buffer without bound.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// How long captured audio must remain silent before the engine is suspended.
 const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
 const MAX_PRESET_NAME_LEN: usize = 64;
@@ -97,9 +101,10 @@ impl Daemon {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false); // blocking for the short req/resp
-                    // Bound the blocking read/write so a client that connects but never
-                    // finishes its request can't freeze the daemon — a freeze would also
-                    // stall the device-follow, low-power, and idle polling below.
+                    // Bound the exchange so a stalled client can't freeze the daemon (which
+                    // would also stall the device-follow, low-power, and idle polling below).
+                    // The read timeout is the total request budget `read_request_line` spends
+                    // down; the write timeout bounds the small response.
                     let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
                     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                     if let Err(e) = self.handle(stream) {
@@ -117,9 +122,7 @@ impl Daemon {
     }
 
     fn handle(&mut self, stream: UnixStream) -> anyhow::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = read_request_line(&stream)?;
         if line.trim().is_empty() {
             return Ok(());
         }
@@ -577,6 +580,55 @@ impl Daemon {
             bands: active.map(|p| p.bands.clone()).unwrap_or_default(),
         }
     }
+}
+
+/// Read one newline-terminated request line, bounded by a total wall-clock budget (the
+/// socket's read timeout, i.e. [`REQUEST_TIMEOUT`]) and a [`MAX_REQUEST_BYTES`] size cap.
+///
+/// `BufRead::read_line`'s only bound is the socket's per-recv timeout, so a client dripping
+/// one byte just inside that window keeps it looping forever — wedging the single-threaded
+/// loop — and grows the buffer without bound on a newline-less flood. Enforcing an overall
+/// deadline and a size cap closes both.
+fn read_request_line(stream: &UnixStream) -> anyhow::Result<String> {
+    // Bound each recv (so a silent client can't block the loop forever) and the read as a
+    // whole (so a client dripping bytes just under that per-recv bound still can't hold it
+    // open). `budget` is the socket's configured read timeout — set by `run` to
+    // REQUEST_TIMEOUT — falling back to REQUEST_TIMEOUT if none is set; we (re)apply it once
+    // here so this stays correct even if a caller forgot to. The overall bound is then a
+    // deadline checked after each read rather than a per-recv timeout re-armed every
+    // iteration: macOS can reject a rapid re-arm of SO_RCVTIMEO under an active flood.
+    let budget = stream.read_timeout()?.unwrap_or(REQUEST_TIMEOUT);
+    stream.set_read_timeout(Some(budget))?;
+    let deadline = Instant::now() + budget;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = Vec::new();
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => break, // EOF before a newline
+            Ok(available) => {
+                if let Some(i) = available.iter().position(|&b| b == b'\n') {
+                    line.extend_from_slice(&available[..i]);
+                    reader.consume(i + 1);
+                    break;
+                }
+                let n = available.len();
+                line.extend_from_slice(available);
+                reader.consume(n);
+                if line.len() > MAX_REQUEST_BYTES {
+                    anyhow::bail!("request exceeds {MAX_REQUEST_BYTES} bytes");
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("client did not send a complete request in time");
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                anyhow::bail!("client did not send a complete request in time");
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
 }
 
 /// The current default output device and its (rounded) sample rate.
@@ -1286,6 +1338,29 @@ mod tests {
             "handle must return promptly once the read times out"
         );
         drop(client);
+    }
+
+    #[test]
+    fn read_request_line_caps_a_newlineless_flood() {
+        // A client that sends bytes without a newline must hit the size cap, not grow the
+        // read buffer without bound.
+        let (client, server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Write from another thread: once the daemon stops reading, the socket buffer fills
+        // and the write blocks, so it can't run inline without deadlocking the test.
+        let writer = std::thread::spawn(move || {
+            let mut w = client;
+            let _ = w.write_all(&vec![b'x'; MAX_REQUEST_BYTES + 16]);
+        });
+        let err = read_request_line(&server).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "a newline-less flood must surface as the size-cap error, got: {err}"
+        );
+        drop(server);
+        let _ = writer.join();
     }
 
     fn daemon_with(config: Config) -> Daemon {
