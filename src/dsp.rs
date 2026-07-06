@@ -310,12 +310,25 @@ impl EqSettings {
     /// 0 dB are skipped: they are mathematically identity, so omitting them saves a
     /// biquad per sample with no audible change.
     pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
+        let coeffs: Vec<Coeffs> = bands
+            .iter()
+            .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
+            .map(|b| Coeffs::design(b, fs))
+            .collect();
+        // The real-time [`Processor`] reserves `MAX_BANDS` capacity per cascade and resizes
+        // to `coeffs.len()` each block without reallocating — which holds only while a
+        // snapshot never carries more than `MAX_BANDS` sections. The mutation edges
+        // (`SetBand`, preset import, config load) all cap band count, so this is unreachable
+        // today; assert it at the single construction site anyway, so a future band-producing
+        // path that skips those caps trips here in tests instead of reallocating on the audio
+        // thread.
+        debug_assert!(
+            coeffs.len() <= MAX_BANDS,
+            "EqSettings built with {} sections, exceeding MAX_BANDS ({MAX_BANDS})",
+            coeffs.len()
+        );
         Self {
-            coeffs: bands
-                .iter()
-                .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
-                .map(|b| Coeffs::design(b, fs))
-                .collect(),
+            coeffs,
             preamp: db_to_lin(preamp_db),
             limiter,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
