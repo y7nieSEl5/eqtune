@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -242,12 +243,23 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        // Write to a sibling temp file, then atomically rename it into place. A crash or
-        // power loss mid-write can then only truncate the throwaway temp file, never the
-        // live config — the rename either fully replaces it or leaves the old one intact.
+        // Write to a sibling temp file, fsync it, then atomically rename it into place and
+        // fsync the directory. A crash or power loss mid-write can then only truncate the
+        // throwaway temp file, never the live config. The fsyncs are what make that true:
+        // without them the rename can reach disk before the bytes do, so a crash could leave
+        // `path` pointing at an empty or partial file — the very truncation this prevents.
         let tmp = with_suffix(path, ".tmp");
-        std::fs::write(&tmp, contents)?;
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
