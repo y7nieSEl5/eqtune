@@ -112,17 +112,13 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
 pub struct EqHandle {
     settings: Arc<ArcSwap<EqSettings>>,
     activity: Arc<AudioActivity>,
-    /// Hands out the monotonic generation stamped on each published snapshot, so the audio
-    /// thread detects updates by value rather than by (reusable) heap address. Starts at 1;
-    /// the initial snapshot carries generation 0.
-    generation: Arc<AtomicU64>,
 }
 
 impl EqHandle {
-    pub fn store(&self, mut settings: EqSettings) {
-        // Stamp a fresh generation so the audio thread's change detection can never mistake
-        // a new snapshot at a reused heap address for the previous one.
-        settings.generation = self.generation.fetch_add(1, Ordering::Relaxed);
+    /// Publish a new snapshot to the audio thread. Its construction-time generation stamp
+    /// is what the audio thread's change detection compares, so a new snapshot at a reused
+    /// heap address can never be mistaken for the previous one.
+    pub fn store(&self, settings: EqSettings) {
         self.settings.store(Arc::new(settings));
     }
 
@@ -148,7 +144,6 @@ impl TapSession {
         let handle = EqHandle {
             settings: shared.clone(),
             activity: activity.clone(),
-            generation: Arc::new(AtomicU64::new(1)),
         };
         let mut state = Box::new(AudioState {
             processor: Processor::new(channels),
