@@ -564,7 +564,7 @@ bands = []
 
     #[test]
     fn save_then_load_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("eqtune-cfg-test-{}", std::process::id()));
+        let dir = unique_dir("roundtrip");
         let path = dir.join("config.toml");
         let c = Config {
             active_preset: "flat".to_string(),
