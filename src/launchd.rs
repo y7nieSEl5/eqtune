@@ -6,7 +6,7 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const LABEL: &str = "app.eqtune.daemon";
 
@@ -53,25 +53,41 @@ pub fn install() -> anyhow::Result<()> {
     fs::write(&plist, plist_contents(&dest, &log))?;
 
     let domain = format!("gui/{}", uid());
-    // Replace any previous instance, then bootstrap the new one.
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(format!("{domain}/{LABEL}"))
-        .status();
-    let status = Command::new("launchctl")
-        .arg("bootstrap")
-        .arg(&domain)
-        .arg(&plist)
-        .status()?;
+    let service = format!("{domain}/{LABEL}");
+    let plist_str = plist.to_string_lossy();
+    // (Re)load the daemon. If it is already loaded, restart it in place with `kickstart -k`
+    // so it re-execs the freshly copied binary. A bootout+bootstrap pair would race the
+    // still-terminating KeepAlive job — bootout returns before the label is gone, so the
+    // immediate bootstrap collides with the still-registered service and launchd rejects it
+    // with "5: Input/output error". Only bootstrap when nothing is loaded yet.
+    let args = reload_args(service_is_loaded(&service), &domain, &service, &plist_str);
+    let status = Command::new("launchctl").args(&args).status()?;
     if !status.success() {
-        // Fall back to the legacy verb on older systems.
-        Command::new("launchctl")
-            .arg("load")
-            .arg("-w")
-            .arg(&plist)
-            .status()?;
+        anyhow::bail!("launchctl {} failed ({status})", args[0]);
     }
     Ok(())
+}
+
+/// Whether launchd already has `service` (a `gui/<uid>/<label>` target) loaded.
+fn service_is_loaded(service: &str) -> bool {
+    Command::new("launchctl")
+        .arg("print")
+        .arg(service)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// launchctl args that (re)load the daemon: restart an already-loaded job in place (which
+/// avoids the bootout/bootstrap race), otherwise bootstrap a fresh one.
+fn reload_args(is_loaded: bool, domain: &str, service: &str, plist: &str) -> Vec<String> {
+    if is_loaded {
+        vec!["kickstart".into(), "-k".into(), service.into()]
+    } else {
+        vec!["bootstrap".into(), domain.into(), plist.into()]
+    }
 }
 
 /// Stop and remove the LaunchAgent and the installed binary (config is left in place).
@@ -148,6 +164,23 @@ mod tests {
         assert!(p.contains("<string>daemon</string>"));
         assert!(p.contains("RunAtLoad"));
         assert!(p.contains("KeepAlive"));
+    }
+
+    #[test]
+    fn reload_args_restarts_a_loaded_service_in_place() {
+        // Already loaded: restart in place, never bootout+bootstrap (which races the
+        // still-terminating KeepAlive job and fails with EIO).
+        let args = reload_args(true, "gui/501", "gui/501/app.eqtune.daemon", "/x.plist");
+        assert_eq!(
+            args,
+            ["kickstart", "-k", "gui/501/app.eqtune.daemon"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn reload_args_bootstraps_when_nothing_is_loaded() {
+        let args = reload_args(false, "gui/501", "gui/501/app.eqtune.daemon", "/x.plist");
+        assert_eq!(args, ["bootstrap", "gui/501", "/x.plist"].map(String::from));
     }
 
     #[test]
