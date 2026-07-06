@@ -606,19 +606,18 @@ fn read_request_line(stream: &UnixStream) -> anyhow::Result<String> {
         match reader.fill_buf() {
             Ok([]) => break, // EOF before a newline
             Ok(available) => {
-                if let Some(i) = available.iter().position(|&b| b == b'\n') {
-                    line.extend_from_slice(&available[..i]);
-                    reader.consume(i + 1);
+                let newline = available.iter().position(|&b| b == b'\n');
+                let upto = newline.unwrap_or(available.len());
+                line.extend_from_slice(&available[..upto]);
+                reader.consume(newline.map_or(upto, |i| i + 1));
+                // Enforce both bounds after every read, before accepting — including the
+                // read that carries the terminating newline. Checking them only on the
+                // no-newline path let a request whose '\n' landed in this buffer slip past
+                // the size cap or the deadline, keeping the single-threaded loop blocked
+                // past REQUEST_TIMEOUT.
+                check_request_bounds(line.len(), deadline)?;
+                if newline.is_some() {
                     break;
-                }
-                let n = available.len();
-                line.extend_from_slice(available);
-                reader.consume(n);
-                if line.len() > MAX_REQUEST_BYTES {
-                    anyhow::bail!("request exceeds {MAX_REQUEST_BYTES} bytes");
-                }
-                if Instant::now() >= deadline {
-                    anyhow::bail!("client did not send a complete request in time");
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
@@ -629,6 +628,18 @@ fn read_request_line(stream: &UnixStream) -> anyhow::Result<String> {
         }
     }
     Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// The size and time bounds a request read must satisfy, checked after every buffer is
+/// appended so neither can be bypassed at the read that carries the terminating newline.
+fn check_request_bounds(line_len: usize, deadline: Instant) -> anyhow::Result<()> {
+    if line_len > MAX_REQUEST_BYTES {
+        anyhow::bail!("request exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    if Instant::now() >= deadline {
+        anyhow::bail!("client did not send a complete request in time");
+    }
+    Ok(())
 }
 
 /// The current default output device and its (rounded) sample rate.
@@ -1361,6 +1372,32 @@ mod tests {
         );
         drop(server);
         let _ = writer.join();
+    }
+
+    #[test]
+    fn check_request_bounds_rejects_over_the_size_cap() {
+        // With plenty of time left, only the size cap decides — a line whose terminating
+        // newline pushes it one byte over must be rejected, not accepted at the break.
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(check_request_bounds(MAX_REQUEST_BYTES, far).is_ok());
+        assert!(
+            check_request_bounds(MAX_REQUEST_BYTES + 1, far)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn check_request_bounds_rejects_a_reached_deadline() {
+        // A deadline of "now" is already reached when the check reads the clock, so even a
+        // within-cap line that completes at/after the deadline is rejected.
+        assert!(
+            check_request_bounds(0, Instant::now())
+                .unwrap_err()
+                .to_string()
+                .contains("in time")
+        );
     }
 
     fn daemon_with(config: Config) -> Daemon {
