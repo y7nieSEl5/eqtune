@@ -180,19 +180,15 @@ impl Config {
             Err(e) => return Err(e.into()),
         };
         // A config that is unusable — malformed TOML, or parseable but with a preset the
-        // real-time engine could not run without allocating (over dsp::MAX_BANDS) — is
-        // quarantined rather than propagated: under launchd KeepAlive a hard error would
-        // restart the daemon into the same failure forever and lose every preset. Back
-        // the bad file up for manual recovery and continue with defaults.
+        // real-time engine could not run (over dsp::MAX_BANDS, or a non-finite / out-of-range
+        // value that would design NaN coefficients) — is quarantined rather than propagated:
+        // under launchd KeepAlive a hard error would restart the daemon into the same failure
+        // forever and lose every preset. Back the bad file up for manual recovery and continue
+        // with defaults.
         let reason = match toml::from_str::<Config>(&contents) {
-            Ok(config) => match config.max_preset_bands() {
-                over if over > dsp::MAX_BANDS => {
-                    format!(
-                        "a preset has {over} bands, over the maximum of {}",
-                        dsp::MAX_BANDS
-                    )
-                }
-                _ => return Ok(config),
+            Ok(config) => match config.first_unusable_preset() {
+                Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
+                None => return Ok(config),
             },
             Err(e) => format!("invalid TOML ({e})"),
         };
@@ -225,15 +221,16 @@ impl Config {
         Ok(())
     }
 
-    /// The largest band count across all presets (0 if there are none). Used at load
-    /// time to reject a config the real-time engine could not run without allocating on
-    /// the audio thread (see [`crate::dsp::MAX_BANDS`]).
-    fn max_preset_bands(&self) -> usize {
+    /// The name and validation error of the first preset the real-time engine could not
+    /// run — over [`dsp::MAX_BANDS`], or carrying a non-finite or out-of-range value that
+    /// would design NaN/garbage coefficients — or `None` if every preset is usable.
+    /// Presets are checked in name order (the map is a `BTreeMap`) so the result is stable.
+    /// Applied at load time so a config that parses but cannot be run is quarantined
+    /// instead of reaching the audio thread.
+    fn first_unusable_preset(&self) -> Option<(&str, anyhow::Error)> {
         self.presets
-            .values()
-            .map(|p| p.bands.len())
-            .max()
-            .unwrap_or(0)
+            .iter()
+            .find_map(|(name, preset)| validate_preset(preset).err().map(|e| (name.as_str(), e)))
     }
 
     /// The currently selected preset, or any remaining preset if the active name no longer
@@ -243,6 +240,80 @@ impl Config {
             .get(&self.active_preset)
             .or_else(|| self.presets.values().next())
     }
+}
+
+// --- preset validation -------------------------------------------------------
+// The single definition of what makes a preset runnable by the real-time engine.
+// The config load path ([`Config::first_unusable_preset`]) and the daemon's IPC
+// mutation handlers (set-band, preamp, import) both validate through these, so
+// "parses from disk" and "the engine can run it" mean exactly the same thing —
+// closing the gap where a hand-edited config with a NaN/out-of-range value would
+// load cleanly and feed garbage coefficients to the audio thread.
+
+const MIN_BAND_FREQ_HZ: f32 = 20.0;
+const MAX_BAND_FREQ_HZ: f32 = 20_000.0;
+const MIN_BAND_GAIN_DB: f32 = -24.0;
+const MAX_BAND_GAIN_DB: f32 = 24.0;
+const MIN_Q: f32 = 0.1;
+const MAX_Q: f32 = 10.0;
+const MIN_PREAMP_DB: f32 = -60.0;
+const MAX_PREAMP_DB: f32 = 12.0;
+
+pub(crate) fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
+    if preset.bands.len() > dsp::MAX_BANDS {
+        return Err(anyhow::anyhow!(
+            "preset has too many bands ({}); the maximum is {}",
+            preset.bands.len(),
+            dsp::MAX_BANDS
+        ));
+    }
+    validate_preamp(preset.preamp_db)?;
+    for band in &preset.bands {
+        validate_band(band.freq, band.gain_db, band.q)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_band(freq: f32, gain_db: f32, q: f32) -> anyhow::Result<()> {
+    validate_freq(freq)?;
+    validate_range("gain", gain_db, MIN_BAND_GAIN_DB, MAX_BAND_GAIN_DB, "dB")?;
+    validate_range("Q", q, MIN_Q, MAX_Q, "")?;
+    Ok(())
+}
+
+pub(crate) fn validate_freq(freq: f32) -> anyhow::Result<()> {
+    validate_range("frequency", freq, MIN_BAND_FREQ_HZ, MAX_BAND_FREQ_HZ, "Hz")
+}
+
+pub(crate) fn validate_preamp(db: f32) -> anyhow::Result<()> {
+    validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
+}
+
+fn validate_range(name: &str, value: f32, min: f32, max: f32, unit: &str) -> anyhow::Result<()> {
+    if !value.is_finite() {
+        return Err(anyhow::anyhow!("{name} must be a finite number"));
+    }
+    if !(min..=max).contains(&value) {
+        return Err(anyhow::anyhow!(
+            "{name} must be between {} and {}",
+            format_bound(min, unit),
+            format_bound(max, unit)
+        ));
+    }
+    Ok(())
+}
+
+fn format_bound(value: f32, unit: &str) -> String {
+    if unit.is_empty() {
+        trim_number(value)
+    } else {
+        format!("{} {unit}", trim_number(value))
+    }
+}
+
+fn trim_number(n: f32) -> String {
+    let s = format!("{n:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]
@@ -437,5 +508,90 @@ bands = []
         let back = Config::load_from(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn load_from_quarantines_a_preset_with_out_of_range_values() {
+        // Valid TOML and a valid band count, but a value the RT engine can't design into
+        // sane coefficients (q = 0 divides by zero; NaN/inf poison the biquad). The load
+        // path must reject it exactly like the IPC mutation paths do, not pass it through
+        // to the audio thread.
+        for bad in [
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: 0.0,
+                q: 0.0,
+            },
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: f32::NAN,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: f32::INFINITY,
+                q: 1.0,
+            },
+        ] {
+            let dir = unique_dir("badvalue");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            let mut c = Config::default();
+            c.presets.insert(
+                "poison".into(),
+                Preset {
+                    bands: vec![bad],
+                    preamp_db: 0.0,
+                },
+            );
+            std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+            let recovered = Config::load_from(&path).unwrap();
+            assert_eq!(recovered, Config::default());
+            assert!(dir.join("config.toml.corrupt").exists());
+            assert!(!path.exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn band_validation_accepts_practical_values() {
+        validate_band(20.0, -24.0, 0.1).unwrap();
+        validate_band(20_000.0, 24.0, 10.0).unwrap();
+        validate_band(1000.0, 0.0, 1.41).unwrap();
+    }
+
+    #[test]
+    fn band_validation_rejects_invalid_values() {
+        for (freq, gain, q) in [
+            (0.0, 0.0, 1.0),
+            (20_001.0, 0.0, 1.0),
+            (1000.0, -24.1, 1.0),
+            (1000.0, 24.1, 1.0),
+            (1000.0, 0.0, 0.0),
+            (1000.0, 0.0, 10.1),
+            (f32::NAN, 0.0, 1.0),
+            (1000.0, f32::INFINITY, 1.0),
+            (1000.0, 0.0, f32::NEG_INFINITY),
+        ] {
+            assert!(validate_band(freq, gain, q).is_err());
+        }
+    }
+
+    #[test]
+    fn preamp_validation_accepts_safe_range() {
+        validate_preamp(-60.0).unwrap();
+        validate_preamp(0.0).unwrap();
+        validate_preamp(12.0).unwrap();
+    }
+
+    #[test]
+    fn preamp_validation_rejects_invalid_values() {
+        for db in [-60.1, 12.1, f32::NAN, f32::INFINITY] {
+            assert!(validate_preamp(db).is_err());
+        }
     }
 }
