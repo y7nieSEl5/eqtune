@@ -90,7 +90,7 @@ bool eqtune_output_device_name(uint32_t dev_id, char *buf, size_t buflen) {
             .mScope = kAudioObjectPropertyScopeGlobal,
             .mElement = kAudioObjectPropertyElementMain,
         };
-        // The Name property returns a +1 CFStringRef the caller owns (like the UID above).
+        // The Name property returns a +1 CFStringRef the caller owns (like the UID helper below).
         if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &name) != noErr || !name) {
             return false;
         }
