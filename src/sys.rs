@@ -57,12 +57,10 @@ pub fn output_device_name(dev: u32) -> Option<String> {
     if !ok {
         return None;
     }
-    // The shim NUL-terminates on success; decode the bytes up to it.
-    CStr::from_bytes_until_nul(&buf)
-        .ok()?
-        .to_str()
-        .ok()
-        .map(str::to_owned)
+    // The shim NUL-terminates on success; decode the bytes up to it. Treat an empty name
+    // as "no name" so the caller falls back to the numeric id rather than showing a blank.
+    let name = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Whether macOS Low Power Mode is currently enabled.
