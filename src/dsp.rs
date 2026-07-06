@@ -6,6 +6,7 @@
 //! Signal path per sample: `preamp -> biquad cascade -> optional soft limiter`.
 
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -278,29 +279,71 @@ const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
 /// coefficient set per band, a linear preamp gain, and the limiter flag. Cheap to
 /// share and swapped atomically, so the control thread can update the EQ live without
 /// ever locking the audio thread.
+///
+/// Every field is private, so the only way to obtain a value is [`EqSettings::new`],
+/// which stamps a fresh [`generation`](Self::generation). That makes the snapshot
+/// genuinely immutable: content and stamp cannot drift apart, so the [`Processor`]'s
+/// generation-based change detection can never miss an edit (the hazard a
+/// clone-then-mutate of public fields would otherwise open).
 #[derive(Clone, Debug)]
 pub struct EqSettings {
-    pub coeffs: Vec<Coeffs>,
-    pub preamp: f32,
-    pub limiter: bool,
+    coeffs: Vec<Coeffs>,
+    preamp: f32,
+    limiter: bool,
+    /// Version stamp, unique per constructed snapshot ([`EqSettings::new`] draws it from a
+    /// process-global counter). The real-time [`Processor`] compares it against the last
+    /// snapshot it synced to decide whether to re-copy coefficients, so an update is
+    /// detected by value and never by heap address — immune to an `Arc` being freed and
+    /// its address reused between two audio blocks. A clone shares the stamp, which is
+    /// correct precisely because the fields are private: a clone can never be mutated, so
+    /// it really is the same snapshot.
+    generation: u64,
 }
+
+/// Source of [`EqSettings::generation`]: every constructed snapshot takes the next value,
+/// so any two separately built settings compare unequal — uniqueness holds by
+/// construction, with no re-stamping step to forget on any publishing path.
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 impl EqSettings {
     /// Design coefficients for `bands` at sample rate `fs` (Hz). Bands at (essentially)
     /// 0 dB are skipped: they are mathematically identity, so omitting them saves a
     /// biquad per sample with no audible change.
     pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
+        let coeffs: Vec<Coeffs> = bands
+            .iter()
+            .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
+            .map(|b| Coeffs::design(b, fs))
+            .collect();
+        // The real-time [`Processor`] reserves `MAX_BANDS` capacity per cascade and resizes
+        // to `coeffs.len()` each block without reallocating — which holds only while a
+        // snapshot never carries more than `MAX_BANDS` sections. The mutation edges
+        // (`SetBand`, preset import, config load) all cap band count, so this is unreachable
+        // today; assert it at the single construction site anyway, so a future band-producing
+        // path that skips those caps trips here in tests instead of reallocating on the audio
+        // thread.
+        debug_assert!(
+            coeffs.len() <= MAX_BANDS,
+            "EqSettings built with {} sections, exceeding MAX_BANDS ({MAX_BANDS})",
+            coeffs.len()
+        );
         Self {
-            coeffs: bands
-                .iter()
-                .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
-                .map(|b| Coeffs::design(b, fs))
-                .collect(),
+            coeffs,
             preamp: db_to_lin(preamp_db),
             limiter,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
 }
+
+/// Upper bound on the number of biquad sections per channel the real-time [`Processor`]
+/// will ever hold. Each cascade reserves this capacity at construction (on the control
+/// thread), so syncing a new coefficient set on the audio thread never reallocates —
+/// upholding the "audio thread never allocates" invariant by construction. Band-adding
+/// paths (`SetBand`, preset import) reject anything beyond this, so a normal preset can
+/// never exceed the reserved capacity. Well above the densest standard graphic EQ
+/// (31-band ISO 1/3-octave).
+pub const MAX_BANDS: usize = 64;
 
 /// A block whose samples are all quieter than this (linear, ≈ −80 dBFS) counts as
 /// silent for the [`Processor`]'s silence-skip optimization.
@@ -312,7 +355,7 @@ const SILENCE_SKIP_BLOCKS: u32 = 3;
 /// Whether every sample in `buf` is below [`SILENCE_THRESHOLD`] (short-circuits on the
 /// first audible sample, so it is cheap on real audio).
 #[inline]
-pub(crate) fn block_is_silent(buf: &[f32]) -> bool {
+fn block_is_silent(buf: &[f32]) -> bool {
     buf.iter().all(|s| s.abs() < SILENCE_THRESHOLD)
 }
 
@@ -321,11 +364,12 @@ pub(crate) fn block_is_silent(buf: &[f32]) -> bool {
 /// of the same band count, so live edits don't click) and processes in place.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
-    /// Identity of the [`EqSettings`] last synced into the cascades. The daemon publishes
-    /// a fresh `Arc<EqSettings>` on every live edit (and keeps the prior one alive while
-    /// the audio thread holds it), so pointer identity is a sound "did it change?" signal
-    /// — letting us skip the per-block coefficient copy in the common steady state.
-    last_settings: *const EqSettings,
+    /// Generation of the [`EqSettings`] last synced into the cascades, or `None` before the
+    /// first block. Every constructed snapshot carries a unique generation, so "did it
+    /// change?" is a value comparison — immune to an `Arc` being freed and its heap address
+    /// reused between two audio blocks, which a pointer-identity check could mistake for
+    /// "unchanged".
+    last_generation: Option<u64>,
     /// Consecutive near-silent blocks seen so far (gates the silence-skip).
     silent_blocks: u32,
 }
@@ -333,20 +377,34 @@ pub struct Processor {
 impl Processor {
     pub fn new(channels: usize) -> Self {
         Self {
-            channels: vec![Vec::new(); channels],
-            last_settings: std::ptr::null(),
+            // Reserve MAX_BANDS up front (on the control thread) so the per-block
+            // coefficient sync in `run` only ever resizes *within* capacity and never
+            // reallocates on the audio thread.
+            channels: (0..channels)
+                .map(|_| Vec::with_capacity(MAX_BANDS))
+                .collect(),
+            last_generation: None,
             silent_blocks: 0,
         }
     }
 
-    pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) {
+    /// Sync coefficients if `settings` changed, EQ the block in place, and return whether
+    /// the block's *input* was silent — scanned once here so the audio callback can drive
+    /// idle detection without walking the buffer a second time.
+    pub fn run(&mut self, settings: &EqSettings, buf: &mut [f32], channels: usize) -> bool {
+        // One pass over the untouched input; reused for the silence-skip below and handed
+        // back to the caller.
+        let silent = block_is_silent(buf);
         if channels == 0 {
-            return;
+            return silent;
         }
-        // Re-copy biquad coefficients only when `settings` actually changed (see
-        // `last_settings`); in steady state this skips dozens of copies per block.
-        let id = settings as *const EqSettings;
-        if id != self.last_settings {
+        // Re-copy biquad coefficients only when a newer snapshot arrives, compared by
+        // generation (see `last_generation`); in steady state this skips dozens of copies
+        // per block.
+        if self.last_generation != Some(settings.generation) {
+            // `n <= MAX_BANDS` for any preset the mutation paths accept, and each cascade
+            // was constructed with that capacity reserved, so this resize stays within
+            // capacity and does not allocate on the audio thread.
             let n = settings.coeffs.len();
             for cascade in self.channels.iter_mut() {
                 if cascade.len() != n {
@@ -356,16 +414,16 @@ impl Processor {
                     bq.set_coeffs(*c);
                 }
             }
-            self.last_settings = id;
+            self.last_generation = Some(settings.generation);
         }
 
         // Skip the per-sample EQ on sustained silence: silent in → silent out, so once any
         // filter ring-out has been rendered (after SILENCE_SKIP_BLOCKS) we can leave the
         // already-correct buffer untouched and do no per-sample work.
-        if block_is_silent(buf) {
+        if silent {
             self.silent_blocks = self.silent_blocks.saturating_add(1);
             if self.silent_blocks > SILENCE_SKIP_BLOCKS {
-                return;
+                return silent;
             }
         } else {
             self.silent_blocks = 0;
@@ -386,6 +444,7 @@ impl Processor {
                 buf[idx] = s;
             }
         }
+        silent
     }
 }
 
@@ -427,6 +486,15 @@ mod tests {
 
     fn db(mag: f32) -> f32 {
         20.0 * mag.log10()
+    }
+
+    fn peak(freq: f32) -> Band {
+        Band {
+            kind: BandKind::Peaking,
+            freq,
+            gain_db: 6.0,
+            q: 1.0,
+        }
     }
 
     #[test]
@@ -491,7 +559,9 @@ mod tests {
         let mut buf = vec![0.3f32; 512 * 2];
         p.run(&s9, &mut buf, 2);
         assert!(buf.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
-        // Shrink to one band — the cascade must resize without panicking.
+        // Shrink to one band — the cascade must resize without panicking. Every
+        // constructed snapshot carries a distinct generation, so the audio thread picks
+        // up the new coefficient count.
         let s1 = EqSettings::new(
             &[Band {
                 kind: BandKind::Peaking,
@@ -505,6 +575,11 @@ mod tests {
         );
         p.run(&s1, &mut buf, 2);
         assert!(buf.iter().all(|x| x.is_finite()));
+        assert_eq!(
+            p.channels[0].len(),
+            1,
+            "new snapshot must resize the cascade"
+        );
     }
 
     #[test]
@@ -575,6 +650,34 @@ mod tests {
     }
 
     #[test]
+    fn processor_reserves_capacity_so_run_never_reallocates() {
+        let mut p = Processor::new(2);
+        let cap_before: Vec<usize> = p.channels.iter().map(|c| c.capacity()).collect();
+        assert!(
+            cap_before.iter().all(|&c| c >= MAX_BANDS),
+            "each cascade must reserve MAX_BANDS up front"
+        );
+        // A full MAX_BANDS worth of non-identity bands (none dropped at design time).
+        let bands: Vec<Band> = (0..MAX_BANDS)
+            .map(|i| Band {
+                kind: BandKind::Peaking,
+                freq: 100.0 + i as f32 * 100.0,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .collect();
+        let s = EqSettings::new(&bands, 48_000.0, 0.0, false);
+        assert_eq!(s.coeffs.len(), MAX_BANDS);
+        let mut buf = vec![0.2f32; 128 * 2];
+        p.run(&s, &mut buf, 2);
+        let cap_after: Vec<usize> = p.channels.iter().map(|c| c.capacity()).collect();
+        assert_eq!(
+            cap_before, cap_after,
+            "syncing coefficients must not reallocate the audio-thread cascades"
+        );
+    }
+
+    #[test]
     fn sustained_silence_skips_then_resumes() {
         let mut p = Processor::new(2);
         let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
@@ -597,5 +700,66 @@ mod tests {
             "audio after silence must be EQ'd"
         );
         assert!(buf.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn run_reports_input_silence() {
+        // The audio callback drives idle detection off this return value, so it must
+        // reflect the block's input regardless of how the block is processed.
+        let mut p = Processor::new(2);
+        let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let mut quiet = vec![0.0f32; 256 * 2];
+        assert!(
+            p.run(&s, &mut quiet, 2),
+            "all-zero input must report silent"
+        );
+        let mut loud = vec![0.5f32; 256 * 2];
+        assert!(
+            !p.run(&s, &mut loud, 2),
+            "audible input must report not silent"
+        );
+    }
+
+    #[test]
+    fn run_resyncs_cascade_only_on_new_generation() {
+        let mut p = Processor::new(1);
+        let three = EqSettings::new(
+            &[peak(200.0), peak(1000.0), peak(5000.0)],
+            48_000.0,
+            0.0,
+            false,
+        );
+        let mut buf = vec![0.1f32; 128];
+        p.run(&three, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            3,
+            "first snapshot syncs three sections"
+        );
+
+        // Same generation, fewer bands: this is exactly the freed-and-reused-address hazard
+        // the generation stamp closes — the audio thread must treat it as unchanged and NOT
+        // adopt the new coefficient count.
+        let mut one_stale = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
+        one_stale.generation = three.generation;
+        p.run(&one_stale, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            3,
+            "a snapshot with the same generation must be skipped"
+        );
+
+        // A distinct generation is adopted, resizing the cascade. A freshly constructed
+        // snapshot is distinct without any manual stamping — the PR #1 regression where
+        // `EqSettings::new` left `generation == 0` on every snapshot made a `Processor`
+        // driven directly through the public API (no `EqHandle::store` in between) treat this
+        // second value as unchanged and keep the previous coefficients.
+        let one_fresh = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
+        p.run(&one_fresh, &mut buf, 1);
+        assert_eq!(
+            p.channels[0].len(),
+            1,
+            "a distinct generation must resync to one section"
+        );
     }
 }

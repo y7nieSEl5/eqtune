@@ -1,7 +1,7 @@
 //! Raw FFI to the Objective-C Core Audio shim (`shim/tap_shim.m`) plus safe wrappers.
 //! This is the boundary between Rust and the macOS audio system.
 
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +26,9 @@ unsafe extern "C" {
     fn eqtune_low_power_enabled() -> bool;
     /// Whether the current default output device is running somewhere.
     fn eqtune_default_output_device_running() -> bool;
+    /// Writes the name of output device `dev` (NUL-terminated UTF-8) into `buf`; returns
+    /// false if unavailable or the buffer is too small.
+    fn eqtune_output_device_name(dev: u32, buf: *mut c_char, buflen: usize) -> bool;
     fn eqtune_tap_start(cb: ProcessCb, ctx: *mut c_void) -> *mut RawSession;
     fn eqtune_tap_stop(session: *mut RawSession);
 }
@@ -40,6 +43,24 @@ pub fn default_output_device() -> Option<u32> {
 pub fn default_output_sample_rate() -> Option<f64> {
     let rate = unsafe { eqtune_default_output_sample_rate() };
     (rate > 0.0).then_some(rate)
+}
+
+/// The human-readable name of output device `dev` (an `AudioObjectID`), if available.
+/// Resolving by id — rather than "whatever the default is right now" — keeps a label
+/// truthful for a device the caller is already attached to, even if the system default
+/// has since moved elsewhere.
+pub fn output_device_name(dev: u32) -> Option<String> {
+    // CoreAudio device names are short; 256 bytes is ample for the UTF-8 form.
+    let mut buf = [0u8; 256];
+    let ok =
+        unsafe { eqtune_output_device_name(dev, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+    if !ok {
+        return None;
+    }
+    // The shim NUL-terminates on success; decode the bytes up to it. Treat an empty name
+    // as "no name" so the caller falls back to the numeric id rather than showing a blank.
+    let name = CStr::from_bytes_until_nul(&buf).ok()?.to_str().ok()?;
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Whether macOS Low Power Mode is currently enabled.
@@ -76,7 +97,10 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     let settings = state.settings.load(); // arc-swap Guard: borrow, no per-block Arc clone
     let len = frames as usize * channels as usize;
     let buf = unsafe { std::slice::from_raw_parts_mut(buffer, len) };
-    if crate::dsp::block_is_silent(buf) {
+    // `run` scans the block for input silence once and returns it, so idle accounting
+    // reuses that result instead of walking the buffer a second time here.
+    let silent = state.processor.run(&settings, buf, channels as usize);
+    if silent {
         state
             .activity
             .silent_frames
@@ -84,7 +108,6 @@ extern "C" fn process_trampoline(ctx: *mut c_void, buffer: *mut f32, frames: u32
     } else {
         state.activity.silent_frames.store(0, Ordering::Relaxed);
     }
-    state.processor.run(&settings, buf, channels as usize);
 }
 
 /// Control-thread handle used to push fresh EQ settings to a running session,
@@ -96,6 +119,9 @@ pub struct EqHandle {
 }
 
 impl EqHandle {
+    /// Publish a new snapshot to the audio thread. Its construction-time generation stamp
+    /// is what the audio thread's change detection compares, so a new snapshot at a reused
+    /// heap address can never be mistaken for the previous one.
     pub fn store(&self, settings: EqSettings) {
         self.settings.store(Arc::new(settings));
     }
@@ -154,6 +180,7 @@ mod tests {
         // Proves the ObjC shim compiles, links CoreAudio, and is callable from Rust.
         let _ = default_output_device();
         let _ = default_output_sample_rate();
+        let _ = default_output_device().and_then(output_device_name);
         let _ = low_power_enabled();
         let _ = default_output_device_running();
     }

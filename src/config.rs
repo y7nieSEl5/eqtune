@@ -5,8 +5,11 @@
 //! Ships a working default (the built-in curve) so a first run needs no config file.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::{self, Band};
@@ -40,6 +43,36 @@ pub struct Config {
 /// config file.
 fn default_true() -> bool {
     true
+}
+
+/// A sibling path with `suffix` appended to the file name (e.g. `config.toml` +
+/// `.tmp` -> `config.toml.tmp`), so it lives in the same directory — and thus the same
+/// filesystem — as `path`, which is required for an atomic `rename`.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path
+        .file_name()
+        .unwrap_or_else(|| OsStr::new("config"))
+        .to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// A sibling backup path for an unusable config that does not already exist, so
+/// quarantining a second bad config never overwrites the first one's backup. The common
+/// case is `config.toml.corrupt`; a prior backup bumps it to `.corrupt.1`, `.corrupt.2`, …
+fn quarantine_path(path: &Path) -> PathBuf {
+    let base = with_suffix(path, ".corrupt");
+    if !base.exists() {
+        return base;
+    }
+    let mut n = 1;
+    loop {
+        let candidate = with_suffix(path, &format!(".corrupt.{n}"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Build a graphic-EQ-style preset (peaking filters at ~octave Q) from (freq_hz,
@@ -161,11 +194,43 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(s) => Ok(toml::from_str(&s)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
-            Err(e) => Err(e.into()),
-        }
+        let contents = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e.into()),
+        };
+        // A config that is unusable — malformed TOML, or parseable but with a preset the
+        // real-time engine could not run (over dsp::MAX_BANDS, or a non-finite / out-of-range
+        // value that would design NaN coefficients) — is quarantined rather than propagated:
+        // under launchd KeepAlive a hard error would restart the daemon into the same failure
+        // forever and lose every preset. Back the bad file up for manual recovery and continue
+        // with defaults.
+        let reason = match toml::from_str::<Config>(&contents) {
+            Ok(config) => match config.first_unusable_preset() {
+                Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
+                None => return Ok(config),
+            },
+            Err(e) => format!("invalid TOML ({e})"),
+        };
+        // Move the bad file aside — both to preserve it for manual recovery and to get it
+        // out of the way so the next save writes a fresh config. If the move fails we must
+        // NOT continue: returning defaults here would let the next save overwrite the
+        // user's only copy with defaults, so propagate instead and leave the file intact.
+        let backup = quarantine_path(path);
+        std::fs::rename(path, &backup).with_context(|| {
+            format!(
+                "config at {} is unusable ({reason}) but could not be moved aside to {}; \
+                 refusing to continue and overwrite it with defaults",
+                path.display(),
+                backup.display(),
+            )
+        })?;
+        eprintln!(
+            "eqtune: config at {} is unusable ({reason}); backed up to {} and continuing with defaults",
+            path.display(),
+            backup.display()
+        );
+        Ok(Self::default())
     }
 
     /// Persist to [`Config::path`], creating the parent directory if needed.
@@ -177,22 +242,137 @@ impl Config {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, toml::to_string_pretty(self)?)?;
+        let contents = toml::to_string_pretty(self)?;
+        // Write to a sibling temp file, fsync it, then atomically rename it into place and
+        // fsync the directory. A crash or power loss mid-write can then only truncate the
+        // throwaway temp file, never the live config. The fsyncs are what make that true:
+        // without them the rename can reach disk before the bytes do, so a crash could leave
+        // `path` pointing at an empty or partial file — the very truncation this prevents.
+        let tmp = with_suffix(path, ".tmp");
+        {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 
-    /// The currently selected preset, falling back to "default" then any preset.
+    /// The name and validation error of the first preset the real-time engine could not
+    /// run — over [`dsp::MAX_BANDS`], or carrying a non-finite or out-of-range value that
+    /// would design NaN/garbage coefficients — or `None` if every preset is usable.
+    /// Presets are checked in name order (the map is a `BTreeMap`) so the result is stable.
+    /// Applied at load time so a config that parses but cannot be run is quarantined
+    /// instead of reaching the audio thread.
+    fn first_unusable_preset(&self) -> Option<(&str, anyhow::Error)> {
+        self.presets
+            .iter()
+            .find_map(|(name, preset)| validate_preset(preset).err().map(|e| (name.as_str(), e)))
+    }
+
+    /// The currently selected preset, or any remaining preset if the active name no longer
+    /// resolves (e.g. right after the active preset was deleted).
     pub fn active(&self) -> Option<&Preset> {
         self.presets
             .get(&self.active_preset)
-            .or_else(|| self.presets.get("default"))
             .or_else(|| self.presets.values().next())
     }
+}
+
+// --- preset validation -------------------------------------------------------
+// The single definition of what makes a preset runnable by the real-time engine.
+// The config load path ([`Config::first_unusable_preset`]) and the daemon's IPC
+// mutation handlers (set-band, preamp, import) both validate through these, so
+// "parses from disk" and "the engine can run it" mean exactly the same thing —
+// closing the gap where a hand-edited config with a NaN/out-of-range value would
+// load cleanly and feed garbage coefficients to the audio thread.
+
+const MIN_BAND_FREQ_HZ: f32 = 20.0;
+const MAX_BAND_FREQ_HZ: f32 = 20_000.0;
+const MIN_BAND_GAIN_DB: f32 = -24.0;
+const MAX_BAND_GAIN_DB: f32 = 24.0;
+const MIN_Q: f32 = 0.1;
+const MAX_Q: f32 = 10.0;
+const MIN_PREAMP_DB: f32 = -60.0;
+const MAX_PREAMP_DB: f32 = 12.0;
+
+pub(crate) fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
+    if preset.bands.len() > dsp::MAX_BANDS {
+        return Err(anyhow::anyhow!(
+            "preset has too many bands ({}); the maximum is {}",
+            preset.bands.len(),
+            dsp::MAX_BANDS
+        ));
+    }
+    validate_preamp(preset.preamp_db)?;
+    for band in &preset.bands {
+        validate_band(band.freq, band.gain_db, band.q)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_band(freq: f32, gain_db: f32, q: f32) -> anyhow::Result<()> {
+    validate_freq(freq)?;
+    validate_range("gain", gain_db, MIN_BAND_GAIN_DB, MAX_BAND_GAIN_DB, "dB")?;
+    validate_range("Q", q, MIN_Q, MAX_Q, "")?;
+    Ok(())
+}
+
+pub(crate) fn validate_freq(freq: f32) -> anyhow::Result<()> {
+    validate_range("frequency", freq, MIN_BAND_FREQ_HZ, MAX_BAND_FREQ_HZ, "Hz")
+}
+
+pub(crate) fn validate_preamp(db: f32) -> anyhow::Result<()> {
+    validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
+}
+
+fn validate_range(name: &str, value: f32, min: f32, max: f32, unit: &str) -> anyhow::Result<()> {
+    if !value.is_finite() {
+        return Err(anyhow::anyhow!("{name} must be a finite number"));
+    }
+    if !(min..=max).contains(&value) {
+        return Err(anyhow::anyhow!(
+            "{name} must be between {} and {}",
+            format_bound(min, unit),
+            format_bound(max, unit)
+        ));
+    }
+    Ok(())
+}
+
+fn format_bound(value: f32, unit: &str) -> String {
+    if unit.is_empty() {
+        trim_number(value)
+    } else {
+        format!("{} {unit}", trim_number(value))
+    }
+}
+
+fn trim_number(n: f32) -> String {
+    let s = format!("{n:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_falls_back_to_a_remaining_preset_when_name_is_missing() {
+        // No preset is named "default"; a stale active name must still resolve to some
+        // preset (the first by name) rather than returning None.
+        let c = Config {
+            active_preset: "nonexistent".into(),
+            ..Config::default()
+        };
+        assert!(!c.presets.contains_key("nonexistent"));
+        assert!(c.active().is_some(), "must fall back to a remaining preset");
+    }
 
     #[test]
     fn default_active_is_bright() {
@@ -261,15 +441,223 @@ bands = []
         assert!(c.auto_off_idle, "absent field should default to true");
     }
 
+    fn unique_dir(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("eqtune-cfg-{}-{unique}-{tag}", std::process::id()))
+    }
+
     #[test]
-    fn save_then_load_roundtrips() {
-        let dir = std::env::temp_dir().join(format!("eqtune-cfg-test-{}", std::process::id()));
+    fn save_to_is_atomic_and_leaves_no_temp_file() {
+        let dir = unique_dir("atomic");
+        let path = dir.join("config.toml");
+        let c = Config::default();
+        c.save_to(&path).unwrap();
+
+        assert!(path.exists(), "config must be written");
+        assert!(
+            !dir.join("config.toml.tmp").exists(),
+            "the temp file must be renamed away, not left behind"
+        );
+        assert_eq!(Config::load_from(&path).unwrap(), c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_recovers_from_corrupt_config() {
+        let dir = unique_dir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "not valid toml {{{").unwrap();
+
+        // Must fall back to defaults instead of erroring (which would crash-loop the
+        // daemon under launchd KeepAlive).
+        let recovered = Config::load_from(&path).unwrap();
+        assert_eq!(recovered, Config::default());
+        // The bad file is preserved for manual recovery, and moved out of the way so the
+        // next save writes a fresh, valid config.
+        assert!(dir.join("config.toml.corrupt").exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn second_quarantine_keeps_the_first_backup() {
+        let dir = unique_dir("requarantine");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+
+        std::fs::write(&path, "not valid toml {{{").unwrap();
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+
+        // A second unusable config must get its own backup, not overwrite the first.
+        std::fs::write(&path, "also not valid }}}").unwrap();
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(
+            dir.join("config.toml.corrupt").exists(),
+            "the first backup must survive a second quarantine"
+        );
+        assert!(
+            dir.join("config.toml.corrupt.1").exists(),
+            "the second bad config must be preserved under a distinct name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn wide_bands(n: usize) -> Vec<Band> {
+        (0..n)
+            .map(|i| Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 20.0 + i as f32,
+                gain_db: 1.0,
+                q: 1.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn load_from_recovers_from_over_cap_preset() {
+        let dir = unique_dir("overcap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        // Valid TOML, but a preset exceeds the band cap — the RT engine could not run it
+        // without allocating, so load must quarantine it and fall back to defaults.
+        let mut c = Config::default();
+        c.presets.insert(
+            "big".into(),
+            Preset {
+                bands: wide_bands(dsp::MAX_BANDS + 1),
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        let recovered = Config::load_from(&path).unwrap();
+        assert_eq!(recovered, Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_accepts_preset_at_the_band_cap() {
+        let dir = unique_dir("atcap");
+        std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         let mut c = Config::default();
-        c.active_preset = "flat".to_string();
+        c.presets.insert(
+            "full".into(),
+            Preset {
+                bands: wide_bands(dsp::MAX_BANDS),
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.presets["full"].bands.len(), dsp::MAX_BANDS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_then_load_roundtrips() {
+        let dir = unique_dir("roundtrip");
+        let path = dir.join("config.toml");
+        let c = Config {
+            active_preset: "flat".to_string(),
+            ..Config::default()
+        };
         c.save_to(&path).unwrap();
         let back = Config::load_from(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn load_from_quarantines_a_preset_with_out_of_range_values() {
+        // Valid TOML and a valid band count, but a value the RT engine can't design into
+        // sane coefficients (q = 0 divides by zero; NaN/inf poison the biquad). The load
+        // path must reject it exactly like the IPC mutation paths do, not pass it through
+        // to the audio thread.
+        for bad in [
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: 0.0,
+                q: 0.0,
+            },
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: f32::NAN,
+                gain_db: 0.0,
+                q: 1.0,
+            },
+            Band {
+                kind: dsp::BandKind::Peaking,
+                freq: 1000.0,
+                gain_db: f32::INFINITY,
+                q: 1.0,
+            },
+        ] {
+            let dir = unique_dir("badvalue");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            let mut c = Config::default();
+            c.presets.insert(
+                "poison".into(),
+                Preset {
+                    bands: vec![bad],
+                    preamp_db: 0.0,
+                },
+            );
+            std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+            let recovered = Config::load_from(&path).unwrap();
+            assert_eq!(recovered, Config::default());
+            assert!(dir.join("config.toml.corrupt").exists());
+            assert!(!path.exists());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn band_validation_accepts_practical_values() {
+        validate_band(20.0, -24.0, 0.1).unwrap();
+        validate_band(20_000.0, 24.0, 10.0).unwrap();
+        validate_band(1000.0, 0.0, 1.41).unwrap();
+    }
+
+    #[test]
+    fn band_validation_rejects_invalid_values() {
+        for (freq, gain, q) in [
+            (0.0, 0.0, 1.0),
+            (20_001.0, 0.0, 1.0),
+            (1000.0, -24.1, 1.0),
+            (1000.0, 24.1, 1.0),
+            (1000.0, 0.0, 0.0),
+            (1000.0, 0.0, 10.1),
+            (f32::NAN, 0.0, 1.0),
+            (1000.0, f32::INFINITY, 1.0),
+            (1000.0, 0.0, f32::NEG_INFINITY),
+        ] {
+            assert!(validate_band(freq, gain, q).is_err());
+        }
+    }
+
+    #[test]
+    fn preamp_validation_accepts_safe_range() {
+        validate_preamp(-60.0).unwrap();
+        validate_preamp(0.0).unwrap();
+        validate_preamp(12.0).unwrap();
+    }
+
+    #[test]
+    fn preamp_validation_rejects_invalid_values() {
+        for db in [-60.1, 12.1, f32::NAN, f32::INFINITY] {
+            assert!(validate_preamp(db).is_err());
+        }
     }
 }

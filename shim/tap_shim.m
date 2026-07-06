@@ -13,32 +13,17 @@ static void log_err(const char *what, OSStatus st) {
     fprintf(stderr, "eqtune shim: %s failed (OSStatus %d)\n", what, (int)st);
 }
 
+// Current default output device, or kAudioObjectUnknown (0) on failure. Defined in the
+// helpers section below; the single query lives there so nothing here re-implements it.
+static AudioObjectID default_output_device(void);
+
 uint32_t eqtune_default_output_device(void) {
-    AudioObjectID device = kAudioObjectUnknown;
-    UInt32 size = sizeof(device);
-    AudioObjectPropertyAddress address = {
-        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    OSStatus status = AudioObjectGetPropertyData(
-        kAudioObjectSystemObject, &address, 0, NULL, &size, &device);
-    if (status != noErr) {
-        return 0;
-    }
-    return (uint32_t)device;
+    return (uint32_t)default_output_device();
 }
 
 double eqtune_default_output_sample_rate(void) {
-    AudioObjectID dev = kAudioObjectUnknown;
-    UInt32 dsize = sizeof(dev);
-    AudioObjectPropertyAddress daddr = {
-        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &daddr, 0, NULL, &dsize, &dev) != noErr
-        || dev == kAudioObjectUnknown) {
+    AudioObjectID dev = default_output_device();
+    if (dev == kAudioObjectUnknown) {
         return 0;
     }
     Float64 rate = 0;
@@ -60,7 +45,7 @@ bool eqtune_low_power_enabled(void) {
 
 bool eqtune_default_output_device_running(void) {
     AudioObjectID dev = (AudioObjectID)eqtune_default_output_device();
-    if (dev == kAudioObjectUnknown || dev == 0) {
+    if (dev == kAudioObjectUnknown) {
         return false;
     }
     UInt32 running = 0;
@@ -72,6 +57,32 @@ bool eqtune_default_output_device_running(void) {
     };
     OSStatus status = AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &running);
     return status == noErr && running != 0;
+}
+
+bool eqtune_output_device_name(uint32_t dev_id, char *buf, size_t buflen) {
+    if (!buf || buflen == 0) {
+        return false;
+    }
+    @autoreleasepool {
+        AudioObjectID dev = (AudioObjectID)dev_id;
+        if (dev == kAudioObjectUnknown) {
+            return false;
+        }
+        CFStringRef name = NULL;
+        UInt32 size = sizeof(name);
+        AudioObjectPropertyAddress addr = {
+            .mSelector = kAudioObjectPropertyName,
+            .mScope = kAudioObjectPropertyScopeGlobal,
+            .mElement = kAudioObjectPropertyElementMain,
+        };
+        // The Name property returns a +1 CFStringRef the caller owns (like the UID helper below).
+        if (AudioObjectGetPropertyData(dev, &addr, 0, NULL, &size, &name) != noErr || !name) {
+            return false;
+        }
+        bool ok = CFStringGetCString(name, buf, (CFIndex)buflen, kCFStringEncodingUTF8);
+        CFRelease(name);
+        return ok;
+    }
 }
 
 // --- helpers ---------------------------------------------------------------

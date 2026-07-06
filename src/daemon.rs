@@ -4,15 +4,17 @@
 //! follow the system default output device (so plugging in EarPods/Bluetooth "just
 //! works" without manually re-selecting output).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, Preset};
-use crate::dsp::{Band, BandKind, EqSettings};
+use crate::config::{
+    Config, Preset, validate_band, validate_freq, validate_preamp, validate_preset,
+};
+use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS};
 use crate::ipc::{self, PresetBackup, Request, Response, Status, Tuning};
 use crate::sys::{self, EqHandle, TapSession};
 
@@ -20,18 +22,21 @@ use crate::sys::{self, EqHandle, TapSession};
 const BAND_MATCH_HZ: f32 = 0.5;
 /// Channel count for the processor (stereo).
 const CHANNELS: usize = 2;
+/// Fallback sample rate (Hz) used only when the default output device's nominal rate is
+/// unavailable. 48 kHz is the near-universal default for macOS output devices.
+const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
 /// How often the idle loop accepts connections and checks the default device.
 const POLL: Duration = Duration::from_millis(100);
+/// Total budget for one client request/response exchange. `read_request_line` spends this
+/// down across the whole read (not just each recv), so a client that drips bytes just under
+/// the socket timeout still can't hold the single-threaded accept/poll loop open.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest request line the daemon will read before giving up. Requests are single short
+/// JSON lines; this only caps a misbehaving client so a newline-less flood can't grow the
+/// read buffer without bound.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// How long captured audio must remain silent before the engine is suspended.
 const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
-const MIN_BAND_FREQ_HZ: f32 = 20.0;
-const MAX_BAND_FREQ_HZ: f32 = 20_000.0;
-const MIN_BAND_GAIN_DB: f32 = -24.0;
-const MAX_BAND_GAIN_DB: f32 = 24.0;
-const MIN_Q: f32 = 0.1;
-const MAX_Q: f32 = 10.0;
-const MIN_PREAMP_DB: f32 = -60.0;
-const MAX_PREAMP_DB: f32 = 12.0;
 const MAX_PRESET_NAME_LEN: usize = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -96,6 +101,12 @@ impl Daemon {
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false); // blocking for the short req/resp
+                    // Bound the exchange so a stalled client can't freeze the daemon (which
+                    // would also stall the device-follow, low-power, and idle polling below).
+                    // The read timeout is the total request budget `read_request_line` spends
+                    // down; the write timeout bounds the small response.
+                    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
+                    let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                     if let Err(e) = self.handle(stream) {
                         eprintln!("connection error: {e}");
                     }
@@ -111,9 +122,7 @@ impl Daemon {
     }
 
     fn handle(&mut self, stream: UnixStream) -> anyhow::Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
+        let line = read_request_line(&stream)?;
         if line.trim().is_empty() {
             return Ok(());
         }
@@ -213,6 +222,11 @@ impl Daemon {
                     b.gain_db = gain_db;
                     b.q = q;
                 } else {
+                    if preset.bands.len() >= MAX_BANDS {
+                        return Ok(Response::Error(format!(
+                            "cannot add band: preset already has the maximum of {MAX_BANDS} bands"
+                        )));
+                    }
                     preset.bands.push(Band {
                         kind: BandKind::Peaking,
                         freq,
@@ -414,7 +428,10 @@ impl Daemon {
         }
 
         if let Some((_, handle)) = &self.engine {
-            let rate = self.engine_target.map(|(_, r)| r).unwrap_or(48_000);
+            let rate = self
+                .engine_target
+                .map(|(_, r)| r)
+                .unwrap_or(DEFAULT_SAMPLE_RATE_HZ);
             let idle_frames = IDLE_SUSPEND_AFTER.as_secs().saturating_mul(rate as u64);
             if handle.silent_frames() >= idle_frames {
                 self.idle_suspended = true;
@@ -455,7 +472,7 @@ impl Daemon {
             let fs = self
                 .engine_target
                 .map(|(_, r)| r as f32)
-                .unwrap_or(48_000.0);
+                .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f32);
             let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
                 handle.store(settings); // lock-free live update
@@ -530,10 +547,14 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let active = self.config.active();
+        // Resolve the name of the device the engine is actually attached to. Between a
+        // default-device change and the next `follow_default_device` tick, `engine_target`
+        // still points at the old device, so naming the *current default* here would label
+        // the running engine with a device it is not on.
         let output_device = self
             .engine_target
             .filter(|_| self.engine.is_some())
-            .map(|(dev, _)| format!("#{dev}"));
+            .map(|(dev, _)| sys::output_device_name(dev).unwrap_or_else(|| format!("#{dev}")));
         Status {
             enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
@@ -561,28 +582,73 @@ impl Daemon {
     }
 }
 
+/// Read one newline-terminated request line, bounded by a total wall-clock budget (the
+/// socket's read timeout, i.e. [`REQUEST_TIMEOUT`]) and a [`MAX_REQUEST_BYTES`] size cap.
+///
+/// `BufRead::read_line`'s only bound is the socket's per-recv timeout, so a client dripping
+/// one byte just inside that window keeps it looping forever — wedging the single-threaded
+/// loop — and grows the buffer without bound on a newline-less flood. Enforcing an overall
+/// deadline and a size cap closes both.
+fn read_request_line(stream: &UnixStream) -> anyhow::Result<String> {
+    // Bound each recv (so a silent client can't block the loop forever) and the read as a
+    // whole (so a client dripping bytes just under that per-recv bound still can't hold it
+    // open). `budget` is the socket's configured read timeout — set by `run` to
+    // REQUEST_TIMEOUT — falling back to REQUEST_TIMEOUT if none is set; we (re)apply it once
+    // here so this stays correct even if a caller forgot to. The overall bound is then a
+    // deadline checked after each read rather than a per-recv timeout re-armed every
+    // iteration: macOS can reject a rapid re-arm of SO_RCVTIMEO under an active flood.
+    let budget = stream.read_timeout()?.unwrap_or(REQUEST_TIMEOUT);
+    stream.set_read_timeout(Some(budget))?;
+    let deadline = Instant::now() + budget;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = Vec::new();
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => break, // EOF before a newline
+            Ok(available) => {
+                let newline = available.iter().position(|&b| b == b'\n');
+                let upto = newline.unwrap_or(available.len());
+                line.extend_from_slice(&available[..upto]);
+                reader.consume(newline.map_or(upto, |i| i + 1));
+                // Enforce both bounds after every read, before accepting — including the
+                // read that carries the terminating newline. Checking them only on the
+                // no-newline path let a request whose '\n' landed in this buffer slip past
+                // the size cap or the deadline, keeping the single-threaded loop blocked
+                // past REQUEST_TIMEOUT.
+                check_request_bounds(line.len(), deadline)?;
+                if newline.is_some() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+                anyhow::bail!("client did not send a complete request in time");
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(String::from_utf8_lossy(&line).into_owned())
+}
+
+/// The size and time bounds a request read must satisfy, checked after every buffer is
+/// appended so neither can be bypassed at the read that carries the terminating newline.
+fn check_request_bounds(line_len: usize, deadline: Instant) -> anyhow::Result<()> {
+    if line_len > MAX_REQUEST_BYTES {
+        anyhow::bail!("request exceeds {MAX_REQUEST_BYTES} bytes");
+    }
+    if Instant::now() >= deadline {
+        anyhow::bail!("client did not send a complete request in time");
+    }
+    Ok(())
+}
+
 /// The current default output device and its (rounded) sample rate.
 fn current_target() -> (u32, u32) {
     let dev = sys::default_output_device().unwrap_or(0);
     let rate = sys::default_output_sample_rate()
-        .unwrap_or(48_000.0)
+        .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f64)
         .round() as u32;
     (dev, rate)
-}
-
-fn validate_band(freq: f32, gain_db: f32, q: f32) -> anyhow::Result<()> {
-    validate_freq(freq)?;
-    validate_range("gain", gain_db, MIN_BAND_GAIN_DB, MAX_BAND_GAIN_DB, "dB")?;
-    validate_range("Q", q, MIN_Q, MAX_Q, "")?;
-    Ok(())
-}
-
-fn validate_freq(freq: f32) -> anyhow::Result<()> {
-    validate_range("frequency", freq, MIN_BAND_FREQ_HZ, MAX_BAND_FREQ_HZ, "Hz")
-}
-
-fn validate_preamp(db: f32) -> anyhow::Result<()> {
-    validate_range("preamp", db, MIN_PREAMP_DB, MAX_PREAMP_DB, "dB")
 }
 
 #[cfg(test)]
@@ -776,14 +842,6 @@ fn is_shipped_preset_name(name: &str) -> bool {
     Config::default().presets.contains_key(name)
 }
 
-fn validate_preset(preset: &Preset) -> anyhow::Result<()> {
-    validate_preamp(preset.preamp_db)?;
-    for band in &preset.bands {
-        validate_band(band.freq, band.gain_db, band.q)?;
-    }
-    Ok(())
-}
-
 fn validate_preset_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() {
         return Err(anyhow::anyhow!("preset name must not be empty"));
@@ -809,74 +867,9 @@ fn validate_preset_name(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_range(name: &str, value: f32, min: f32, max: f32, unit: &str) -> anyhow::Result<()> {
-    if !value.is_finite() {
-        return Err(anyhow::anyhow!("{name} must be a finite number"));
-    }
-    if !(min..=max).contains(&value) {
-        return Err(anyhow::anyhow!(
-            "{name} must be between {} and {}",
-            format_bound(min, unit),
-            format_bound(max, unit)
-        ));
-    }
-    Ok(())
-}
-
-fn format_bound(value: f32, unit: &str) -> String {
-    if unit.is_empty() {
-        trim_number(value)
-    } else {
-        format!("{} {unit}", trim_number(value))
-    }
-}
-
-fn trim_number(n: f32) -> String {
-    let s = format!("{n:.3}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn band_validation_accepts_practical_values() {
-        validate_band(20.0, -24.0, 0.1).unwrap();
-        validate_band(20_000.0, 24.0, 10.0).unwrap();
-        validate_band(1000.0, 0.0, 1.41).unwrap();
-    }
-
-    #[test]
-    fn band_validation_rejects_invalid_values() {
-        for (freq, gain, q) in [
-            (0.0, 0.0, 1.0),
-            (20_001.0, 0.0, 1.0),
-            (1000.0, -24.1, 1.0),
-            (1000.0, 24.1, 1.0),
-            (1000.0, 0.0, 0.0),
-            (1000.0, 0.0, 10.1),
-            (f32::NAN, 0.0, 1.0),
-            (1000.0, f32::INFINITY, 1.0),
-            (1000.0, 0.0, f32::NEG_INFINITY),
-        ] {
-            assert!(validate_band(freq, gain, q).is_err());
-        }
-    }
-
-    #[test]
-    fn preamp_validation_accepts_safe_range() {
-        validate_preamp(-60.0).unwrap();
-        validate_preamp(0.0).unwrap();
-        validate_preamp(12.0).unwrap();
-    }
-
-    #[test]
-    fn preamp_validation_rejects_invalid_values() {
-        for db in [-60.1, 12.1, f32::NAN, f32::INFINITY] {
-            assert!(validate_preamp(db).is_err());
-        }
-    }
 
     #[test]
     fn preset_save_clones_active_and_selects_new_preset() {
@@ -898,8 +891,10 @@ mod tests {
 
     #[test]
     fn preset_delete_removes_active_and_selects_another() {
-        let mut c = Config::default();
-        c.active_preset = "mellow".into();
+        let mut c = Config {
+            active_preset: "mellow".into(),
+            ..Config::default()
+        };
         delete_presets(&mut c, &["mellow".into()]).unwrap();
         assert!(!c.presets.contains_key("mellow"));
         assert!(c.presets.contains_key(&c.active_preset));
@@ -948,8 +943,10 @@ mod tests {
 
     #[test]
     fn preset_rename_moves_preset_and_updates_active_name() {
-        let mut c = Config::default();
-        c.active_preset = "bright".into();
+        let mut c = Config {
+            active_preset: "bright".into(),
+            ..Config::default()
+        };
         let bright = c.presets["bright"].clone();
         rename_preset(&mut c, "bright", "daily").unwrap();
         assert!(!c.presets.contains_key("bright"));
@@ -1260,6 +1257,146 @@ mod tests {
         assert_eq!(
             d.saved_config.presets["bright"],
             Config::default().presets["bright"]
+        );
+    }
+
+    #[test]
+    fn set_band_rejects_exceeding_max_bands() {
+        let mut d = daemon_with(Config::default());
+        // Start from an empty preset so the count is controlled exactly.
+        d.config.presets.insert(
+            "empty".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: 0.0,
+            },
+        );
+        d.config.active_preset = "empty".into();
+        // Fill to MAX_BANDS with distinct frequencies (spaced > BAND_MATCH_HZ apart).
+        for i in 0..MAX_BANDS {
+            let freq = 20.0 + i as f32;
+            d.apply(Request::SetBand {
+                freq,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .unwrap();
+        }
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+        // One more *new* band must be rejected without mutating the preset.
+        let resp = d
+            .apply(Request::SetBand {
+                freq: 19_000.0,
+                gain_db: 3.0,
+                q: 1.0,
+            })
+            .unwrap();
+        assert!(matches!(resp, Response::Error(_)));
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+        // Editing an existing band is still allowed at the cap.
+        d.apply(Request::SetBand {
+            freq: 20.0,
+            gain_db: -3.0,
+            q: 2.0,
+        })
+        .unwrap();
+        assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+    }
+
+    #[test]
+    fn import_rejects_preset_exceeding_max_bands() {
+        let mut c = Config::default();
+        let bands: Vec<Band> = (0..=MAX_BANDS)
+            .map(|i| Band {
+                kind: BandKind::Peaking,
+                freq: 20.0 + i as f32,
+                gain_db: 1.0,
+                q: 1.0,
+            })
+            .collect();
+        assert_eq!(bands.len(), MAX_BANDS + 1);
+        let path = tmp_path("import-toomany.toml");
+        let file = PresetFile {
+            name: "big".into(),
+            bands,
+            preamp_db: 0.0,
+        };
+        std::fs::write(&path, toml::to_string_pretty(&file).unwrap()).unwrap();
+        let res = import_preset(&mut c, &path, None);
+        let _ = std::fs::remove_file(&path);
+        assert!(res.is_err());
+        assert!(!c.presets.contains_key("big"));
+    }
+
+    #[test]
+    fn handle_does_not_block_on_a_silent_client() {
+        // A client that connects but never sends a full request line must not wedge the
+        // single-threaded daemon: the read timeout `run` sets turns it into an error.
+        let (client, server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut d = daemon_with(Config::default());
+
+        let start = std::time::Instant::now();
+        let res = d.handle(server);
+        assert!(
+            res.is_err(),
+            "a silent client must surface as an error, not a hang"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "handle must return promptly once the read times out"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn read_request_line_caps_a_newlineless_flood() {
+        // A client that sends bytes without a newline must hit the size cap, not grow the
+        // read buffer without bound.
+        let (client, server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // Write from another thread: once the daemon stops reading, the socket buffer fills
+        // and the write blocks, so it can't run inline without deadlocking the test.
+        let writer = std::thread::spawn(move || {
+            let mut w = client;
+            let _ = w.write_all(&vec![b'x'; MAX_REQUEST_BYTES + 16]);
+        });
+        let err = read_request_line(&server).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds"),
+            "a newline-less flood must surface as the size-cap error, got: {err}"
+        );
+        drop(server);
+        let _ = writer.join();
+    }
+
+    #[test]
+    fn check_request_bounds_rejects_over_the_size_cap() {
+        // With plenty of time left, only the size cap decides — a line whose terminating
+        // newline pushes it one byte over must be rejected, not accepted at the break.
+        let far = Instant::now() + Duration::from_secs(3600);
+        assert!(check_request_bounds(MAX_REQUEST_BYTES, far).is_ok());
+        assert!(
+            check_request_bounds(MAX_REQUEST_BYTES + 1, far)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn check_request_bounds_rejects_a_reached_deadline() {
+        // A deadline of "now" is already reached when the check reads the clock, so even a
+        // within-cap line that completes at/after the deadline is rejected.
+        assert!(
+            check_request_bounds(0, Instant::now())
+                .unwrap_err()
+                .to_string()
+                .contains("in time")
         );
     }
 
