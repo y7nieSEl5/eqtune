@@ -279,18 +279,24 @@ const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
 /// coefficient set per band, a linear preamp gain, and the limiter flag. Cheap to
 /// share and swapped atomically, so the control thread can update the EQ live without
 /// ever locking the audio thread.
+///
+/// Every field is private, so the only way to obtain a value is [`EqSettings::new`],
+/// which stamps a fresh [`generation`](Self::generation). That makes the snapshot
+/// genuinely immutable: content and stamp cannot drift apart, so the [`Processor`]'s
+/// generation-based change detection can never miss an edit (the hazard a
+/// clone-then-mutate of public fields would otherwise open).
 #[derive(Clone, Debug)]
 pub struct EqSettings {
-    pub coeffs: Vec<Coeffs>,
-    pub preamp: f32,
-    pub limiter: bool,
+    coeffs: Vec<Coeffs>,
+    preamp: f32,
+    limiter: bool,
     /// Version stamp, unique per constructed snapshot ([`EqSettings::new`] draws it from a
     /// process-global counter). The real-time [`Processor`] compares it against the last
     /// snapshot it synced to decide whether to re-copy coefficients, so an update is
     /// detected by value and never by heap address — immune to an `Arc` being freed and
-    /// its address reused between two audio blocks. Private so no path can construct an
-    /// unstamped snapshot or forge a collision; clones share the stamp, which is correct
-    /// because a clone is the same snapshot.
+    /// its address reused between two audio blocks. A clone shares the stamp, which is
+    /// correct precisely because the fields are private: a clone can never be mutated, so
+    /// it really is the same snapshot.
     generation: u64,
 }
 
