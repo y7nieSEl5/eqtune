@@ -96,7 +96,7 @@ my-bright.toml` or `eqtune preset-import my-bright.toml other-name`.
 The EQ is fully editable. `eqtune band` adds or updates a peaking filter at any frequency on the active preset:
 
 ```sh
-eqtune band 2000 -6        # cut 2 kHz by 6 dB (default Q 1.41)
+eqtune band 2000 -6        # cut 2 kHz by 6 dB (default Q 1.0)
 eqtune band 8000 3 2.0     # boost 8 kHz by 3 dB with a narrower Q
 eqtune band-rm 2000        # remove the 2 kHz band
 eqtune preamp 4            # set the preamp to +4 dB
@@ -104,6 +104,9 @@ eqtune preamp 4            # set the preamp to +4 dB
 
 Editable values are validated before they reach the audio engine: band frequencies must
 be 20-20000 Hz, band gains -24 to +24 dB, Q 0.1-10, and preamp -60 to +12 dB.
+Presets are capped at 64 bands. If a hand-edited config is malformed or contains values
+the realtime engine cannot run, eqtune preserves it as `config.toml.corrupt` (or a
+numbered sibling) and starts from shipped defaults instead of crash-looping.
 
 ## Battery & energy
 

@@ -16,6 +16,34 @@ This project follows [Semantic Versioning](https://semver.org/).
 - `eqtune response` to print a frequency-response table using the existing DSP math.
 - Shell completion generation for zsh, bash, and fish.
 
+## [0.3.1] - 2026-07-06
+
+### Fixed
+
+- Hardened daemon request reads with a total deadline and 64 KiB request-line cap, including
+  the read that contains the terminating newline, so stalled or flooding clients cannot
+  freeze the single-threaded accept/poll loop.
+- Config loading now rejects malformed TOML, over-cap presets, and non-finite or out-of-range
+  preset values before they can reach the realtime engine.
+- Unusable config files are moved aside as `config.toml.corrupt` (or `.corrupt.N`) before
+  falling back to defaults, preserving the bad file for manual recovery instead of
+  crash-looping under launchd.
+- Config saves now write a sibling temp file, fsync it, atomically rename it into place,
+  and fsync the directory to reduce the chance of a crash or power loss truncating the
+  live config.
+- Reinstalling with `eqtune install` now restarts an already-loaded LaunchAgent with
+  `launchctl kickstart -k`, avoiding the bootout/bootstrap race, and skips copying when
+  the current executable is already the installed binary.
+- `eqtune status` reports the output device the running engine is actually attached to,
+  rather than relabeling it as the current default device during the device-follow poll gap.
+
+### Changed
+
+- The realtime processor reserves capacity for the 64-band preset cap up front, so adopting
+  a larger preset does not allocate on the audio thread.
+- EQ settings snapshots now carry construction-time generation stamps with private fields,
+  making live-update detection robust even if an allocator reuses the same heap address.
+
 ## [0.3.0] - 2026-06-25
 
 ### Added

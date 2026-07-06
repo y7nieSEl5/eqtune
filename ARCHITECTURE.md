@@ -117,6 +117,12 @@ to extend (add an enum variant) and trivial to test (`serde_json` round-trip tes
 `ipc.rs`). There's no long-lived connection, no streaming, no versioning headache — the
 client is stateless and the daemon is the single source of truth.
 
+The request read is deliberately bounded: one line must arrive within the socket's total
+deadline (currently 5 seconds) and fit under 64 KiB. The daemon checks those bounds after
+every buffer append, including the append that contains the terminating newline, so a
+silent client, slow byte-drip, or newline-less flood cannot wedge the single-threaded
+accept/poll loop.
+
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
 to the audio thread via `EqHandle::store` — without restarting playback. The daemon keeps
@@ -180,11 +186,18 @@ The interesting part is how settings cross the plane boundary safely. Two types:
 
 They're connected by an `Arc<ArcSwap<EqSettings>>` (the `arc-swap` crate). The control
 thread publishes a new snapshot with a single atomic pointer swap; the audio thread reads
-the current snapshot each block with a wait-free `load()`. **No locks touch the audio
-thread.** This matters enormously: blocking or waiting on a mutex inside a real-time audio
-callback risks priority inversion and audible dropouts. The atomic-swap pattern means a
-live EQ edit is just "allocate a new `EqSettings`, swap the pointer," and the next audio
-block picks it up cleanly.
+the current snapshot each block with a wait-free `load()`. Each constructed snapshot also
+carries a unique generation stamp, and `EqSettings`'s fields are private, so the audio
+thread detects updates by value rather than by heap address — an allocator reusing an
+`Arc` address cannot hide a fresh setting.
+
+**No locks touch the audio thread.** This matters enormously: blocking or waiting on a
+mutex inside a real-time audio callback risks priority inversion and audible dropouts. The
+atomic-swap pattern means a live EQ edit is just "allocate a new `EqSettings`, swap the
+pointer," and the next audio block picks it up cleanly. The processor also reserves
+capacity for `MAX_BANDS` (64) per channel when it is created, and every mutation/import/load
+path enforces that cap, so adopting a larger preset resizes within existing capacity
+instead of allocating on the audio thread.
 
 `src/sys.rs` wires this up: `process_trampoline` is the `extern "C"` function the shim
 calls. It loads the current settings and runs the processor over the buffer. The
@@ -231,7 +244,7 @@ attacks this on two fronts:
 - **Run the engine less.** Idle auto-off, Low Power Mode auto-off, and `eqtune off` tear
   the whole Core Audio pipeline down — the biggest lever.
 - **Make each block cheaper.** The real-time `Processor` (a) re-copies filter coefficients
-  only when the settings pointer actually changes (steady-state blocks do zero coefficient
+  only when the settings generation changes (steady-state blocks do zero coefficient
   work), (b) drops 0 dB "identity" bands at design time so they cost no biquad, and (c)
   skips per-sample processing entirely during sustained silence.
 
@@ -246,7 +259,12 @@ for "media is streaming" rather than a per-app media-session API.
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
   named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
   `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
-  needs no file. The daemon holds both a working config and the last saved config: live
+  needs no file. Loads validate every preset against the realtime engine's limits
+  (finite values, practical ranges, and at most 64 bands). A malformed or unrunnable config
+  is moved aside as `config.toml.corrupt` or `config.toml.corrupt.N` and eqtune continues
+  from shipped defaults, preserving the bad file for manual recovery. Saves write a sibling
+  temp file, fsync it, atomically rename it into place, and fsync the directory so a crash
+  cannot easily truncate the live config. The daemon holds both a working config and the last saved config: live
   tuning edits affect only the working config until the `off` prompt resolves them.
   Preset-management commands mutate the saved preset map directly: new preset names cannot
   overwrite existing custom names, deleting the last preset is rejected, and deleting the
@@ -261,7 +279,9 @@ for "media is streaming" rather than a per-app media-session API.
 
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
-  binary to a stable location and bootstraps the agent.
+  binary to a stable location, skips self-copies, and either bootstraps a new agent or
+  restarts an already-loaded one with `launchctl kickstart -k` to avoid the
+  bootout/bootstrap race.
 - **No code signing.** Locally-built binaries aren't quarantined, so Gatekeeper never
   applies. `build.rs` embeds an `Info.plist` into the binary so macOS shows a proper
   audio-capture permission prompt without an Apple Developer account.

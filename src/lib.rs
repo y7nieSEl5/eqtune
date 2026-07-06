@@ -1,7 +1,7 @@
 //! eqtune — system-wide audio EQ for macOS.
 //!
-//! Library root. The Core Audio capture/replay layer (process taps) will live in the
-//! `daemon` module; the modules here are the portable, unit-testable core.
+//! Library root. The portable Rust modules own config, IPC, daemon state, DSP, launchd
+//! integration, and safe wrappers around the Objective-C Core Audio shim.
 //!
 //! For the design notes, see [`architecture_zh`].
 

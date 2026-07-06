@@ -448,9 +448,11 @@ impl Processor {
     }
 }
 
-/// The built-in "default" curve — a 9-band, graphic-EQ-style tuning from the user:
+/// A legacy 9-band, graphic-EQ-style tuning used by DSP tests and low-level examples:
 /// a broad ~-5 dB low/low-mid cut, a scoop through 1-2 kHz to tame harsh mids, a small
 /// lift of air up top, with +7 dB make-up gain ([`DEFAULT_PREAMP_DB`]).
+///
+/// This is not the shipped preset library; user-facing defaults live in `Config::default`.
 ///
 /// Modeled as peaking filters at ~octave Q (the conventional graphic-EQ shape); pure
 /// data, tunable live via `eqtune band`.

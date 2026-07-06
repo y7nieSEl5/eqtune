@@ -2,7 +2,7 @@
 //! preamp) and global audio toggles. Serialized as TOML at
 //! `~/Library/Application Support/eqtune/config.toml`.
 //!
-//! Ships a working default (the built-in curve) so a first run needs no config file.
+//! Ships a working preset library so a first run needs no config file.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;

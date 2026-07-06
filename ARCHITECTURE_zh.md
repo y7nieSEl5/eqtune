@@ -8,11 +8,11 @@
 
 现有的第三方equalizer都倾向于通过安装loopback/kernel drivers来替换掉原生扬声器。这会导致项目体型庞大，且在连接蓝牙耳机或有线耳机后，并不会及时切换输出设备。
 
-eqtune通过利用Apple从MacOS 14.2开始支持的**Core Audio Process API**来实现对系统级别音频的调衡。
+eqtune通过利用Apple从macOS 14.2开始支持的**Core Audio process-tap API**来实现对系统级别音频的调衡。
 
 ## general 
 
-```
+```text
    you ── eqtune on/off/band/… ─▶    ┌─────────────────────┐
    (CLI client, short-lived)         │  thin client        │
                                      └──────────┬──────────┘
@@ -59,7 +59,7 @@ TLDR：`src/sys.rs`和shim里面集中了没法优雅故障恢复、带`unsafe`�
 
 `src/ipc.rs`中实现了用户命令与engine交互的途径：
 
-```rs
+```rust,ignore
 enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SavePreset { name }, ClonePreset { source, dest },
                 DeletePresets { names }, RenamePreset { from, to },
@@ -79,6 +79,8 @@ daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令
 另外，`export`命令会导出单preset TOML并返回`Ok`；而保存/克隆/重命名/import等命令会根据语义返回`Tuning`或预设列表，而不都是`Ok`。
 
 因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。
+
+daemon对这行JSON也有硬边界：一次请求必须在总计5秒内读完，且不能超过64 KiB。这个检查会在每次读取后执行，包括读到结尾换行符的那一次，因此沉默连接、慢速滴字节、或一直不发换行的client都不能卡住单线程的accept/poll循环。
 
 ### audio plane
 
@@ -105,6 +107,7 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 请注意
 `EqSettings`（音频线程中所需全部参数的不可变快照）和`Processor`（音频线程本地的filter状态）通过`Arc<ArcSwap<EqSettings>>`相连接。control线程通过一次原子指针交换发布新快照，audio线程在每个block中用`load()`读取快照，无需等待。**audio线程是lock-free的**，这很重要，因为实时音频处理中阻塞或等待互斥锁可能引发优先级反转和掉帧。
+每个`EqSettings`在构造时都会带上唯一的generation stamp，且内部字段保持私有，所以audio线程根据generation判断是否需要同步新coefficients，而不是依赖`Arc`的堆地址；即使allocator复用了同一个地址，也不会漏掉一次实时调教更新。`Processor`在创建时也会按`MAX_BANDS`（64）为每个声道预留容量，所有添加、导入、加载preset的路径都会执行同一个上限校验，因此切换到更大的preset时也不会在audio线程重新分配内存。
 `src/sys.rs`负责把它俩连起来。`process-trampoline`是shim调用的`extern "C"`函数。它加载当前设置之后在buffer中运行processor。`TapSession`拥有原生session，在`Drop`的时候可以停止音频，所以这顺便很好地实现了`eqtune off`，本质就是drop掉`TapSession`，而且这可以避免泄露Core Audio对象或者以错误的方式终止它们。
 
 ## engine lifecycle
@@ -120,16 +123,17 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 `reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。
 
-> 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教改变时重新计算filter的coeffs; (b) 0dB被忽略，因此不消耗biquad。
+> 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教generation改变时同步filter的coeffs; (b) 0dB被忽略，因此不消耗biquad; (c) 持续静音时跳过逐sample处理。
 
 ## persistence & packaging
 
 - **Config** 全部是存放在`~/Library/Application Support/eqtune/config.toml`的TOML。
   我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
+  加载config时会先验证每个preset是否能被实时engine安全运行：数值必须有限且在范围内，preset最多64个band。无法解析或无法运行的config会被移动到`config.toml.corrupt`或带编号的同名备份，然后用内置默认值继续启动，避免launchd KeepAlive反复重启同一个坏配置。保存config时会先写同目录临时文件、fsync、再原子rename并fsync目录，以降低崩溃或断电时截断正式config的风险。
   daemon拥有实时调教和上一个被保存的调教。只改变当前正在运行的config，只有实时调教会被改变。`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。
   这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
 
-- **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置。
+- **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置；如果daemon已经加载，则用`launchctl kickstart -k`原地重启新binary，避免`bootout`之后立刻`bootstrap`时撞上KeepAlive job尚未完全退出的race。
 
 ## FAQ
 
