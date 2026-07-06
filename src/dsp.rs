@@ -749,44 +749,17 @@ mod tests {
             "a snapshot with the same generation must be skipped"
         );
 
-        // A distinct generation is adopted, resizing the cascade — and a freshly
-        // constructed snapshot is distinct without any manual stamping.
+        // A distinct generation is adopted, resizing the cascade. A freshly constructed
+        // snapshot is distinct without any manual stamping — the PR #1 regression where
+        // `EqSettings::new` left `generation == 0` on every snapshot made a `Processor`
+        // driven directly through the public API (no `EqHandle::store` in between) treat this
+        // second value as unchanged and keep the previous coefficients.
         let one_fresh = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
         p.run(&one_fresh, &mut buf, 1);
         assert_eq!(
             p.channels[0].len(),
             1,
             "a distinct generation must resync to one section"
-        );
-    }
-
-    #[test]
-    fn fresh_snapshots_resync_without_any_stamping_path() {
-        // Regression (PR #1 review): `EqSettings::new` used to leave `generation == 0` on
-        // every snapshot, so a `Processor` driven directly through the public API — no
-        // `EqHandle::store` in between — treated a second freshly built settings value as
-        // unchanged and kept the previous coefficients.
-        let mut p = Processor::new(1);
-        let mut buf = vec![0.1f32; 128];
-        let three = EqSettings::new(
-            &[peak(200.0), peak(1000.0), peak(5000.0)],
-            48_000.0,
-            0.0,
-            false,
-        );
-        p.run(&three, &mut buf, 1);
-        assert_eq!(
-            p.channels[0].len(),
-            3,
-            "first snapshot syncs three sections"
-        );
-
-        let one = EqSettings::new(&[peak(1000.0)], 48_000.0, 0.0, false);
-        p.run(&one, &mut buf, 1);
-        assert_eq!(
-            p.channels[0].len(),
-            1,
-            "a second freshly constructed snapshot must be adopted, not skipped"
         );
     }
 }
