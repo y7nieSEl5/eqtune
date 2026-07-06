@@ -1,7 +1,7 @@
 //! Raw FFI to the Objective-C Core Audio shim (`shim/tap_shim.m`) plus safe wrappers.
 //! This is the boundary between Rust and the macOS audio system.
 
-use std::ffi::{c_char, c_void};
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -58,8 +58,11 @@ pub fn output_device_name(dev: u32) -> Option<String> {
         return None;
     }
     // The shim NUL-terminates on success; decode the bytes up to it.
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    std::str::from_utf8(&buf[..end]).ok().map(str::to_owned)
+    CStr::from_bytes_until_nul(&buf)
+        .ok()?
+        .to_str()
+        .ok()
+        .map(str::to_owned)
 }
 
 /// Whether macOS Low Power Mode is currently enabled.
