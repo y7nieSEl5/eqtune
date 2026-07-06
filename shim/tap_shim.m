@@ -60,7 +60,7 @@ bool eqtune_low_power_enabled(void) {
 
 bool eqtune_default_output_device_running(void) {
     AudioObjectID dev = (AudioObjectID)eqtune_default_output_device();
-    if (dev == kAudioObjectUnknown || dev == 0) {
+    if (dev == kAudioObjectUnknown) {
         return false;
     }
     UInt32 running = 0;
@@ -80,7 +80,7 @@ bool eqtune_output_device_name(uint32_t dev_id, char *buf, size_t buflen) {
     }
     @autoreleasepool {
         AudioObjectID dev = (AudioObjectID)dev_id;
-        if (dev == kAudioObjectUnknown || dev == 0) {
+        if (dev == kAudioObjectUnknown) {
             return false;
         }
         CFStringRef name = NULL;
