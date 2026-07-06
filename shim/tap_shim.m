@@ -13,32 +13,17 @@ static void log_err(const char *what, OSStatus st) {
     fprintf(stderr, "eqtune shim: %s failed (OSStatus %d)\n", what, (int)st);
 }
 
+// Current default output device, or kAudioObjectUnknown (0) on failure. Defined in the
+// helpers section below; the single query lives there so nothing here re-implements it.
+static AudioObjectID default_output_device(void);
+
 uint32_t eqtune_default_output_device(void) {
-    AudioObjectID device = kAudioObjectUnknown;
-    UInt32 size = sizeof(device);
-    AudioObjectPropertyAddress address = {
-        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    OSStatus status = AudioObjectGetPropertyData(
-        kAudioObjectSystemObject, &address, 0, NULL, &size, &device);
-    if (status != noErr) {
-        return 0;
-    }
-    return (uint32_t)device;
+    return (uint32_t)default_output_device();
 }
 
 double eqtune_default_output_sample_rate(void) {
-    AudioObjectID dev = kAudioObjectUnknown;
-    UInt32 dsize = sizeof(dev);
-    AudioObjectPropertyAddress daddr = {
-        .mSelector = kAudioHardwarePropertyDefaultOutputDevice,
-        .mScope = kAudioObjectPropertyScopeGlobal,
-        .mElement = kAudioObjectPropertyElementMain,
-    };
-    if (AudioObjectGetPropertyData(kAudioObjectSystemObject, &daddr, 0, NULL, &dsize, &dev) != noErr
-        || dev == kAudioObjectUnknown) {
+    AudioObjectID dev = default_output_device();
+    if (dev == kAudioObjectUnknown) {
         return 0;
     }
     Float64 rate = 0;
