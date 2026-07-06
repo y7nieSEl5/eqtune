@@ -74,12 +74,12 @@ bool eqtune_default_output_device_running(void) {
     return status == noErr && running != 0;
 }
 
-bool eqtune_default_output_device_name(char *buf, size_t buflen) {
+bool eqtune_output_device_name(uint32_t dev_id, char *buf, size_t buflen) {
     if (!buf || buflen == 0) {
         return false;
     }
     @autoreleasepool {
-        AudioObjectID dev = (AudioObjectID)eqtune_default_output_device();
+        AudioObjectID dev = (AudioObjectID)dev_id;
         if (dev == kAudioObjectUnknown || dev == 0) {
             return false;
         }

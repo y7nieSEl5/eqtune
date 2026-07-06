@@ -21,10 +21,10 @@ bool eqtune_low_power_enabled(void);
 // true when the current default output device is running somewhere.
 bool eqtune_default_output_device_running(void);
 
-// Writes the current default output device's name as a NUL-terminated UTF-8 C string into
-// `buf` (capacity `buflen` bytes). Returns false if there is no device, its name can't be
-// read, or `buf` is too small.
-bool eqtune_default_output_device_name(char *buf, size_t buflen);
+// Writes the name of output device `dev` as a NUL-terminated UTF-8 C string into `buf`
+// (capacity `buflen` bytes). Returns false if `dev` is 0/unknown, its name can't be read,
+// or `buf` is too small.
+bool eqtune_output_device_name(uint32_t dev, char *buf, size_t buflen);
 
 // Called from the real-time audio thread to process captured audio in place.
 // `buffer` holds `frames * channels` interleaved 32-bit float samples.

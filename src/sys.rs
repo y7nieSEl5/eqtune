@@ -26,9 +26,9 @@ unsafe extern "C" {
     fn eqtune_low_power_enabled() -> bool;
     /// Whether the current default output device is running somewhere.
     fn eqtune_default_output_device_running() -> bool;
-    /// Writes the default output device name (NUL-terminated UTF-8) into `buf`; returns
+    /// Writes the name of output device `dev` (NUL-terminated UTF-8) into `buf`; returns
     /// false if unavailable or the buffer is too small.
-    fn eqtune_default_output_device_name(buf: *mut c_char, buflen: usize) -> bool;
+    fn eqtune_output_device_name(dev: u32, buf: *mut c_char, buflen: usize) -> bool;
     fn eqtune_tap_start(cb: ProcessCb, ctx: *mut c_void) -> *mut RawSession;
     fn eqtune_tap_stop(session: *mut RawSession);
 }
@@ -45,12 +45,15 @@ pub fn default_output_sample_rate() -> Option<f64> {
     (rate > 0.0).then_some(rate)
 }
 
-/// The current default output device's human-readable name, if available.
-pub fn default_output_device_name() -> Option<String> {
+/// The human-readable name of output device `dev` (an `AudioObjectID`), if available.
+/// Resolving by id — rather than "whatever the default is right now" — keeps a label
+/// truthful for a device the caller is already attached to, even if the system default
+/// has since moved elsewhere.
+pub fn output_device_name(dev: u32) -> Option<String> {
     // CoreAudio device names are short; 256 bytes is ample for the UTF-8 form.
     let mut buf = [0u8; 256];
     let ok =
-        unsafe { eqtune_default_output_device_name(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+        unsafe { eqtune_output_device_name(dev, buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
     if !ok {
         return None;
     }
@@ -176,7 +179,7 @@ mod tests {
         // Proves the ObjC shim compiles, links CoreAudio, and is callable from Rust.
         let _ = default_output_device();
         let _ = default_output_sample_rate();
-        let _ = default_output_device_name();
+        let _ = default_output_device().and_then(output_device_name);
         let _ = low_power_enabled();
         let _ = default_output_device_running();
     }

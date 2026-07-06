@@ -550,10 +550,14 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let active = self.config.active();
+        // Resolve the name of the device the engine is actually attached to. Between a
+        // default-device change and the next `follow_default_device` tick, `engine_target`
+        // still points at the old device, so naming the *current default* here would label
+        // the running engine with a device it is not on.
         let output_device = self
             .engine_target
             .filter(|_| self.engine.is_some())
-            .map(|(dev, _)| sys::default_output_device_name().unwrap_or_else(|| format!("#{dev}")));
+            .map(|(dev, _)| sys::output_device_name(dev).unwrap_or_else(|| format!("#{dev}")));
         Status {
             enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
