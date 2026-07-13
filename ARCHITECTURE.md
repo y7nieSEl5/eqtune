@@ -317,8 +317,10 @@ The daemon deliberately separates "what is playing now" from "what is saved":
   returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a
   clone of `saved_config`. If the name is unused, it creates a user preset. If the name is
-  one of the shipped names (`bright`, `mellow`, `pro`), it overwrites that local shipped
-  preset copy. Existing non-shipped names are rejected to prevent accidental loss.
+  one of the shipped names (`bright`, `mellow`, `pro`) or the active preset's own name, it
+  overwrites that preset — saving back into the preset being edited is the overwrite
+  action, not a collision. Names of *other* custom presets are rejected to prevent
+  accidental loss.
 - Overwrite (`SaveSessionOverwrite`) writes the entire working config as-is, preserving
   the active preset name. This is the direct path for "I tuned bright; make my device's
   bright sound like this now."

@@ -571,7 +571,7 @@ impl Daemon {
     }
 
     fn save_session_as(&mut self, name: &str) -> anyhow::Result<()> {
-        validate_session_save_name(&self.saved_config, name)?;
+        validate_session_save_name(&self.saved_config, &self.config.active_preset, name)?;
         let preset = self
             .config
             .active()
@@ -906,9 +906,13 @@ fn validate_new_preset_name(config: &Config, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_session_save_name(config: &Config, name: &str) -> anyhow::Result<()> {
+/// A session may be saved under a new name, a shipped name (a deliberate overwrite of a
+/// built-in), or the active preset's own name — saving the tuning back into the preset
+/// being edited is exactly the overwrite action, not an accident to prevent. Only the
+/// names of *other* custom presets are rejected, to prevent accidental loss.
+fn validate_session_save_name(config: &Config, active: &str, name: &str) -> anyhow::Result<()> {
     validate_preset_name(name)?;
-    if config.presets.contains_key(name) && !is_shipped_preset_name(name) {
+    if config.presets.contains_key(name) && !is_shipped_preset_name(name) && name != active {
         return Err(anyhow::anyhow!("preset already exists: {name}"));
     }
     Ok(())
@@ -1152,7 +1156,31 @@ mod tests {
     }
 
     #[test]
-    fn session_save_as_rejects_existing_custom_preset_name() {
+    fn session_save_as_rejects_another_custom_preset_name() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SavePreset {
+            name: "daily".into(),
+        })
+        .unwrap();
+        d.apply(Request::SavePreset {
+            name: "desk".into(),
+        })
+        .unwrap(); // active is now "desk"
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        // "daily" is someone else's preset — overwriting it by save-as would be the
+        // accidental loss the check exists to prevent.
+        let err = d
+            .apply(Request::SaveSessionAs {
+                name: "daily".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("preset already exists"));
+        let _ = std::fs::remove_file(&d.config_path);
+    }
+
+    #[test]
+    fn session_save_as_own_name_overwrites_the_active_custom_preset() {
         let mut d = daemon_with(Config::default());
         d.apply(Request::SavePreset {
             name: "daily".into(),
@@ -1160,12 +1188,16 @@ mod tests {
         .unwrap();
         d.apply(Request::SetPreamp(-3.0)).unwrap();
 
-        let err = d
-            .apply(Request::SaveSessionAs {
-                name: "daily".into(),
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("preset already exists"));
+        // Saving the session under the preset being edited is the overwrite action, not
+        // a name collision — it must not dead-end with "preset already exists".
+        d.apply(Request::SaveSessionAs {
+            name: "daily".into(),
+        })
+        .unwrap();
+        assert_eq!(d.config, d.saved_config);
+        assert_eq!(d.config.active_preset, "daily");
+        assert_eq!(d.saved_config.presets["daily"].preamp_db, -3.0);
+        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
