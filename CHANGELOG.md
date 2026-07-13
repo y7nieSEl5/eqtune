@@ -52,6 +52,12 @@ This project follows [Semantic Versioning](https://semver.org/).
   saved one and silently drop the session edits.
 - `eqtune lowpower off` no longer restarts the engine while it is idle-suspended with no
   media playing; the idle policy keeps it suspended until playback resumes.
+- Preset-management commands (`preset-rm`, `preset-rename`, `preset-import`, `reset`) and
+  the save prompt's overwrite path no longer adopt a change in memory when the config
+  write fails. A failed save now leaves `status`, the engine, and the disk in agreement
+  and retrying the command re-attempts the write — it used to leave a half-applied change
+  behind that read as phantom unsaved tuning. A failed `reset` also no longer lifts an
+  idle suspension.
 
 ### Waiting to be implemented
 

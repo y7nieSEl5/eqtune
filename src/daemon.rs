@@ -237,8 +237,7 @@ impl Daemon {
             }
             Request::DeletePresets { names } => {
                 self.ensure_no_unsaved_session()?;
-                delete_presets(&mut self.config, &names)?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| delete_presets(c, &names))?;
                 Ok(Response::Presets {
                     active: self.config.active_preset.clone(),
                     names: self.config.presets.keys().cloned().collect(),
@@ -246,8 +245,7 @@ impl Daemon {
             }
             Request::RenamePreset { from, to } => {
                 self.ensure_no_unsaved_session()?;
-                rename_preset(&mut self.config, &from, &to)?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| rename_preset(c, &from, &to))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ExportPreset { name, path } => {
@@ -256,8 +254,7 @@ impl Daemon {
             }
             Request::ImportPreset { path, name } => {
                 self.ensure_no_unsaved_session()?;
-                import_preset(&mut self.config, &path, name.as_deref())?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| import_preset(c, &path, name.as_deref()))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetBand { freq, gain_db, q } => {
@@ -331,7 +328,8 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SaveSessionOverwrite => {
-                self.persist_and_apply()?;
+                // Commit the working config — the session edits — exactly as it stands.
+                self.commit_config(|_| Ok(()))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::DiscardSession => {
@@ -545,9 +543,20 @@ impl Daemon {
         self.commit_setting(|c| c.enabled = on)
     }
 
-    fn persist_and_apply(&mut self) -> anyhow::Result<()> {
-        self.config.save_to(&self.config_path)?;
-        self.saved_config = self.config.clone();
+    /// Commit a working-config mutation: mutate a clone, persist it, and adopt it in
+    /// memory only on success — the whole-config sibling of `commit_setting`. A failed
+    /// save leaves both configs (and so `status` and the engine) on the state the disk
+    /// still has, and a retry of the command re-attempts the write. Committing the
+    /// working config as it stands (resolving a session) is the identity mutation.
+    fn commit_config(
+        &mut self,
+        mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut next = self.config.clone();
+        mutate(&mut next)?;
+        next.save_to(&self.config_path)?;
+        self.saved_config = next.clone();
+        self.config = next;
         self.apply_current_settings()
     }
 
@@ -690,21 +699,25 @@ impl Daemon {
         self.apply_current_settings()
     }
 
+    // Every reset entry point ensures no unsaved session first, so the working config
+    // these two mutate equals the saved one.
     fn confirm_reset_preset(&mut self, name: &str, backups: &[PresetBackup]) -> anyhow::Result<()> {
-        let mut next = self.saved_config.clone();
-        apply_reset_backups(&mut next, backups)?;
-        reset_preset(&mut next, name)?;
-        self.config = next;
-        self.persist_and_apply()
+        self.commit_config(|c| {
+            apply_reset_backups(c, backups)?;
+            reset_preset(c, name)
+        })
     }
 
     fn confirm_reset_all(&mut self, backups: &[PresetBackup]) -> anyhow::Result<()> {
-        let mut next = self.saved_config.clone();
-        apply_reset_backups(&mut next, backups)?;
-        reset_shipped_presets(&mut next);
-        self.config = next;
+        self.commit_config(|c| {
+            apply_reset_backups(c, backups)?;
+            reset_shipped_presets(c);
+            Ok(())
+        })?;
+        // Only after the reset actually landed: a failed save must not lift the idle
+        // suspension and let the next reconcile restart the engine with nothing playing.
         self.idle_suspended = false;
-        self.persist_and_apply()
+        Ok(())
     }
 
     fn status(&self) -> Status {
@@ -1699,6 +1712,85 @@ mod tests {
             Config::load_from(&d.config_path).unwrap().active_preset,
             "mellow"
         );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn preset_delete_save_failure_leaves_state_untouched_and_a_retry_persists() {
+        let mut d = daemon_with(Config::default());
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        let names = vec!["mellow".to_string()];
+        assert!(
+            d.apply(Request::DeletePresets {
+                names: names.clone()
+            })
+            .is_err()
+        );
+        // The delete must not survive in memory: the disk still has the preset, and a
+        // half-applied working config would read as a phantom unsaved session whose
+        // retry ("no such preset") could never persist the deletion.
+        assert!(d.config.presets.contains_key("mellow"));
+        assert!(d.saved_config.presets.contains_key("mellow"));
+        assert!(!d.has_unsaved_session());
+
+        d.config_path = good_path;
+        d.apply(Request::DeletePresets { names }).unwrap();
+        assert!(!d.config.presets.contains_key("mellow"));
+        assert!(
+            !Config::load_from(&d.config_path)
+                .unwrap()
+                .presets
+                .contains_key("mellow")
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn session_overwrite_save_failure_keeps_the_session_open() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.has_unsaved_session());
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::SaveSessionOverwrite).is_err());
+        // The edits were not committed, so they must stay an open session (draft mirror
+        // included) rather than being adopted as saved while the disk disagrees.
+        assert!(d.has_unsaved_session());
+        assert!(d.session_path.exists());
+
+        d.config_path = good_path;
+        d.apply(Request::SaveSessionOverwrite).unwrap();
+        assert!(!d.has_unsaved_session());
+        assert!(!d.session_path.exists());
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert_eq!(on_disk.active().unwrap().preamp_db, -3.0);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn reset_all_save_failure_keeps_the_idle_suspension() {
+        let mut d = daemon_with(Config::default());
+        d.idle_suspended = true;
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::ConfirmReset { backups: vec![] }).is_err());
+        // A reset that did not land must not lift the idle suspension: the next
+        // reconcile would restart the engine with nothing playing.
+        assert!(d.idle_suspended);
+
+        d.config_path = good_path;
+        d.apply(Request::ConfirmReset { backups: vec![] }).unwrap();
+        assert!(!d.idle_suspended);
         let _ = std::fs::remove_file(&blocker);
     }
 
