@@ -314,25 +314,44 @@ impl Config {
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        self.write_atomically(path, true)
+    }
+
+    /// Atomic like [`Config::save_to`] (readers never see a torn file) but without the
+    /// fsyncs, for the best-effort session-draft mirror: it is rewritten on every live
+    /// edit inside the daemon's single-threaded accept/poll loop, where two
+    /// durability-grade flushes per keystroke would stall request handling and the
+    /// device/low-power/idle polling for nothing — the worst a power loss can cost is
+    /// the most recent mirror write, and a file truncated by an ill-timed crash is
+    /// quarantined (not trusted) by [`Config::load_session`].
+    pub fn write_draft_to(&self, path: &Path) -> anyhow::Result<()> {
+        self.write_atomically(path, false)
+    }
+
+    fn write_atomically(&self, path: &Path, durable: bool) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        // Write to a sibling temp file, fsync it, then atomically rename it into place and
-        // fsync the directory. A crash or power loss mid-write can then only truncate the
-        // throwaway temp file, never the live config. The fsyncs are what make that true:
-        // without them the rename can reach disk before the bytes do, so a crash could leave
-        // `path` pointing at an empty or partial file — the very truncation this prevents.
+        // Write to a sibling temp file, then atomically rename it into place, so a crash
+        // mid-write can only truncate the throwaway temp file, never the live file. When
+        // `durable`, additionally fsync the file before the rename and the directory
+        // after it: without those a power loss could apply the rename before the bytes
+        // reach disk, leaving `path` pointing at an empty or partial file.
         let tmp = with_suffix(path, ".tmp");
         {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
+            if durable {
+                file.sync_all()?;
+            }
         }
         std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+        if durable {
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
             }
         }
         Ok(())

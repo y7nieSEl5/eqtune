@@ -582,7 +582,7 @@ impl Daemon {
     /// command must not report success over that.
     fn sync_session_file(&self) -> anyhow::Result<()> {
         if self.has_unsaved_session() {
-            if let Err(e) = self.config.save_to(&self.session_path) {
+            if let Err(e) = self.config.write_draft_to(&self.session_path) {
                 eprintln!(
                     "could not mirror the session draft to {}: {e}",
                     self.session_path.display()
