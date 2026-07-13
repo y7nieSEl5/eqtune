@@ -299,7 +299,11 @@ impl Daemon {
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
                 } else if !on {
-                    self.engine_target_on = self.config.enabled; // lift any LPM suppression
+                    // Lift any LPM suppression — but an idle suspension is not this
+                    // toggle's to lift: restarting the engine here with no media playing
+                    // would contradict the idle policy (follow_low_power and
+                    // SetAutoOffIdle apply the same guard).
+                    self.engine_target_on = self.config.enabled && !self.idle_suspended;
                 }
                 self.reconcile()?;
                 Ok(Response::Ok)
@@ -1478,6 +1482,28 @@ mod tests {
             !on_disk.enabled,
             "off must be persisted for the next startup"
         );
+        let _ = std::fs::remove_file(&d.config_path);
+    }
+
+    #[test]
+    fn disabling_lowpower_auto_off_does_not_lift_an_idle_suspension() {
+        // EQ enabled but idle-suspended (no media): turning the LPM policy off must not
+        // restart the engine — only new device activity (or an explicit `on`) lifts an
+        // idle suspension.
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.idle_suspended = true;
+        d.engine_target_on = false;
+
+        d.apply(Request::SetAutoOffLowPower(false)).unwrap();
+
+        assert!(
+            !d.engine_target_on,
+            "lifting LPM suppression must not override an idle suspension"
+        );
+        assert!(d.idle_suspended);
         let _ = std::fs::remove_file(&d.config_path);
     }
 
