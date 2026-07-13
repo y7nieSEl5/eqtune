@@ -481,32 +481,40 @@ impl Daemon {
         }
     }
 
-    /// Commit a preset switch. Switching is a selection, not a tuning edit: like the
-    /// global toggles it is written to both configs and persisted immediately, so it
-    /// survives restarts and never counts as an unsaved session by itself — `eqtune off`
-    /// right after a switch must not raise the save prompt. Draft edits to any preset's
-    /// contents stay uncommitted; only `active_preset` changes in the saved config.
-    fn set_active_preset(&mut self, name: String) -> anyhow::Result<()> {
-        if self.config.active_preset == name && self.saved_config.active_preset == name {
+    /// Commit an immediately-persisted setting (a global toggle or the preset switch):
+    /// apply `set` to a copy of the saved config, persist that copy, and only then adopt
+    /// it into both in-memory configs. Persist-first is the invariant — on a failed
+    /// write nothing in memory changes, so `status` and the engine keep matching what is
+    /// actually on disk, and a retried command re-attempts the write instead of hitting
+    /// the no-op skip. Applying `set` to both configs keeps the field equal in `config`
+    /// and `saved_config`, so an immediate-commit change never shows up as an
+    /// unsaved-session diff. A change that alters nothing skips the disk write.
+    fn commit_setting(&mut self, set: impl Fn(&mut Config)) -> anyhow::Result<()> {
+        let mut next = self.saved_config.clone();
+        set(&mut next);
+        if next == self.saved_config {
             return Ok(());
         }
-        self.config.active_preset = name.clone();
-        self.saved_config.active_preset = name;
-        self.saved_config.save_to(&self.config_path)
+        next.save_to(&self.config_path)?;
+        set(&mut self.config);
+        self.saved_config = next;
+        Ok(())
     }
 
-    /// Record the user's explicit on/off in both configs and persist it, so the state is
-    /// restored at the next daemon startup. `enabled` is a global toggle, not session
-    /// state: like the `auto_off_*` toggles it is written to `saved_config` (keeping
-    /// `config.enabled == saved_config.enabled`, so it never shows up as an unsaved
-    /// session diff) and drafts are not committed along with it.
+    /// Commit a preset switch. Switching is a selection, not a tuning edit: like the
+    /// global toggles it is persisted immediately, so it survives restarts and never
+    /// counts as an unsaved session by itself — `eqtune off` right after a switch must
+    /// not raise the save prompt. Draft edits to any preset's contents stay uncommitted;
+    /// only `active_preset` changes in the saved config.
+    fn set_active_preset(&mut self, name: String) -> anyhow::Result<()> {
+        self.commit_setting(|c| c.active_preset = name.clone())
+    }
+
+    /// Record the user's explicit on/off and persist it, so the state is restored at the
+    /// next daemon startup. `enabled` is a global toggle, not session state: drafts are
+    /// not committed along with it.
     fn set_enabled(&mut self, on: bool) -> anyhow::Result<()> {
-        if self.config.enabled == on {
-            return Ok(());
-        }
-        self.config.enabled = on;
-        self.saved_config.enabled = on;
-        self.saved_config.save_to(&self.config_path)
+        self.commit_setting(|c| c.enabled = on)
     }
 
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
@@ -1463,6 +1471,33 @@ mod tests {
         let mut d = daemon_with(Config::default());
         d.apply(Request::Disable).unwrap();
         assert!(!d.config_path.exists());
+    }
+
+    #[test]
+    fn preset_switch_save_failure_leaves_state_untouched_and_a_retry_persists() {
+        let mut d = daemon_with(Config::default());
+        // An unwritable config path: its parent is a regular file, so save_to must fail.
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::SetPreset("mellow".into())).is_err());
+        // On a failed save nothing in memory may change, or `status` would report a
+        // preset the disk (and after the skipped apply, the engine) does not have.
+        assert_eq!(d.config.active_preset, "bright");
+        assert_eq!(d.saved_config.active_preset, "bright");
+
+        // A retry must actually retry the write, not hit the no-op skip.
+        d.config_path = good_path;
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert_eq!(d.config.active_preset, "mellow");
+        assert_eq!(
+            Config::load_from(&d.config_path).unwrap().active_preset,
+            "mellow"
+        );
+        let _ = std::fs::remove_file(&blocker);
+        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
