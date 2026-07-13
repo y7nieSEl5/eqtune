@@ -1262,7 +1262,6 @@ mod tests {
             })
             .unwrap_err();
         assert!(err.to_string().contains("preset already exists"));
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1283,7 +1282,6 @@ mod tests {
         assert_eq!(d.config, d.saved_config);
         assert_eq!(d.config.active_preset, "daily");
         assert_eq!(d.saved_config.presets["daily"].preamp_db, -3.0);
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1335,8 +1333,6 @@ mod tests {
             }
             other => panic!("expected UnsavedSession, got {other:?}"),
         }
-        let _ = std::fs::remove_file(&d.config_path);
-        let _ = std::fs::remove_file(&d.session_path);
     }
 
     #[test]
@@ -1373,8 +1369,6 @@ mod tests {
             d.session_path.exists(),
             "…and stays mirrored for a daemon restart"
         );
-        let _ = std::fs::remove_file(&d.config_path);
-        let _ = std::fs::remove_file(&d.session_path);
     }
 
     #[test]
@@ -1396,7 +1390,6 @@ mod tests {
             d.config.presets["bright"].preamp_db, -3.0,
             "the working edit must not be dropped"
         );
-        let _ = std::fs::remove_file(&d.session_path);
     }
 
     #[test]
@@ -1621,7 +1614,6 @@ mod tests {
             !on_disk.enabled,
             "off must be persisted for the next startup"
         );
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1643,7 +1635,6 @@ mod tests {
             "lifting LPM suppression must not override an idle suspension"
         );
         assert!(d.idle_suspended);
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1674,7 +1665,6 @@ mod tests {
         assert!(!d.config.enabled);
         assert!(!Config::load_from(&d.config_path).unwrap().enabled);
         let _ = std::fs::remove_file(&blocker);
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1710,7 +1700,6 @@ mod tests {
             "mellow"
         );
         let _ = std::fs::remove_file(&blocker);
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1730,7 +1719,6 @@ mod tests {
         assert!(!d.session_path.exists());
         let on_disk = Config::load_from(&d.config_path).unwrap();
         assert_eq!(on_disk.active_preset, "mellow");
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1749,7 +1737,6 @@ mod tests {
             !d.session_path.exists(),
             "a committed session must remove the draft mirror"
         );
-        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]
@@ -1782,7 +1769,6 @@ mod tests {
         assert!(err.to_string().contains("session draft"));
         // The in-memory discard itself still applied (a retry is idempotent).
         assert_eq!(d.config, d.saved_config);
-        let _ = std::fs::remove_dir_all(&d.session_path);
     }
 
     #[test]
@@ -1857,8 +1843,37 @@ mod tests {
         );
     }
 
-    fn daemon_with(config: Config) -> Daemon {
-        Daemon {
+    /// A `Daemon` plus RAII cleanup of its on-disk footprint (the config and
+    /// session-draft files), so no test can leak temp files by asserting early or by
+    /// exercising a path that leaves the draft behind on purpose.
+    struct TestDaemon(Daemon);
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            for path in [&self.0.config_path, &self.0.session_path] {
+                if std::fs::remove_file(path).is_err() {
+                    // Some tests plant a directory there to force removal failures.
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestDaemon {
+        type Target = Daemon;
+        fn deref(&self) -> &Daemon {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for TestDaemon {
+        fn deref_mut(&mut self) -> &mut Daemon {
+            &mut self.0
+        }
+    }
+
+    fn daemon_with(config: Config) -> TestDaemon {
+        TestDaemon(Daemon {
             saved_config: config.clone(),
             config,
             config_path: tmp_path("daemon-config.toml"),
@@ -1868,7 +1883,7 @@ mod tests {
             engine_target_on: false,
             low_power: false,
             idle_suspended: false,
-        }
+        })
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
