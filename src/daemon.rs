@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -177,10 +178,16 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
-                self.set_enabled(false)?;
+                // Stop the engine before anything fallible: `off` must never leave audio
+                // processing because a disk write failed. The stop path of `reconcile`
+                // is pure assignments and cannot fail.
                 self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
+                self.set_enabled(false).context(
+                    "the EQ was stopped for this run, but the off state could not be \
+                     saved — a daemon restart would turn it back on; retry `eqtune off`",
+                )?;
                 if self.has_unsaved_session() {
                     Ok(Response::UnsavedSession(self.tuning()))
                 } else {
@@ -1457,6 +1464,37 @@ mod tests {
             !on_disk.enabled,
             "off must be persisted for the next startup"
         );
+        let _ = std::fs::remove_file(&d.config_path);
+    }
+
+    #[test]
+    fn disable_with_a_failing_save_still_stops_the_engine_and_a_retry_persists() {
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.engine_target_on = true;
+        let blocker = tmp_path("off-not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::Disable).is_err());
+        // The engine must be stopped regardless of the persist failure…
+        assert!(
+            !d.engine_target_on,
+            "off must stop the engine even if the config write fails"
+        );
+        // …while the recorded intent stays truthful to disk (still on), so a retry
+        // re-attempts the write instead of hitting the no-op skip.
+        assert!(d.config.enabled);
+        assert!(d.saved_config.enabled);
+
+        d.config_path = good_path;
+        d.apply(Request::Disable).unwrap();
+        assert!(!d.config.enabled);
+        assert!(!Config::load_from(&d.config_path).unwrap().enabled);
+        let _ = std::fs::remove_file(&blocker);
         let _ = std::fs::remove_file(&d.config_path);
     }
 
