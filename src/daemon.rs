@@ -274,9 +274,7 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetAutoOffLowPower(on) => {
-                self.config.auto_off_low_power = on;
-                self.saved_config.auto_off_low_power = on;
-                self.saved_config.save_to(&self.config_path)?;
+                self.commit_setting(|c| c.auto_off_low_power = on)?;
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
                 } else if !on {
@@ -286,9 +284,7 @@ impl Daemon {
                 Ok(Response::Ok)
             }
             Request::SetAutoOffIdle(on) => {
-                self.config.auto_off_idle = on;
-                self.saved_config.auto_off_idle = on;
-                self.saved_config.save_to(&self.config_path)?;
+                self.commit_setting(|c| c.auto_off_idle = on)?;
                 if !on && self.idle_suspended {
                     self.idle_suspended = false;
                     if self.config.enabled && !(self.config.auto_off_low_power && self.low_power) {
