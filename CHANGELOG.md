@@ -19,6 +19,14 @@ This project follows [Semantic Versioning](https://semver.org/).
   the draft; global toggles always come from the saved config, and an unusable draft is
   moved aside as `session.toml.corrupt`.
 
+### Changed
+
+- `eqtune preset <name>` now persists the switch immediately, like the global toggles.
+  Switching presets no longer counts as "unsaved tuning changes", so `eqtune off` right
+  after a switch no longer raises the save/overwrite/discard prompt (it still does for
+  actual band/preamp edits), and preset-management commands are no longer blocked by a
+  mere switch.
+
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.

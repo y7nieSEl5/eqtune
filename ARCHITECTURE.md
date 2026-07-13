@@ -125,12 +125,14 @@ accept/poll loop.
 
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
-to the audio thread via `EqHandle::store` — without restarting playback. The daemon keeps
-a separate snapshot of the last saved config; on `eqtune off`, any difference becomes an
-interactive save/overwrite/discard prompt. While a difference exists it is also mirrored
-to a session-draft file, so an unresolved session survives a daemon restart (§8). Explicit
-library-management commands (`preset-save`, import, rename, delete, reset, …) persist
-immediately.
+to the audio thread via `EqHandle::store` — without restarting playback. Editing commands
+(`band`, `band-rm`, `preamp`) are session drafts: the daemon keeps a separate snapshot of
+the last saved config, and on `eqtune off` any content difference becomes an interactive
+save/overwrite/discard prompt. While a difference exists it is also mirrored to a
+session-draft file, so an unresolved session survives a daemon restart (§8). A preset
+*switch* is a selection, not an edit: it commits to the saved config immediately (like the
+global toggles) and never raises the prompt by itself. Explicit library-management
+commands (`preset-save`, import, rename, delete, reset, …) also persist immediately.
 
 ---
 
@@ -297,19 +299,20 @@ for "media is streaming" rather than a per-app media-session API.
 
 The daemon deliberately separates "what is playing now" from "what is saved":
 
-- `config` is the working config. `preset`, `band`, `band-rm`, and `preamp` mutate this
-  copy and immediately push new `EqSettings` to the audio thread, but do not write the
-  saved config.
+- `config` is the working config. `band`, `band-rm`, and `preamp` mutate this copy and
+  immediately push new `EqSettings` to the audio thread, but do not write the saved
+  config. `preset` (a switch of `active_preset`) commits to the saved config immediately,
+  so switching alone never counts as an unsaved session.
 - `saved_config` mirrors the last config written to disk. It is the source for discard,
   save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
 - While `config != saved_config`, the working config is mirrored to a sibling
   `session.toml` (same atomic-write path as the config), and the mirror is removed once
   the session resolves. At startup the daemon restores a leftover mirror as an unsaved
   draft — so a reboot, crash, or reinstall does not silently lose live edits, and the
-  `off` prompt still decides their fate. Only the tuning (`active_preset` + `presets`) is
-  trusted from the mirror; global toggles always come from the saved config, since toggle
-  changes commit immediately and a stale draft must not revert them. An unreadable or
-  unrunnable mirror is moved aside as `session.toml.corrupt` and ignored.
+  `off` prompt still decides their fate. Only the preset contents are trusted from the
+  mirror; the active preset and global toggles always come from the saved config, since
+  switches and toggle changes commit immediately and a stale draft must not revert them.
+  An unreadable or unrunnable mirror is moved aside as `session.toml.corrupt` and ignored.
 - `eqtune off` stops the audio engine first. If `config != saved_config`, the daemon
   returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a

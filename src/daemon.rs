@@ -195,7 +195,7 @@ impl Daemon {
                 if !self.config.presets.contains_key(&name) {
                     return Ok(Response::Error(format!("no such preset: {name}")));
                 }
-                self.config.active_preset = name;
+                self.set_active_preset(name)?;
                 self.apply_current_settings();
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -479,6 +479,20 @@ impl Daemon {
                 eprintln!("engine idle-resume failed: {e}");
             }
         }
+    }
+
+    /// Commit a preset switch. Switching is a selection, not a tuning edit: like the
+    /// global toggles it is written to both configs and persisted immediately, so it
+    /// survives restarts and never counts as an unsaved session by itself — `eqtune off`
+    /// right after a switch must not raise the save prompt. Draft edits to any preset's
+    /// contents stay uncommitted; only `active_preset` changes in the saved config.
+    fn set_active_preset(&mut self, name: String) -> anyhow::Result<()> {
+        if self.config.active_preset == name && self.saved_config.active_preset == name {
+            return Ok(());
+        }
+        self.config.active_preset = name.clone();
+        self.saved_config.active_preset = name;
+        self.saved_config.save_to(&self.config_path)
     }
 
     /// Record the user's explicit on/off in both configs and persist it, so the state is
@@ -1417,6 +1431,26 @@ mod tests {
         let mut d = daemon_with(Config::default());
         d.apply(Request::Disable).unwrap();
         assert!(!d.config_path.exists());
+    }
+
+    #[test]
+    fn preset_switch_commits_immediately_and_is_not_an_unsaved_session() {
+        let mut d = daemon_with(Config::default());
+
+        // Re-selecting the already-active preset must not churn the disk.
+        d.apply(Request::SetPreset("bright".into())).unwrap();
+        assert!(!d.config_path.exists());
+
+        // A real switch commits: no unsaved session, no draft mirror, persisted on disk
+        // — `eqtune off` right after `eqtune p mellow` must not raise the save prompt,
+        // and a daemon restart must come back on mellow.
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert_eq!(d.saved_config.active_preset, "mellow");
+        assert!(!d.has_unsaved_session());
+        assert!(!d.session_path.exists());
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert_eq!(on_disk.active_preset, "mellow");
+        let _ = std::fs::remove_file(&d.config_path);
     }
 
     #[test]

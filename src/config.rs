@@ -250,11 +250,11 @@ impl Config {
     /// reinstall). Returns the working config to continue from, or `None` when no usable
     /// draft exists.
     ///
-    /// Only the tuning (`active_preset` + `presets`) is taken from the draft; every
-    /// global toggle (`enabled`, `limiter`, `auto_off_*`, …) comes from `saved`. Toggle
-    /// changes are committed to the saved config immediately by their handlers, so a
-    /// stale draft must not revert them — or manufacture a phantom "unsaved changes"
-    /// diff out of a toggle alone.
+    /// Only the preset contents are taken from the draft; `active_preset` and every
+    /// global toggle (`enabled`, `limiter`, `auto_off_*`, …) come from `saved`. Preset
+    /// switches and toggle changes are committed to the saved config immediately by
+    /// their handlers, so a stale draft must not revert them — or manufacture a phantom
+    /// "unsaved changes" diff out of a switch or toggle alone.
     ///
     /// An unreadable or engine-unrunnable draft is moved aside like a bad config
     /// (`.corrupt` backup) and ignored. Unlike [`Config::load_from`], a failed move-aside
@@ -275,7 +275,6 @@ impl Config {
         let reason = match toml::from_str::<Config>(&contents) {
             Ok(draft) => {
                 let config = Config {
-                    active_preset: draft.active_preset,
                     presets: draft.presets,
                     ..saved.clone()
                 };
@@ -588,14 +587,15 @@ bands = []
     }
 
     #[test]
-    fn load_session_takes_tuning_from_draft_and_toggles_from_saved() {
+    fn load_session_takes_preset_contents_from_draft_and_the_rest_from_saved() {
         let dir = unique_dir("session-merge");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("session.toml");
 
-        // The draft carries a preset switch and an edit, but also stale toggle values.
+        // The draft carries an edit, but also a stale active preset and toggle values
+        // (switches and toggles commit immediately, so the saved config is their truth).
         let mut draft = Config {
-            active_preset: "mellow".into(),
+            active_preset: "pro".into(),
             enabled: false,
             auto_off_idle: false,
             ..Config::default()
@@ -604,15 +604,19 @@ bands = []
         std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
 
         let saved = Config {
+            active_preset: "mellow".into(),
             enabled: true,
             ..Config::default()
         };
         let restored = Config::load_session(&path, &saved).unwrap();
 
-        // Tuning comes from the draft…
-        assert_eq!(restored.active_preset, "mellow");
+        // Preset contents come from the draft…
         assert_eq!(restored.presets["mellow"].preamp_db, -3.0);
-        // …but every global toggle comes from the saved config.
+        // …and the active preset and every global toggle come from the saved config.
+        assert_eq!(
+            restored.active_preset, "mellow",
+            "stale draft must not revert the committed preset switch"
+        );
         assert!(restored.enabled, "stale draft must not revert `enabled`");
         assert!(
             restored.auto_off_idle,

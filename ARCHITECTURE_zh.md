@@ -130,8 +130,8 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 - **Config** 全部是存放在`~/Library/Application Support/eqtune/config.toml`的TOML。
   我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
   加载config时会先验证每个preset是否能被实时engine安全运行：数值必须有限且在范围内，preset最多64个band。无法解析或无法运行的config会被移动到`config.toml.corrupt`或带编号的同名备份，然后用内置默认值继续启动，避免launchd KeepAlive反复重启同一个坏配置。保存config时会先写同目录临时文件、fsync、再原子rename并fsync目录，以降低崩溃或断电时截断正式config的风险。
-  daemon拥有实时调教和上一个被保存的调教。只改变当前正在运行的config，只有实时调教会被改变。`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。
-  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的原子写入方式），一致后镜像会被删除。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只信任调教部分（`active_preset`和presets）；全局开关一律以已保存的config为准。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
+  daemon拥有实时调教和上一个被保存的调教。band/preamp编辑只改变当前正在运行的config，`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。切换preset（`eqtune preset`）则是"选择"而非"编辑"：它像全局开关一样立即写入已保存的config，单独切换不会触发`off`时的保存询问。
+  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的原子写入方式），一致后镜像会被删除。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只信任各preset的内容；当前active preset和全局开关一律以已保存的config为准（它们都是立即提交的）。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
   这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
 
 - **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置；如果daemon已经加载，则用`launchctl kickstart -k`原地重启新binary，避免`bootout`之后立刻`bootstrap`时撞上KeepAlive job尚未完全退出的race。
