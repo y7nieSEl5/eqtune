@@ -229,7 +229,11 @@ be on and isn't, drop it if it should be off and is. Every event routes through 
 - Daemon startup restores the persisted `config.enabled` (respecting the Low-Power-Mode
   policy), then reconciles once before serving requests. A start failure (capture
   permission not yet granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
-- `eqtune on` / `off` persist `config.enabled`, set `engine_target_on`, then reconcile.
+- `eqtune on` starts the engine first and persists `config.enabled` only after a
+  successful start, so a failed start (permission not yet granted) never records an "on"
+  that a later restart would silently act on. `eqtune off` is the mirror image: it stops
+  the engine first — unconditionally — and then persists, so a failed config write can
+  cost persistence (reported as an error, retryable) but never leaves audio processing.
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
   engine off (a large power saving) while remembering `config.enabled`; leaving LPM
   restores it. An explicit `eqtune on` overrides and runs even under LPM.
@@ -306,21 +310,36 @@ The daemon deliberately separates "what is playing now" from "what is saved":
 - `saved_config` mirrors the last config written to disk. It is the source for discard,
   save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
 - While `config != saved_config`, the working config is mirrored to a sibling
-  `session.toml` (same atomic-write path as the config), and the mirror is removed once
-  the session resolves. At startup the daemon restores a leftover mirror as an unsaved
-  draft — so a reboot, crash, or reinstall does not silently lose live edits, and the
-  `off` prompt still decides their fate. Only the preset contents are trusted from the
-  mirror; the active preset and global toggles always come from the saved config, since
+  `session.toml` (atomic temp-file + rename, but without the config's fsyncs: the mirror
+  is best-effort and rewritten on every live edit, so durability-grade flushes in the
+  single-threaded loop would buy nothing). The mirror is removed once the session
+  resolves; if that removal fails, the resolving command reports it as an error, because
+  a leftover draft would restore the just-resolved session at the next startup. At
+  startup the daemon restores a leftover mirror as an unsaved draft — so a reboot,
+  crash, or reinstall does not silently lose live edits, and the `off` prompt still
+  decides their fate. Only preset *contents* are trusted from the mirror, preset by
+  preset, for names the saved config knows — a legitimate draft only ever modifies
+  existing presets, so a stale one can neither delete a just-saved preset nor smuggle
+  one in. The active preset and global toggles always come from the saved config, since
   switches and toggle changes commit immediately and a stale draft must not revert them.
   An unreadable or unrunnable mirror is moved aside as `session.toml.corrupt` and ignored.
 - `eqtune off` stops the audio engine first. If `config != saved_config`, the daemon
-  returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
+  returns `UnsavedSession` carrying the active tuning plus the names of every preset
+  whose working contents differ from the saved config. Edits stay attached to the preset
+  they were made on across preset switches, so those names can include presets other
+  than the active one; the CLI names them instead of implying the active curve is all
+  there is, and offers save-by-name only when the active preset itself has edits.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a
   clone of `saved_config`. If the name is unused, it creates a user preset. If the name is
   one of the shipped names (`bright`, `mellow`, `pro`) or the active preset's own name, it
   overwrites that preset — saving back into the preset being edited is the overwrite
   action, not a collision. Names of *other* custom presets are rejected to prevent
-  accidental loss.
+  accidental loss. The save consumes the active preset's edits (and, on an explicit
+  overwrite, supersedes pending edits of the overwritten preset); unsaved edits on any
+  other preset are carried into the new working config and stay an open session for the
+  next `off` prompt, never silently reverted. `preset-clone`, like the other
+  preset-management commands, is rejected while a session is open — it rebuilds the
+  working config from the saved one, which would drop those edits.
 - Overwrite (`SaveSessionOverwrite`) writes the entire working config as-is, preserving
   the active preset name. This is the direct path for "I tuned bright; make my device's
   bright sound like this now."

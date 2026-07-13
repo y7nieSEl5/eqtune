@@ -70,12 +70,13 @@ enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
 enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
-                ResetWouldOverwrite { names }, UnsavedSession(Tuning), Error(String) }
+                ResetWouldOverwrite { names },
+                UnsavedSession { tuning, dirty_presets }, Error(String) }
 ```
 
 一个client（比如`eqtune band 2000 -6`这行命令）会把一个`Request`改写成JSON，并把一行写入`~/Library/Application Support/eqtune/eqtune.sock`，再读到一个返回的`Response`。
 daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令，改变状态，然后回复。
-`Enable`下，会回复`Tuning`，让CLI打印当前调教曲线；`Disable`下，如果存在未保存的实时改动，会返回`UnsavedSession`并由CLI继续询问保存/覆盖/丢弃；若没有未保存改动，才返回`Ok`。
+`Enable`下，会回复`Tuning`，让CLI打印当前调教曲线；`Disable`下，如果存在未保存的实时改动，会返回`UnsavedSession`并由CLI继续询问保存/覆盖/丢弃；若没有未保存改动，才返回`Ok`。`UnsavedSession`除了当前调教还带有所有实际存在未保存编辑的preset名单——编辑在切换preset后仍然留在原preset上，所以名单可能包含非当前preset；CLI会把它们列出来，而不是只显示当前曲线。
 另外，`export`命令会导出单preset TOML并返回`Ok`；而保存/克隆/重命名/import等命令会根据语义返回`Tuning`或预设列表，而不都是`Ok`。
 
 因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。
@@ -117,7 +118,7 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 于是，我需要在合适的时候让daemon自己停止运行engine。
 
 - `engine_target_on`：engine现在该在运行
-- `config.enabled`：用户明确指令的on/off。它会随config持久化，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。
+- `config.enabled`：用户明确指令的on/off。它会随config持久化，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。`eqtune on`只有在engine真正启动成功后才写入"on"（启动失败绝不会在下次重启时被悄悄恢复成开启）；`eqtune off`则相反：先无条件停止engine，再持久化——写盘失败会报错并可重试，但绝不会让音频继续被处理。
 - `low_power`：MacBook在低电量模式下吗？都低电量模式了，就别调衡了吧。
 - `idle_suspended`: 没有捕获到任何音频呢？没放音乐，engine运行着干嘛呢？
 
@@ -130,8 +131,8 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 - **Config** 全部是存放在`~/Library/Application Support/eqtune/config.toml`的TOML。
   我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
   加载config时会先验证每个preset是否能被实时engine安全运行：数值必须有限且在范围内，preset最多64个band。无法解析或无法运行的config会被移动到`config.toml.corrupt`或带编号的同名备份，然后用内置默认值继续启动，避免launchd KeepAlive反复重启同一个坏配置。保存config时会先写同目录临时文件、fsync、再原子rename并fsync目录，以降低崩溃或断电时截断正式config的风险。
-  daemon拥有实时调教和上一个被保存的调教。band/preamp编辑只改变当前正在运行的config，`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。切换preset（`eqtune preset`）则是"选择"而非"编辑"：它像全局开关一样立即写入已保存的config，单独切换不会触发`off`时的保存询问。
-  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的原子写入方式），一致后镜像会被删除。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只信任各preset的内容；当前active preset和全局开关一律以已保存的config为准（它们都是立即提交的）。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
+  daemon拥有实时调教和上一个被保存的调教。band/preamp编辑只改变当前正在运行的config，`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。切换preset（`eqtune preset`）则是"选择"而非"编辑"：它像全局开关一样立即写入已保存的config，单独切换不会触发`off`时的保存询问。按名保存只消耗当前preset的编辑（对已有preset的显式覆盖也会取代该preset的待定编辑）；留在其它preset上的未保存编辑会被带入新的工作config，仍是一个未关闭的session，由下一次`off`继续询问，绝不会被悄悄还原。`preset-clone`与其它preset管理命令一样，在session未解决时会被拒绝——它会用已保存的config重建工作config，否则会丢掉这些编辑。
+  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的临时文件+原子rename，但省略config的fsync：镜像是尽力而为的，每次实时编辑都会重写，在单线程循环里做耐久级flush毫无收益），一致后镜像会被删除；删除失败会作为错误上报，因为残留的镜像会在下次启动时复活刚刚解决掉的session。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只逐preset地信任已保存config里存在的preset的内容——合法的草稿只会修改既有preset，因此过期草稿既不能删掉刚保存的preset也不能夹带新preset；当前active preset和全局开关一律以已保存的config为准（它们都是立即提交的）。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
   这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
 
 - **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置；如果daemon已经加载，则用`launchctl kickstart -k`原地重启新binary，避免`bootout`之后立刻`bootstrap`时撞上KeepAlive job尚未完全退出的race。
