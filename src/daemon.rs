@@ -171,10 +171,24 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
-                self.set_enabled(true)?;
                 self.idle_suspended = false;
                 self.engine_target_on = true;
-                self.reconcile()?; // override: starts even while Low Power Mode is active
+                // Override: starts even while Low Power Mode is active.
+                if let Err(e) = self.reconcile() {
+                    // A failed start is a failed enable: leave no half-on target behind,
+                    // or a later unrelated reconcile would start the EQ as a side effect
+                    // of a command that never succeeded.
+                    self.engine_target_on = false;
+                    return Err(e);
+                }
+                // Persist only after the engine actually started: recording enabled=true
+                // for a start that failed (capture permission not granted yet) would make
+                // a later daemon restart silently start the EQ although no `eqtune on`
+                // ever succeeded.
+                self.set_enabled(true).context(
+                    "the EQ is running, but the on state could not be saved — it would \
+                     not survive a daemon restart; retry `eqtune on`",
+                )?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
