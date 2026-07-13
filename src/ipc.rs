@@ -90,7 +90,16 @@ pub enum Response {
         names: Vec<String>,
     },
     /// Returned by `off` when live tuning edits have not been persisted yet.
-    UnsavedSession(Tuning),
+    UnsavedSession {
+        /// The active tuning — what `[s]ave` acts on.
+        tuning: Tuning,
+        /// Names of every preset whose working contents differ from the saved config —
+        /// the actual substance of the unsaved session. Edits stay attached to the
+        /// preset they were made on across preset switches, so this can name presets
+        /// other than the active one; the prompt must not imply the active curve is
+        /// all there is to save or discard.
+        dirty_presets: Vec<String>,
+    },
     Error(String),
 }
 
@@ -267,12 +276,15 @@ mod tests {
             Response::ResetWouldOverwrite {
                 names: vec!["bright".into()],
             },
-            Response::UnsavedSession(Tuning {
-                enabled: false,
-                preset: "bright".into(),
-                preamp_db: -8.0,
-                bands: vec![],
-            }),
+            Response::UnsavedSession {
+                tuning: Tuning {
+                    enabled: false,
+                    preset: "bright".into(),
+                    preamp_db: -8.0,
+                    bands: vec![],
+                },
+                dirty_presets: vec!["bright".into(), "mellow".into()],
+            },
             Response::Error("nope".into()),
         ];
         for r in resps {

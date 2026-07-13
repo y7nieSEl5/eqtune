@@ -203,7 +203,10 @@ impl Daemon {
                      saved — a daemon restart would turn it back on; retry `eqtune off`",
                 )?;
                 if self.has_unsaved_session() {
-                    Ok(Response::UnsavedSession(self.tuning()))
+                    Ok(Response::UnsavedSession {
+                        tuning: self.tuning(),
+                        dirty_presets: self.dirty_preset_names(),
+                    })
                 } else {
                     Ok(Response::Ok)
                 }
@@ -225,6 +228,10 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ClonePreset { source, dest } => {
+                // Cloning rebuilds the working config from the saved one, which would
+                // silently drop unsaved session edits — block it like the other
+                // preset-management commands until the session is resolved.
+                self.ensure_no_unsaved_session()?;
                 self.clone_preset(&source, &dest)?;
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -589,6 +596,21 @@ impl Daemon {
         self.config != self.saved_config
     }
 
+    /// Names of every preset whose working contents differ from the saved config — the
+    /// actual substance of an unsaved session. Immediate-commit fields (the preset
+    /// switch, global toggles) are equalized in both configs by `commit_setting` and so
+    /// never appear here; edits left on a previously active preset do.
+    fn dirty_preset_names(&self) -> Vec<String> {
+        self.config
+            .presets
+            .iter()
+            .filter(|(name, contents)| {
+                self.saved_config.presets.get(name.as_str()) != Some(contents)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     fn ensure_no_unsaved_session(&self) -> anyhow::Result<()> {
         if self.has_unsaved_session() {
             Err(anyhow::anyhow!(
@@ -599,8 +621,16 @@ impl Daemon {
         }
     }
 
+    /// Save the *active* preset's working tuning under `name` and switch to it. This
+    /// save consumes the active preset's unsaved edit, and — when `name` is an explicit
+    /// overwrite of an existing preset — supersedes any pending edit of that preset.
+    /// Unsaved edits to every other preset (left behind by a preset switch) are neither:
+    /// they are carried over into the new working config and stay an open session,
+    /// re-raised by the next `off` prompt, instead of being silently reverted to their
+    /// saved contents.
     fn save_session_as(&mut self, name: &str) -> anyhow::Result<()> {
         validate_session_save_name(&self.saved_config, &self.config.active_preset, name)?;
+        let active_name = self.config.active_preset.clone();
         let preset = self
             .config
             .active()
@@ -609,8 +639,21 @@ impl Daemon {
         let mut next = self.saved_config.clone();
         next.presets.insert(name.to_string(), preset);
         next.active_preset = name.to_string();
-        self.config = next;
-        self.persist_and_apply()
+        // Persist first (commit_setting's invariant): a failed write changes nothing
+        // in memory.
+        next.save_to(&self.config_path)?;
+        let mut working = next.clone();
+        for (preset_name, contents) in &self.config.presets {
+            if *preset_name != active_name && preset_name != name {
+                working
+                    .presets
+                    .insert(preset_name.clone(), contents.clone());
+            }
+        }
+        self.saved_config = next;
+        self.config = working;
+        self.apply_current_settings();
+        Ok(())
     }
 
     fn clone_preset(&mut self, source: &str, dest: &str) -> anyhow::Result<()> {
@@ -624,8 +667,13 @@ impl Daemon {
         let mut next = self.saved_config.clone();
         next.presets.insert(dest.to_string(), preset);
         next.active_preset = dest.to_string();
+        // Persist first: a failed write must not leave a half-applied clone in the
+        // working config (which would read as a phantom unsaved session).
+        next.save_to(&self.config_path)?;
+        self.saved_config = next.clone();
         self.config = next;
-        self.persist_and_apply()
+        self.apply_current_settings();
+        Ok(())
     }
 
     fn discard_session(&mut self) {
@@ -1257,7 +1305,89 @@ mod tests {
         d.apply(Request::SetPreamp(-3.0)).unwrap();
 
         let resp = d.apply(Request::Disable).unwrap();
-        assert!(matches!(resp, Response::UnsavedSession(_)));
+        assert!(matches!(resp, Response::UnsavedSession { .. }));
+    }
+
+    #[test]
+    fn off_reports_the_presets_that_actually_carry_unsaved_edits() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap(); // edit bright (active)
+        d.apply(Request::SetPreset("mellow".into())).unwrap(); // switch commits
+
+        // The unsaved diff lives on bright, not on the now-active mellow: the prompt
+        // data must name what would actually be overwritten or discarded.
+        match d.apply(Request::Disable).unwrap() {
+            Response::UnsavedSession {
+                tuning,
+                dirty_presets,
+            } => {
+                assert_eq!(tuning.preset, "mellow");
+                assert_eq!(dirty_presets, vec!["bright".to_string()]);
+            }
+            other => panic!("expected UnsavedSession, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&d.config_path);
+        let _ = std::fs::remove_file(&d.session_path);
+    }
+
+    #[test]
+    fn save_session_as_keeps_unsaved_edits_to_other_presets_open() {
+        let mut d = daemon_with(Config::default());
+        // Edit bright (active), then switch away: the switch commits immediately, the
+        // edit stays attached to bright as the open session.
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert!(d.has_unsaved_session());
+
+        // Saving the (pristine) active tuning under a new name consumes only the active
+        // preset's edits — bright's unsaved edit must not be silently reverted.
+        d.apply(Request::SaveSessionAs {
+            name: "party".into(),
+        })
+        .unwrap();
+
+        assert_eq!(d.saved_config.active_preset, "party");
+        assert_eq!(
+            d.saved_config.presets["party"],
+            d.saved_config.presets["mellow"]
+        );
+        assert_eq!(
+            d.config.presets["bright"].preamp_db, -3.0,
+            "bright's unsaved edit must survive the save-as"
+        );
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -8.0);
+        assert!(
+            d.has_unsaved_session(),
+            "the remaining edit stays an open session"
+        );
+        assert!(
+            d.session_path.exists(),
+            "…and stays mirrored for a daemon restart"
+        );
+        let _ = std::fs::remove_file(&d.config_path);
+        let _ = std::fs::remove_file(&d.session_path);
+    }
+
+    #[test]
+    fn preset_clone_is_blocked_by_an_unsaved_session() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        // Cloning rebuilds the working config from the saved one; with a session open
+        // that would silently drop the working edit.
+        let err = d
+            .apply(Request::ClonePreset {
+                source: "mellow".into(),
+                dest: "night".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("unsaved tuning changes"));
+        assert!(!d.config.presets.contains_key("night"));
+        assert_eq!(
+            d.config.presets["bright"].preamp_db, -3.0,
+            "the working edit must not be dropped"
+        );
+        let _ = std::fs::remove_file(&d.session_path);
     }
 
     #[test]

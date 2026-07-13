@@ -319,9 +319,9 @@ fn print_response(cmd: &Command, resp: &Response) {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
-        Response::UnsavedSession(t) => {
+        Response::UnsavedSession { tuning, .. } => {
             println!("unsaved tuning changes");
-            print_curve(t, None);
+            print_curve(tuning, None);
         }
         Response::ResetWouldOverwrite { names } => {
             println!(
@@ -334,11 +334,26 @@ fn print_response(cmd: &Command, resp: &Response) {
 
 fn handle_off_response(resp: &Response) -> anyhow::Result<()> {
     match resp {
-        Response::UnsavedSession(t) => {
+        Response::UnsavedSession {
+            tuning,
+            dirty_presets,
+        } => {
             println!("eqtune off — native Apple audio restored");
-            println!("unsaved tuning changes for preset '{}'", t.preset);
-            print_curve(t, None);
-            resolve_unsaved_session(&t.preset)
+            let active_is_dirty = dirty_presets.contains(&tuning.preset);
+            if dirty_presets.len() == 1 && active_is_dirty {
+                println!("unsaved tuning changes for preset '{}'", tuning.preset);
+                print_curve(tuning, None);
+            } else {
+                // Edits stay attached to the preset they were made on across preset
+                // switches, so the unsaved changes may live on presets other than the
+                // active one — name them instead of implying the active curve is all
+                // there is.
+                println!("unsaved tuning changes to: {}", dirty_presets.join(", "));
+                if active_is_dirty {
+                    print_curve(tuning, None);
+                }
+            }
+            resolve_unsaved_session(&tuning.preset, dirty_presets)
         }
         _ => {
             print_response(&Command::Off, resp);
@@ -347,13 +362,34 @@ fn handle_off_response(resp: &Response) -> anyhow::Result<()> {
     }
 }
 
-fn resolve_unsaved_session(active_preset: &str) -> anyhow::Result<()> {
+fn resolve_unsaved_session(active_preset: &str, dirty_presets: &[String]) -> anyhow::Result<()> {
+    let active_is_dirty = dirty_presets.iter().any(|n| n == active_preset);
+    // Presets other than the active one that carry unsaved edits: [s]ave (which saves
+    // the active tuning) does not consume those, so they stay an open session.
+    let others: Vec<&str> = dirty_presets
+        .iter()
+        .filter(|n| *n != active_preset)
+        .map(String::as_str)
+        .collect();
+    let overwrite_target = if dirty_presets.is_empty() {
+        active_preset.to_string()
+    } else {
+        dirty_presets.join(", ")
+    };
     loop {
-        print!("Preserve this tuning? [s]ave by name / [o]verwrite {active_preset} / [d]iscard: ");
+        if active_is_dirty {
+            print!(
+                "Preserve this tuning? [s]ave by name / [o]verwrite {overwrite_target} / [d]iscard: "
+            );
+        } else {
+            // The active preset has no unsaved edits, so there is no "this tuning" to
+            // save by name — only committing or dropping the named presets' edits.
+            print!("Keep those edits? [o]verwrite {overwrite_target} / [d]iscard: ");
+        }
         io::stdout().flush()?;
         let choice = read_line_trimmed()?;
         let req = match choice.as_str() {
-            "s" | "save" => {
+            "s" | "save" if active_is_dirty => {
                 print!(
                     "Preset name (new name, {active_preset} to overwrite it, \
                      or bright/mellow/pro to overwrite that built-in): "
@@ -369,7 +405,14 @@ fn resolve_unsaved_session(active_preset: &str) -> anyhow::Result<()> {
             "o" | "overwrite" => Request::SaveSessionOverwrite,
             "d" | "discard" | "" => Request::DiscardSession,
             _ => {
-                eprintln!("enter s, o, or d");
+                eprintln!(
+                    "{}",
+                    if active_is_dirty {
+                        "enter s, o, or d"
+                    } else {
+                        "enter o or d"
+                    }
+                );
                 continue;
             }
         };
@@ -381,8 +424,17 @@ fn resolve_unsaved_session(active_preset: &str) -> anyhow::Result<()> {
             }
             Response::Tuning(t) => {
                 match req {
-                    Request::SaveSessionAs { .. } => println!("saved tuning"),
-                    Request::SaveSessionOverwrite => println!("overwrote preset {active_preset}"),
+                    Request::SaveSessionAs { .. } => {
+                        println!("saved tuning");
+                        if !others.is_empty() {
+                            println!(
+                                "unsaved edits to {} are still open — the next \
+                                 `eqtune off` will ask about them",
+                                others.join(", ")
+                            );
+                        }
+                    }
+                    Request::SaveSessionOverwrite => println!("overwrote {overwrite_target}"),
                     Request::DiscardSession => println!("discarded tuning changes"),
                     _ => {}
                 }
