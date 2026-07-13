@@ -220,7 +220,7 @@ impl Daemon {
                     return Ok(Response::Error(format!("no such preset: {name}")));
                 }
                 self.set_active_preset(name)?;
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SavePreset { name } => {
@@ -284,7 +284,7 @@ impl Daemon {
                     });
                     preset.bands.sort_by(|a, b| a.freq.total_cmp(&b.freq));
                 }
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::RemoveBand { freq } => {
@@ -292,13 +292,13 @@ impl Daemon {
                 self.active_preset_mut()?
                     .bands
                     .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetPreamp(db) => {
                 validate_preamp(db)?;
                 self.active_preset_mut()?.preamp_db = db;
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetAutoOffLowPower(on) => {
@@ -335,7 +335,7 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::DiscardSession => {
-                self.discard_session();
+                self.discard_session()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ResetPreset { name } => {
@@ -548,16 +548,16 @@ impl Daemon {
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save_to(&self.config_path)?;
         self.saved_config = self.config.clone();
-        self.apply_current_settings();
-        Ok(())
+        self.apply_current_settings()
     }
 
     /// Push the working config to the running engine (if any) and mirror the session
     /// draft to disk. Every mutation of the working config funnels through here, so the
     /// on-disk draft always matches `has_unsaved_session`: written while a draft exists,
     /// removed once the session resolves (save, overwrite, discard, or any persist).
-    fn apply_current_settings(&mut self) {
-        self.sync_session_file();
+    /// The engine push cannot fail; the returned error is `sync_session_file`'s.
+    fn apply_current_settings(&mut self) -> anyhow::Result<()> {
+        let synced = self.sync_session_file();
         if self.engine.is_some() {
             let fs = self
                 .engine_target
@@ -568,13 +568,19 @@ impl Daemon {
                 handle.store(settings); // lock-free live update
             }
         }
+        synced
     }
 
-    /// Mirror the session-draft state to disk so it survives a daemon restart. Failures
-    /// are logged, not propagated: the edit already applied live, and failing the
-    /// command over a degraded draft mirror would be worse than a draft that only lives
-    /// in memory (the pre-mirror behavior).
-    fn sync_session_file(&self) {
+    /// Mirror the session-draft state to disk so it survives a daemon restart.
+    ///
+    /// A *write* failure is logged, not propagated: the edit already applied live, and
+    /// failing the command over a degraded draft mirror would be worse than a draft
+    /// that only lives in memory (the pre-mirror behavior). A *removal* failure is an
+    /// error: the leftover draft is authoritative restore state, so the next daemon
+    /// startup would resurrect the very session the command just resolved (a discarded
+    /// tuning coming back, or a stale draft shadowing a fresh save) — the resolving
+    /// command must not report success over that.
+    fn sync_session_file(&self) -> anyhow::Result<()> {
         if self.has_unsaved_session() {
             if let Err(e) = self.config.save_to(&self.session_path) {
                 eprintln!(
@@ -584,12 +590,15 @@ impl Daemon {
             }
         } else if let Err(e) = std::fs::remove_file(&self.session_path) {
             if e.kind() != ErrorKind::NotFound {
-                eprintln!(
-                    "could not remove the resolved session draft {}: {e}",
+                return Err(anyhow::anyhow!(
+                    "the tuning was applied, but the resolved session draft at {} could \
+                     not be removed ({e}); a daemon restart would restore it as unsaved \
+                     tuning — remove the file manually",
                     self.session_path.display()
-                );
+                ));
             }
         }
+        Ok(())
     }
 
     fn has_unsaved_session(&self) -> bool {
@@ -652,7 +661,7 @@ impl Daemon {
         }
         self.saved_config = next;
         self.config = working;
-        self.apply_current_settings();
+        self.apply_current_settings()?;
         Ok(())
     }
 
@@ -672,13 +681,13 @@ impl Daemon {
         next.save_to(&self.config_path)?;
         self.saved_config = next.clone();
         self.config = next;
-        self.apply_current_settings();
+        self.apply_current_settings()?;
         Ok(())
     }
 
-    fn discard_session(&mut self) {
+    fn discard_session(&mut self) -> anyhow::Result<()> {
         self.config = self.saved_config.clone();
-        self.apply_current_settings();
+        self.apply_current_settings()
     }
 
     fn confirm_reset_preset(&mut self, name: &str, backups: &[PresetBackup]) -> anyhow::Result<()> {
@@ -1755,6 +1764,25 @@ mod tests {
             !d.session_path.exists(),
             "a discarded session must remove the draft mirror"
         );
+    }
+
+    #[test]
+    fn discard_surfaces_a_draft_that_could_not_be_removed() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.session_path.exists());
+
+        // Make the draft unremovable: remove_file on a directory fails. A leftover
+        // draft would restore the discarded tuning at the next startup, so the discard
+        // must not report success over it.
+        std::fs::remove_file(&d.session_path).unwrap();
+        std::fs::create_dir(&d.session_path).unwrap();
+
+        let err = d.apply(Request::DiscardSession).unwrap_err();
+        assert!(err.to_string().contains("session draft"));
+        // The in-memory discard itself still applied (a retry is idempotent).
+        assert_eq!(d.config, d.saved_config);
+        let _ = std::fs::remove_dir_all(&d.session_path);
     }
 
     #[test]
