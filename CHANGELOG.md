@@ -27,6 +27,16 @@ This project follows [Semantic Versioning](https://semver.org/).
   actual band/preamp edits), and preset-management commands are no longer blocked by a
   mere switch.
 
+### Fixed
+
+- CLI invocations no longer panic with "failed printing to stdout: Broken pipe" when
+  their output pipe closes early (e.g. `eqtune status | head`); they now exit quietly
+  like any Unix filter. The daemon still ignores `SIGPIPE`, so a client disconnecting
+  mid-response cannot kill it.
+- The `eqtune off` save prompt's save-by-name path now accepts the active preset's own
+  name as an overwrite, instead of dead-ending with "preset already exists" for custom
+  presets; the name prompt says so. Names of other custom presets are still rejected.
+
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.

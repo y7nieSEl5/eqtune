@@ -89,6 +89,12 @@ enum Toggle {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if !matches!(cli.command, Command::Daemon) {
+        // CLI invocations behave like normal Unix filters: die quietly when the output
+        // pipe closes instead of panicking. The daemon keeps SIGPIPE ignored (see
+        // `restore_default_sigpipe`).
+        eqtune::sys::restore_default_sigpipe();
+    }
     match cli.command {
         Command::Daemon => Daemon::new()?.run(),
         Command::Install => {
@@ -348,7 +354,10 @@ fn resolve_unsaved_session(active_preset: &str) -> anyhow::Result<()> {
         let choice = read_line_trimmed()?;
         let req = match choice.as_str() {
             "s" | "save" => {
-                print!("Preset name (new name, or bright/mellow/pro to overwrite that built-in): ");
+                print!(
+                    "Preset name (new name, {active_preset} to overwrite it, \
+                     or bright/mellow/pro to overwrite that built-in): "
+                );
                 io::stdout().flush()?;
                 let name = read_line_trimmed()?;
                 if name.is_empty() {
