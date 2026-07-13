@@ -390,9 +390,20 @@ fn resolve_unsaved_session(active_preset: &str, dirty_presets: &[String]) -> any
         let choice = read_line_trimmed()?;
         let req = match choice.as_str() {
             "s" | "save" if active_is_dirty => {
+                // When the active preset is itself a built-in, "bright/mellow/pro"
+                // already covers it — offering the same name twice with two different
+                // descriptions would suggest two distinct overwrite targets.
+                let own_name = if eqtune::config::Config::default()
+                    .presets
+                    .contains_key(active_preset)
+                {
+                    String::new()
+                } else {
+                    format!("{active_preset} to overwrite it, ")
+                };
                 print!(
-                    "Preset name (new name, {active_preset} to overwrite it, \
-                     or bright/mellow/pro to overwrite that built-in): "
+                    "Preset name (new name, {own_name}or bright/mellow/pro to overwrite \
+                     that built-in): "
                 );
                 io::stdout().flush()?;
                 let name = read_line_trimmed()?;
