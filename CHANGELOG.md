@@ -6,6 +6,19 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The on/off state is now persisted (`enabled` in `config.toml`) and restored at daemon
+  startup, so an enabled EQ survives a reboot or daemon restart instead of requiring
+  `eqtune on` after every login. Restoring respects the Low Power Mode auto-off policy,
+  and a failed engine start at startup is logged rather than crash-looping the daemon.
+- Unsaved session tuning (preset switch, band, and preamp edits) is mirrored to a
+  `session.toml` draft file and restored — still as an unsaved draft — after a daemon
+  restart, so a reboot, crash, or reinstall no longer silently discards live edits. The
+  `eqtune off` save/overwrite/discard prompt is unchanged. Only tuning is trusted from
+  the draft; global toggles always come from the saved config, and an unusable draft is
+  moved aside as `session.toml.corrupt`.
+
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.

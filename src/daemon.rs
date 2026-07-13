@@ -53,15 +53,19 @@ pub struct Daemon {
     /// preset without overwriting the preset being edited.
     saved_config: Config,
     config_path: PathBuf,
+    /// Where the working config is mirrored while it differs from `saved_config`, so an
+    /// unsaved session survives a daemon restart. Removed once the session resolves.
+    session_path: PathBuf,
     engine: Option<(TapSession, EqHandle)>,
     /// (output device id, sample rate Hz) the running engine was built for.
     engine_target: Option<(u32, u32)>,
     /// The effective target: the audio engine should be running iff this is true.
     /// `reconcile` starts/stops the engine to match it.
+    ///
+    /// The user's last explicit on/off lives in `config.enabled` (persisted, restored at
+    /// startup); this flag additionally folds in the automatic suspends (Low Power Mode,
+    /// idle), which are runtime-only.
     engine_target_on: bool,
-    /// The user's last explicit on/off, remembered across a Low-Power-Mode auto-off so it
-    /// can be restored when Low Power Mode clears.
-    user_intent: bool,
     /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
     low_power: bool,
     /// Whether the engine is currently off because captured audio was silent long enough
@@ -71,17 +75,25 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
-        let config = Config::load()?;
+        let saved_config = Config::load()?;
+        let session_path = Config::session_path();
+        // Restore the unsaved session a previous daemon run left behind (reboot, crash,
+        // reinstall), if any — it stays a draft, resolved by the usual `off` prompt.
+        let config = Config::load_session(&session_path, &saved_config)
+            .unwrap_or_else(|| saved_config.clone());
+        // Seed from the real state so the first poll doesn't fire a spurious edge.
+        let low_power = sys::low_power_enabled();
         Ok(Self {
-            saved_config: config.clone(),
+            // Restore the persisted on/off, respecting the Low-Power-Mode policy the same
+            // way a live LPM edge would. `run` reconciles once before serving requests.
+            engine_target_on: config.enabled && !(config.auto_off_low_power && low_power),
+            saved_config,
             config,
             config_path: Config::path(),
+            session_path,
             engine: None,
             engine_target: None,
-            engine_target_on: false,
-            user_intent: false,
-            // Seed from the real state so the first poll doesn't fire a spurious edge.
-            low_power: sys::low_power_enabled(),
+            low_power,
             idle_suspended: false,
         })
     }
@@ -96,6 +108,15 @@ impl Daemon {
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
+
+        // Restore the last run's on state. A start failure (capture permission not yet
+        // granted, unsupported macOS) must not kill the daemon — under launchd KeepAlive
+        // that would crash-loop — so log it; `eqtune on` retries on demand.
+        if self.engine_target_on {
+            if let Err(e) = self.reconcile() {
+                eprintln!("could not restore the EQ at startup: {e}");
+            }
+        }
 
         loop {
             match listener.accept() {
@@ -149,14 +170,14 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
-                self.user_intent = true;
+                self.set_enabled(true)?;
                 self.idle_suspended = false;
                 self.engine_target_on = true;
                 self.reconcile()?; // override: starts even while Low Power Mode is active
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
-                self.user_intent = false;
+                self.set_enabled(false)?;
                 self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
@@ -259,7 +280,7 @@ impl Daemon {
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
                 } else if !on {
-                    self.engine_target_on = self.user_intent; // lift any LPM suppression
+                    self.engine_target_on = self.config.enabled; // lift any LPM suppression
                 }
                 self.reconcile()?;
                 Ok(Response::Ok)
@@ -270,7 +291,7 @@ impl Daemon {
                 self.saved_config.save_to(&self.config_path)?;
                 if !on && self.idle_suspended {
                     self.idle_suspended = false;
-                    if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
+                    if self.config.enabled && !(self.config.auto_off_low_power && self.low_power) {
                         self.engine_target_on = true;
                     }
                 }
@@ -403,7 +424,7 @@ impl Daemon {
         self.engine_target_on = if now {
             false
         } else {
-            self.user_intent && !self.idle_suspended
+            self.config.enabled && !self.idle_suspended
         };
         eprintln!(
             "low power mode {} — eqtune {}",
@@ -423,7 +444,7 @@ impl Daemon {
     /// default output device running again. The resume probe only runs while suspended;
     /// while the tap is active, eqtune itself keeps the output device running.
     fn follow_idle_activity(&mut self) {
-        if !self.config.auto_off_idle || !self.user_intent {
+        if !self.config.auto_off_idle || !self.config.enabled {
             return;
         }
 
@@ -460,6 +481,20 @@ impl Daemon {
         }
     }
 
+    /// Record the user's explicit on/off in both configs and persist it, so the state is
+    /// restored at the next daemon startup. `enabled` is a global toggle, not session
+    /// state: like the `auto_off_*` toggles it is written to `saved_config` (keeping
+    /// `config.enabled == saved_config.enabled`, so it never shows up as an unsaved
+    /// session diff) and drafts are not committed along with it.
+    fn set_enabled(&mut self, on: bool) -> anyhow::Result<()> {
+        if self.config.enabled == on {
+            return Ok(());
+        }
+        self.config.enabled = on;
+        self.saved_config.enabled = on;
+        self.saved_config.save_to(&self.config_path)
+    }
+
     fn persist_and_apply(&mut self) -> anyhow::Result<()> {
         self.config.save_to(&self.config_path)?;
         self.saved_config = self.config.clone();
@@ -467,7 +502,12 @@ impl Daemon {
         Ok(())
     }
 
+    /// Push the working config to the running engine (if any) and mirror the session
+    /// draft to disk. Every mutation of the working config funnels through here, so the
+    /// on-disk draft always matches `has_unsaved_session`: written while a draft exists,
+    /// removed once the session resolves (save, overwrite, discard, or any persist).
     fn apply_current_settings(&mut self) {
+        self.sync_session_file();
         if self.engine.is_some() {
             let fs = self
                 .engine_target
@@ -476,6 +516,28 @@ impl Daemon {
             let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
                 handle.store(settings); // lock-free live update
+            }
+        }
+    }
+
+    /// Mirror the session-draft state to disk so it survives a daemon restart. Failures
+    /// are logged, not propagated: the edit already applied live, and failing the
+    /// command over a degraded draft mirror would be worse than a draft that only lives
+    /// in memory (the pre-mirror behavior).
+    fn sync_session_file(&self) {
+        if self.has_unsaved_session() {
+            if let Err(e) = self.config.save_to(&self.session_path) {
+                eprintln!(
+                    "could not mirror the session draft to {}: {e}",
+                    self.session_path.display()
+                );
+            }
+        } else if let Err(e) = std::fs::remove_file(&self.session_path) {
+            if e.kind() != ErrorKind::NotFound {
+                eprintln!(
+                    "could not remove the resolved session draft {}: {e}",
+                    self.session_path.display()
+                );
             }
         }
     }
@@ -1329,6 +1391,68 @@ mod tests {
     }
 
     #[test]
+    fn disable_persists_enabled_off() {
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+
+        let resp = d.apply(Request::Disable).unwrap();
+        assert!(matches!(resp, Response::Ok));
+
+        assert!(!d.config.enabled);
+        assert!(!d.saved_config.enabled);
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert!(
+            !on_disk.enabled,
+            "off must be persisted for the next startup"
+        );
+        let _ = std::fs::remove_file(&d.config_path);
+    }
+
+    #[test]
+    fn redundant_disable_skips_the_config_write() {
+        // Already off: `eqtune off` must not churn the disk (and on a first run must not
+        // manufacture a config file).
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::Disable).unwrap();
+        assert!(!d.config_path.exists());
+    }
+
+    #[test]
+    fn live_edits_mirror_a_session_draft_and_committing_removes_it() {
+        let mut d = daemon_with(Config::default());
+
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        let draft = Config::load_from(&d.session_path).unwrap();
+        assert_eq!(
+            draft.presets[&draft.active_preset].preamp_db, -3.0,
+            "the unsaved edit must be mirrored to the session file"
+        );
+
+        d.apply(Request::SaveSessionOverwrite).unwrap();
+        assert!(
+            !d.session_path.exists(),
+            "a committed session must remove the draft mirror"
+        );
+        let _ = std::fs::remove_file(&d.config_path);
+    }
+
+    #[test]
+    fn discarding_a_session_removes_the_draft_mirror() {
+        let mut d = daemon_with(Config::default());
+
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.session_path.exists());
+
+        d.apply(Request::DiscardSession).unwrap();
+        assert!(
+            !d.session_path.exists(),
+            "a discarded session must remove the draft mirror"
+        );
+    }
+
+    #[test]
     fn handle_does_not_block_on_a_silent_client() {
         // A client that connects but never sends a full request line must not wedge the
         // single-threaded daemon: the read timeout `run` sets turns it into an error.
@@ -1405,10 +1529,10 @@ mod tests {
             saved_config: config.clone(),
             config,
             config_path: tmp_path("daemon-config.toml"),
+            session_path: tmp_path("daemon-session.toml"),
             engine: None,
             engine_target: None,
             engine_target_on: false,
-            user_intent: false,
             low_power: false,
             idle_suspended: false,
         }
