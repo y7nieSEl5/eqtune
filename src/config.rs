@@ -250,11 +250,16 @@ impl Config {
     /// reinstall). Returns the working config to continue from, or `None` when no usable
     /// draft exists.
     ///
-    /// Only the preset contents are taken from the draft; `active_preset` and every
-    /// global toggle (`enabled`, `limiter`, `auto_off_*`, …) come from `saved`. Preset
-    /// switches and toggle changes are committed to the saved config immediately by
-    /// their handlers, so a stale draft must not revert them — or manufacture a phantom
-    /// "unsaved changes" diff out of a switch or toggle alone.
+    /// Only preset contents are taken from the draft, and only preset by preset, for
+    /// names that exist in `saved`; `active_preset` and every global toggle (`enabled`,
+    /// `limiter`, `auto_off_*`, …) come from `saved`. A legitimate draft only ever
+    /// *modifies* presets of its saved base — session edits touch the active preset's
+    /// contents, never the preset set — so a draft can neither delete a preset the
+    /// saved config has (e.g. one committed by the very save that resolved the session,
+    /// when a crash landed between the config write and the draft's removal) nor smuggle
+    /// one in. Preset switches and toggle changes are committed to the saved config
+    /// immediately by their handlers, so a stale draft must not revert them — or
+    /// manufacture a phantom "unsaved changes" diff out of a switch or toggle alone.
     ///
     /// An unreadable or engine-unrunnable draft is moved aside like a bad config
     /// (`.corrupt` backup) and ignored. Unlike [`Config::load_from`], a failed move-aside
@@ -274,10 +279,12 @@ impl Config {
         };
         let reason = match toml::from_str::<Config>(&contents) {
             Ok(draft) => {
-                let config = Config {
-                    presets: draft.presets,
-                    ..saved.clone()
-                };
+                let mut config = saved.clone();
+                for (name, preset) in draft.presets {
+                    if let Some(slot) = config.presets.get_mut(&name) {
+                        *slot = preset;
+                    }
+                }
                 match config.first_unusable_preset() {
                     Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
                     None => return Some(config),
@@ -622,6 +629,65 @@ bands = []
             restored.auto_off_idle,
             "stale draft must not revert toggles"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_keeps_presets_the_stale_draft_lacks() {
+        // Crash window: `preset-save daily` committed config.toml (which gained "daily")
+        // but the daemon died before the now-resolved draft was removed. The stale
+        // draft's preset map must not shadow the committed one — "daily" survives.
+        let dir = unique_dir("session-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+
+        let mut draft = Config::default(); // no "daily"
+        draft.presets.get_mut("bright").unwrap().preamp_db = -3.0;
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        let mut saved = Config {
+            active_preset: "daily".into(),
+            ..Config::default()
+        };
+        saved.presets.insert(
+            "daily".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: -6.0,
+            },
+        );
+        let restored = Config::load_session(&path, &saved).unwrap();
+
+        assert_eq!(
+            restored.presets["daily"].preamp_db, -6.0,
+            "a preset committed to the saved config must survive a stale draft"
+        );
+        assert_eq!(restored.active_preset, "daily");
+        // Contents of presets both sides know still come from the draft.
+        assert_eq!(restored.presets["bright"].preamp_db, -3.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_ignores_draft_presets_unknown_to_saved() {
+        // A session can only modify existing presets, never add one — a draft key the
+        // saved config does not know is stale garbage and must not be smuggled in.
+        let dir = unique_dir("session-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+
+        let mut draft = Config::default();
+        draft.presets.insert(
+            "ghost".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        let restored = Config::load_session(&path, &Config::default()).unwrap();
+        assert!(!restored.presets.contains_key("ghost"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
