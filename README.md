@@ -61,6 +61,10 @@ eqtune install | uninstall            # manage the launchd daemon
 - Tuning edits apply **live** (no audio restart). On `eqtune off`, eqtune asks whether
   to save the latest tuning as a new preset, overwrite the active preset name, or discard
   the session changes.
+- eqtune **remembers its state across restarts**: after a reboot (or daemon restart) it
+  comes back on if you left it on, with the preset — including tuning edits you haven't
+  saved yet — you were listening to. Unsaved edits stay unsaved; the `eqtune off` prompt
+  still decides whether to keep them.
 - For the no-eqtune native Apple sound, use `eqtune off`.
 - To save battery, eqtune **auto-disables while no media is active** and resumes when
   playback starts again. It also auto-disables while macOS Low Power Mode is on and

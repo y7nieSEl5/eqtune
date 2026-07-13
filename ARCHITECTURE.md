@@ -127,8 +127,10 @@ accept/poll loop.
 daemon's working config and, if the engine is running, push freshly-designed coefficients
 to the audio thread via `EqHandle::store` — without restarting playback. The daemon keeps
 a separate snapshot of the last saved config; on `eqtune off`, any difference becomes an
-interactive save/overwrite/discard prompt. Explicit library-management commands
-(`preset-save`, import, rename, delete, reset, …) persist immediately.
+interactive save/overwrite/discard prompt. While a difference exists it is also mirrored
+to a session-draft file, so an unresolved session survives a daemon restart (§8). Explicit
+library-management commands (`preset-save`, import, rename, delete, reset, …) persist
+immediately.
 
 ---
 
@@ -213,17 +215,22 @@ The daemon never starts/stops the engine ad hoc. Instead it keeps a small amount
 intent and *reconciles*:
 
 - `engine_target_on` — whether the engine *should* be running right now.
-- `user_intent` — your last explicit `on`/`off`, remembered across an automatic suspend.
+- `config.enabled` — your last explicit `on`/`off`, remembered across an automatic
+  suspend. Persisted in the config file and restored at daemon startup, so an enabled EQ
+  survives a reboot or daemon restart.
 - `low_power` — the last-seen macOS Low Power Mode state.
 - `idle_suspended` — whether the engine is off because captured audio stayed silent.
 
 `reconcile()` simply makes reality match `engine_target_on`: start the engine if it should
 be on and isn't, drop it if it should be off and is. Every event routes through this:
 
-- `eqtune on` / `off` set `user_intent` + `engine_target_on`, then reconcile.
+- Daemon startup restores the persisted `config.enabled` (respecting the Low-Power-Mode
+  policy), then reconciles once before serving requests. A start failure (capture
+  permission not yet granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
+- `eqtune on` / `off` persist `config.enabled`, set `engine_target_on`, then reconcile.
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
-  engine off (a large power saving) while remembering `user_intent`; leaving LPM restores
-  it. An explicit `eqtune on` overrides and runs even under LPM.
+  engine off (a large power saving) while remembering `config.enabled`; leaving LPM
+  restores it. An explicit `eqtune on` overrides and runs even under LPM.
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
   engine is running. After sustained silence it drops the engine; while suspended, it
   polls Core Audio's default-output-device activity and resumes when playback starts.
@@ -257,9 +264,9 @@ for "media is streaming" rather than a per-app media-session API.
 ## 8. Persistence & packaging
 
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
-  named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
-  `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
-  needs no file. Loads validate every preset against the realtime engine's limits
+  named presets (each a list of bands + a preamp) plus global toggles (`enabled`,
+  `limiter`, `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a
+  first run needs no file. Loads validate every preset against the realtime engine's limits
   (finite values, practical ranges, and at most 64 bands). A malformed or unrunnable config
   is moved aside as `config.toml.corrupt` or `config.toml.corrupt.N` and eqtune continues
   from shipped defaults, preserving the bad file for manual recovery. Saves write a sibling
@@ -291,9 +298,18 @@ for "media is streaming" rather than a per-app media-session API.
 The daemon deliberately separates "what is playing now" from "what is saved":
 
 - `config` is the working config. `preset`, `band`, `band-rm`, and `preamp` mutate this
-  copy and immediately push new `EqSettings` to the audio thread, but do not write TOML.
+  copy and immediately push new `EqSettings` to the audio thread, but do not write the
+  saved config.
 - `saved_config` mirrors the last config written to disk. It is the source for discard,
   save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
+- While `config != saved_config`, the working config is mirrored to a sibling
+  `session.toml` (same atomic-write path as the config), and the mirror is removed once
+  the session resolves. At startup the daemon restores a leftover mirror as an unsaved
+  draft — so a reboot, crash, or reinstall does not silently lose live edits, and the
+  `off` prompt still decides their fate. Only the tuning (`active_preset` + `presets`) is
+  trusted from the mirror; global toggles always come from the saved config, since toggle
+  changes commit immediately and a stale draft must not revert them. An unreadable or
+  unrunnable mirror is moved aside as `session.toml.corrupt` and ignored.
 - `eqtune off` stops the audio engine first. If `config != saved_config`, the daemon
   returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a

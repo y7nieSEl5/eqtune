@@ -117,11 +117,11 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 于是，我需要在合适的时候让daemon自己停止运行engine。
 
 - `engine_target_on`：engine现在该在运行
-- `user_intent`：用户明确指令的on/off
+- `config.enabled`：用户明确指令的on/off。它会随config持久化，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。
 - `low_power`：MacBook在低电量模式下吗？都低电量模式了，就别调衡了吧。
 - `idle_suspended`: 没有捕获到任何音频呢？没放音乐，engine运行着干嘛呢？
 
-`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。
+`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。daemon启动时也会按恢复的`config.enabled`（并遵循低电量模式策略）先reconcile一次；如果此时启动engine失败（比如还没授予捕获权限），只记录日志而不退出，避免launchd KeepAlive反复重启。
 
 > 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教generation改变时同步filter的coeffs; (b) 0dB被忽略，因此不消耗biquad; (c) 持续静音时跳过逐sample处理。
 
@@ -131,6 +131,7 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
   我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
   加载config时会先验证每个preset是否能被实时engine安全运行：数值必须有限且在范围内，preset最多64个band。无法解析或无法运行的config会被移动到`config.toml.corrupt`或带编号的同名备份，然后用内置默认值继续启动，避免launchd KeepAlive反复重启同一个坏配置。保存config时会先写同目录临时文件、fsync、再原子rename并fsync目录，以降低崩溃或断电时截断正式config的风险。
   daemon拥有实时调教和上一个被保存的调教。只改变当前正在运行的config，只有实时调教会被改变。`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。
+  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的原子写入方式），一致后镜像会被删除。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只信任调教部分（`active_preset`和presets）；全局开关一律以已保存的config为准。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
   这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
 
 - **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置；如果daemon已经加载，则用`launchctl kickstart -k`原地重启新binary，避免`bootout`之后立刻`bootstrap`时撞上KeepAlive job尚未完全退出的race。
