@@ -211,12 +211,9 @@ impl Config {
         // under launchd KeepAlive a hard error would restart the daemon into the same failure
         // forever and lose every preset. Back the bad file up for manual recovery and continue
         // with defaults.
-        let reason = match toml::from_str::<Config>(&contents) {
-            Ok(config) => match config.first_unusable_preset() {
-                Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
-                None => return Ok(config),
-            },
-            Err(e) => format!("invalid TOML ({e})"),
+        let reason = match Self::parse_usable(&contents) {
+            Ok(config) => return Ok(config),
+            Err(reason) => reason,
         };
         // Move the bad file aside — both to preserve it for manual recovery and to get it
         // out of the way so the next save writes a fresh config. If the move fails we must
@@ -277,7 +274,10 @@ impl Config {
                 return None;
             }
         };
-        let reason = match toml::from_str::<Config>(&contents) {
+        // The merged result needs no re-check: `saved` was validated by its own load and
+        // the adopted contents by this parse (a draft carrying any unusable preset is
+        // quarantined wholesale, adopted or not).
+        let reason = match Self::parse_usable(&contents) {
             Ok(draft) => {
                 let mut config = saved.clone();
                 for (name, preset) in draft.presets {
@@ -285,12 +285,9 @@ impl Config {
                         *slot = preset;
                     }
                 }
-                match config.first_unusable_preset() {
-                    Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
-                    None => return Some(config),
-                }
+                return Some(config);
             }
-            Err(e) => format!("invalid TOML ({e})"),
+            Err(reason) => reason,
         };
         let backup = quarantine_path(path);
         match std::fs::rename(path, &backup) {
@@ -355,6 +352,20 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Parse `contents` and check that every preset is runnable by the real-time
+    /// engine. On failure returns the human-readable reason the quarantine paths log —
+    /// one definition of "usable" and one reason format shared by the config file and
+    /// the session draft, so their validation and diagnostics cannot drift apart.
+    fn parse_usable(contents: &str) -> Result<Config, String> {
+        match toml::from_str::<Config>(contents) {
+            Ok(config) => match config.first_unusable_preset() {
+                Some((name, err)) => Err(format!("preset {name:?} cannot be applied ({err})")),
+                None => Ok(config),
+            },
+            Err(e) => Err(format!("invalid TOML ({e})")),
+        }
     }
 
     /// The name and validation error of the first preset the real-time engine could not
