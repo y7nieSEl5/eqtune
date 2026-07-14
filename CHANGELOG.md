@@ -34,6 +34,11 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- `eqtune install` now stages daemon binary updates as a sibling temp file, ad-hoc signs
+  the staged copy before atomically replacing the installed daemon, and verifies launchd
+  reaches the running state. If an already-loaded service keeps stale launch constraints
+  and `kickstart -k` leaves it spawn-failed, install falls back to bootout + bootstrap
+  instead of reporting success over a dead daemon.
 - CLI invocations no longer panic with "failed printing to stdout: Broken pipe" when
   their output pipe closes early (e.g. `eqtune status | head`); they now exit quietly
   like any Unix filter. The daemon still ignores `SIGPIPE`, so a client disconnecting

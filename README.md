@@ -6,7 +6,7 @@ A lightweight, system-wide audio equalizer for macOS.
 
 Mac speakers and headphone outputs are tuned conservatively out of the box — often mid-heavy and a bit flat, so music can sound closed-in. macOS has **no built-in system-wide EQ**, and the existing tools tend to be heavyweight: they install loopback/kernel drivers and *replace* your default output device, which breaks macOS's normal "switch to the headphones when I plug them in" behaviour.
 
-eqtune taps the system audio mix with Apple's modern **Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no code signing), applies a parametric EQ, and plays the result back to your **current** output device. Because it never hijacks the default device, plugging in EarPods or Bluetooth keeps working normally. It ships a few curated presets and lets you tweak any frequency yourself.
+eqtune taps the system audio mix with Apple's modern **Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no Developer ID certificate), applies a parametric EQ, and plays the result back to your **current** output device. Because it never hijacks the default device, plugging in EarPods or Bluetooth keeps working normally. It ships a few curated presets and lets you tweak any frequency yourself.
 
 ## Requirements
 

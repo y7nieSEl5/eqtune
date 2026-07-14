@@ -291,13 +291,16 @@ for "media is streaming" rather than a per-app media-session API.
   request to the daemon; omitted export paths default to `<preset>.toml` in that directory.
 
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
-  so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
-  binary to a stable location, skips self-copies, and either bootstraps a new agent or
-  restarts an already-loaded one with `launchctl kickstart -k` to avoid the
-  bootout/bootstrap race.
-- **No code signing.** Locally-built binaries aren't quarantined, so Gatekeeper never
-  applies. `build.rs` embeds an `Info.plist` into the binary so macOS shows a proper
-  audio-capture permission prompt without an Apple Developer account.
+  so the daemon starts at login and is restarted if it dies. `eqtune install` stages the
+  binary as a sibling temp file, ad-hoc signs that staged copy locally, atomically renames
+  it into the stable daemon location, and verifies launchd reaches the running state after
+  bootstrapping or restarting the agent. A healthy loaded agent still restarts with
+  `launchctl kickstart -k`; if launchd keeps stale launch constraints and the restarted
+  job fails to run, install falls back to bootout + bootstrap.
+- **No Developer ID signing.** The installer uses local ad-hoc signing for the daemon
+  copy, so no Apple Developer account, certificate, notarization, driver, or kernel
+  extension is needed. `build.rs` embeds an `Info.plist` into the binary so macOS shows a
+  proper audio-capture permission prompt.
 
 ### Session drafts and shipped presets
 

@@ -1,14 +1,17 @@
 //! Build-from-source install: copy the binary to a stable location and manage a
-//! launchd LaunchAgent so the daemon runs at login. No code signing required —
-//! locally built code is not quarantined, so Gatekeeper never applies.
+//! launchd LaunchAgent so the daemon runs at login. The installed daemon copy is
+//! ad-hoc signed locally; no Developer ID certificate or notarization is required.
 
 use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 const LABEL: &str = "app.eqtune.daemon";
+const STARTUP_CHECKS: usize = 20;
+const STARTUP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
@@ -38,12 +41,7 @@ pub fn install() -> anyhow::Result<()> {
     let current = std::env::current_exe()?;
     let dest = installed_bin();
     fs::create_dir_all(support_dir())?;
-    copy_install_binary(&current, &dest)?;
-    {
-        let mut perms = fs::metadata(&dest)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest, perms)?;
-    }
+    install_binary(&current, &dest)?;
 
     let log = support_dir().join("daemon.log");
     let plist = plist_path();
@@ -55,24 +53,12 @@ pub fn install() -> anyhow::Result<()> {
     let domain = format!("gui/{}", uid());
     let service = format!("{domain}/{LABEL}");
     let plist_str = plist.to_string_lossy();
-    // (Re)load the daemon. If it is already loaded, restart it in place with `kickstart -k`
-    // so it re-execs the freshly copied binary. A bootout+bootstrap pair would race the
-    // still-terminating KeepAlive job — bootout returns before the label is gone, so the
-    // immediate bootstrap collides with the still-registered service and launchd rejects it
-    // with "5: Input/output error". Only bootstrap when nothing is loaded yet.
-    let args = reload_args(service_is_loaded(&service), &domain, &service, &plist_str);
-    let status = Command::new("launchctl").args(&args).status()?;
-    if !status.success() {
-        anyhow::bail!("launchctl {} failed ({status})", args[0]);
-    }
-    Ok(())
+    load_or_restart_daemon(&domain, &service, &plist_str)
 }
 
 /// Whether launchd already has `service` (a `gui/<uid>/<label>` target) loaded.
 fn service_is_loaded(service: &str) -> bool {
-    Command::new("launchctl")
-        .arg("print")
-        .arg(service)
+    launchctl(["print", service])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -80,14 +66,85 @@ fn service_is_loaded(service: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// launchctl args that (re)load the daemon: restart an already-loaded job in place (which
-/// avoids the bootout/bootstrap race), otherwise bootstrap a fresh one.
+fn service_is_running(service: &str) -> bool {
+    let output = match launchctl(["print", service]).output() {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    service_state_is_running(&stdout)
+}
+
+fn service_state_is_running(output: &str) -> bool {
+    output.lines().any(|line| line.trim() == "state = running")
+}
+
+fn wait_for_service_running(service: &str) -> anyhow::Result<()> {
+    for _ in 0..STARTUP_CHECKS {
+        if service_is_running(service) {
+            return Ok(());
+        }
+        std::thread::sleep(STARTUP_CHECK_INTERVAL);
+    }
+    anyhow::bail!("launchd loaded {LABEL}, but the daemon did not reach the running state")
+}
+
+fn load_or_restart_daemon(domain: &str, service: &str, plist: &str) -> anyhow::Result<()> {
+    // Prefer kickstart for an already-loaded healthy job: it re-execs the freshly copied
+    // binary without the bootout/bootstrap race. If launchd keeps stale launch constraints
+    // and the restarted job never reaches "running", fall back to a full unload/reload.
+    if service_is_loaded(service) {
+        run_launchctl(&reload_args(true, domain, service, plist))?;
+        if wait_for_service_running(service).is_ok() {
+            return Ok(());
+        }
+        let _ = launchctl(["bootout", service]).status();
+        bootstrap_with_retry(domain, plist)?;
+    } else {
+        run_launchctl(&reload_args(false, domain, service, plist))?;
+    }
+    wait_for_service_running(service)
+}
+
+/// launchctl args that (re)load the daemon: restart an already-loaded job in place,
+/// otherwise bootstrap a fresh one.
 fn reload_args(is_loaded: bool, domain: &str, service: &str, plist: &str) -> Vec<String> {
     if is_loaded {
         vec!["kickstart".into(), "-k".into(), service.into()]
     } else {
         vec!["bootstrap".into(), domain.into(), plist.into()]
     }
+}
+
+fn bootstrap_with_retry(domain: &str, plist: &str) -> anyhow::Result<()> {
+    let args = reload_args(false, domain, "", plist);
+    let mut last_status = None;
+    for _ in 0..STARTUP_CHECKS {
+        let status = Command::new("launchctl").args(&args).status()?;
+        if status.success() {
+            return Ok(());
+        }
+        last_status = Some(status);
+        std::thread::sleep(STARTUP_CHECK_INTERVAL);
+    }
+    let status = last_status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "not attempted".to_string());
+    anyhow::bail!("launchctl bootstrap failed after retrying ({status})")
+}
+
+fn run_launchctl(args: &[String]) -> anyhow::Result<()> {
+    let status = Command::new("launchctl").args(args).status()?;
+    if !status.success() {
+        anyhow::bail!("launchctl {} failed ({status})", args[0]);
+    }
+    Ok(())
+}
+
+fn launchctl<const N: usize>(args: [&str; N]) -> Command {
+    let mut command = Command::new("launchctl");
+    command.args(args);
+    command
 }
 
 /// Stop and remove the LaunchAgent and the installed binary (config is left in place).
@@ -98,17 +155,68 @@ pub fn uninstall() -> anyhow::Result<()> {
         .arg("bootout")
         .arg(format!("{domain}/{LABEL}"))
         .status();
-    let _ = Command::new("launchctl").arg("unload").arg(&plist).status();
+    let _ = launchctl(["unload", plist.to_string_lossy().as_ref()]).status();
     let _ = fs::remove_file(&plist);
     let _ = fs::remove_file(installed_bin());
     Ok(())
 }
 
-fn copy_install_binary(current: &Path, dest: &Path) -> anyhow::Result<()> {
+fn install_binary(current: &Path, dest: &Path) -> anyhow::Result<bool> {
+    replace_install_binary(current, dest, ad_hoc_sign)
+}
+
+fn replace_install_binary(
+    current: &Path,
+    dest: &Path,
+    sign: impl FnOnce(&Path) -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     if same_file(current, dest)? {
-        return Ok(());
+        return Ok(false);
     }
+    let tmp = install_tmp_path(dest);
+    let result = (|| {
+        copy_install_binary(current, &tmp)?;
+        let mut perms = fs::metadata(&tmp)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&tmp, perms)?;
+        sign(&tmp)?;
+        fs::rename(&tmp, dest)?;
+        Ok(true)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+fn copy_install_binary(current: &Path, dest: &Path) -> anyhow::Result<()> {
     fs::copy(current, dest)?;
+    Ok(())
+}
+
+fn install_tmp_path(dest: &Path) -> PathBuf {
+    let mut name = dest
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("eqtune"))
+        .to_os_string();
+    name.push(format!(".installing.{}", std::process::id()));
+    dest.with_file_name(name)
+}
+
+fn ad_hoc_sign(path: &Path) -> anyhow::Result<()> {
+    let output = Command::new("codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(path)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "codesign failed for {} ({}): {}",
+            path.display(),
+            output.status,
+            stderr.trim()
+        );
+    }
     Ok(())
 }
 
@@ -184,44 +292,75 @@ mod tests {
     }
 
     #[test]
-    fn copy_install_binary_skips_same_source_and_dest() -> anyhow::Result<()> {
+    fn service_state_parser_requires_running_state() {
+        assert!(service_state_is_running(
+            "\tstate = running\n\tprogram = /x/eqtune\n"
+        ));
+        assert!(!service_state_is_running(
+            "\tstate = spawn failed\n\tstate = active\n"
+        ));
+    }
+
+    #[test]
+    fn install_binary_skips_same_source_and_dest() -> anyhow::Result<()> {
         let dir = test_dir("self-copy");
         let bin = dir.join("eqtune");
         fs::write(&bin, b"installed binary")?;
 
-        copy_install_binary(&bin, &bin)?;
+        let copied = replace_install_binary(&bin, &bin, |_| unreachable!())?;
 
+        assert!(!copied);
         assert_eq!(fs::read(&bin)?, b"installed binary");
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }
 
     #[test]
-    fn copy_install_binary_skips_symlink_to_dest() -> anyhow::Result<()> {
+    fn install_binary_skips_symlink_to_dest() -> anyhow::Result<()> {
         let dir = test_dir("symlink-copy");
         let bin = dir.join("eqtune");
         let link = dir.join("eqtune-link");
         fs::write(&bin, b"installed binary")?;
         std::os::unix::fs::symlink(&bin, &link)?;
 
-        copy_install_binary(&link, &bin)?;
+        let copied = replace_install_binary(&link, &bin, |_| unreachable!())?;
 
+        assert!(!copied);
         assert_eq!(fs::read(&bin)?, b"installed binary");
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }
 
     #[test]
-    fn copy_install_binary_copies_distinct_source() -> anyhow::Result<()> {
+    fn install_binary_copies_distinct_source() -> anyhow::Result<()> {
         let dir = test_dir("distinct-copy");
         let source = dir.join("target-eqtune");
         let dest = dir.join("installed-eqtune");
         fs::write(&source, b"release binary")?;
         fs::write(&dest, b"old binary")?;
 
-        copy_install_binary(&source, &dest)?;
+        let copied = replace_install_binary(&source, &dest, |_| Ok(()))?;
 
+        assert!(copied);
         assert_eq!(fs::read(&dest)?, b"release binary");
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn install_binary_removes_staged_copy_when_signing_fails() -> anyhow::Result<()> {
+        let dir = test_dir("sign-failure");
+        let source = dir.join("target-eqtune");
+        let dest = dir.join("installed-eqtune");
+        fs::write(&source, b"release binary")?;
+        fs::write(&dest, b"old binary")?;
+
+        let err = replace_install_binary(&source, &dest, |_| anyhow::bail!("sign failed"))
+            .expect_err("signing failure must abort install");
+
+        assert!(err.to_string().contains("sign failed"));
+        assert_eq!(fs::read(&dest)?, b"old binary");
+        assert!(!install_tmp_path(&dest).exists());
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }
