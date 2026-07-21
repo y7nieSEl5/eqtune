@@ -300,8 +300,8 @@ pub struct EqSettings {
     generation: u64,
 }
 
-/// Source of [`EqSettings::generation`]: every constructed snapshot takes the next value,
-/// so any two separately built settings compare unequal — uniqueness holds by
+/// Source of the [`EqSettings`] `generation` stamp: every constructed snapshot takes the
+/// next value, so any two separately built settings compare unequal — uniqueness holds by
 /// construction, with no re-stamping step to forget on any publishing path.
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
