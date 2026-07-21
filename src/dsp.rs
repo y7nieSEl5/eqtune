@@ -190,86 +190,6 @@ pub fn soft_clip(x: f32) -> f32 {
     }
 }
 
-/// Full equalizer: preamp gain, a per-channel biquad cascade, and an optional limiter.
-pub struct Equalizer {
-    fs: f32,
-    preamp: f32, // linear
-    limiter: bool,
-    bands: Vec<Band>,
-    channels: Vec<Vec<Biquad>>, // one cascade per channel
-}
-
-impl Equalizer {
-    pub fn new(fs: f32, channels: usize, bands: Vec<Band>, preamp_db: f32, limiter: bool) -> Self {
-        let mut eq = Self {
-            fs,
-            preamp: db_to_lin(preamp_db),
-            limiter,
-            bands: Vec::new(),
-            channels: vec![Vec::new(); channels],
-        };
-        eq.set_bands(bands);
-        eq
-    }
-
-    /// Rebuild every channel's cascade from `bands`, preserving filter state where the
-    /// cascade length is unchanged (so live edits don't click).
-    pub fn set_bands(&mut self, bands: Vec<Band>) {
-        let coeffs: Vec<Coeffs> = bands.iter().map(|b| Coeffs::design(b, self.fs)).collect();
-        for ch in self.channels.iter_mut() {
-            ch.resize(coeffs.len(), Biquad::new(Coeffs::identity()));
-            for (bq, c) in ch.iter_mut().zip(coeffs.iter()) {
-                bq.set_coeffs(*c);
-            }
-        }
-        self.bands = bands;
-    }
-
-    pub fn set_preamp_db(&mut self, db: f32) {
-        self.preamp = db_to_lin(db);
-    }
-
-    pub fn set_limiter(&mut self, on: bool) {
-        self.limiter = on;
-    }
-
-    /// Re-design all filters for a new sample rate and clear state.
-    pub fn set_sample_rate(&mut self, fs: f32) {
-        self.fs = fs;
-        let bands = std::mem::take(&mut self.bands);
-        self.set_bands(bands);
-        for ch in self.channels.iter_mut() {
-            for bq in ch.iter_mut() {
-                bq.reset();
-            }
-        }
-    }
-
-    pub fn bands(&self) -> &[Band] {
-        &self.bands
-    }
-
-    /// Process an interleaved buffer in place. `channels` is the interleave stride and
-    /// must be `<=` the channel count this equalizer was built with.
-    pub fn process_interleaved(&mut self, buf: &mut [f32], channels: usize) {
-        debug_assert!(channels <= self.channels.len());
-        let frames = buf.len() / channels;
-        for frame in 0..frames {
-            for ch in 0..channels {
-                let idx = frame * channels + ch;
-                let mut s = buf[idx] * self.preamp;
-                for bq in self.channels[ch].iter_mut() {
-                    s = bq.process(s);
-                }
-                if self.limiter {
-                    s = soft_clip(s);
-                }
-                buf[idx] = s;
-            }
-        }
-    }
-}
-
 /// Bands within this many dB of flat are identity filters; they are dropped from the
 /// realtime coefficient set (see [`EqSettings::new`]) since they would cost a biquad per
 /// sample while contributing nothing audible.
@@ -591,34 +511,6 @@ mod tests {
         for x in [1.0, 2.0, 50.0, -50.0] {
             assert!(soft_clip(x).abs() < 1.0);
         }
-    }
-
-    #[test]
-    fn process_is_finite_and_bounded_with_default_curve() {
-        let mut eq = Equalizer::new(48_000.0, 2, default_bands(), DEFAULT_PREAMP_DB, true);
-        let mut buf = vec![0.0f32; 4096 * 2];
-        for (i, s) in buf.iter_mut().enumerate() {
-            *s = (i as f32 * 0.1).sin() * 0.8; // loud-ish interleaved stereo
-        }
-        eq.process_interleaved(&mut buf, 2);
-        assert!(buf.iter().all(|x| x.is_finite()));
-        assert!(buf.iter().all(|x| x.abs() <= 1.0));
-    }
-
-    #[test]
-    fn live_band_edit_preserves_cascade() {
-        let mut eq = Equalizer::new(44_100.0, 2, default_bands(), 0.0, false);
-        assert_eq!(eq.bands().len(), default_bands().len());
-        eq.set_bands(vec![Band {
-            kind: BandKind::Peaking,
-            freq: 3000.0,
-            gain_db: 4.0,
-            q: 2.0,
-        }]);
-        assert_eq!(eq.bands().len(), 1);
-        let mut buf = vec![0.25f32; 256 * 2];
-        eq.process_interleaved(&mut buf, 2); // must not panic on resized cascade
-        assert!(buf.iter().all(|x| x.is_finite()));
     }
 
     #[test]

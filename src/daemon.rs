@@ -925,31 +925,6 @@ fn initial_engine_state(
     (engine_target_on, lazy_start)
 }
 
-#[cfg(test)]
-fn save_active_preset(config: &mut Config, name: &str) -> anyhow::Result<()> {
-    validate_new_preset_name(config, name)?;
-    let preset = config
-        .active()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no active preset to save"))?;
-    config.presets.insert(name.to_string(), preset);
-    config.active_preset = name.to_string();
-    Ok(())
-}
-
-#[cfg(test)]
-fn clone_preset(config: &mut Config, source: &str, dest: &str) -> anyhow::Result<()> {
-    validate_new_preset_name(config, dest)?;
-    let preset = config
-        .presets
-        .get(source)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no such preset: {source}"))?;
-    config.presets.insert(dest.to_string(), preset);
-    config.active_preset = dest.to_string();
-    Ok(())
-}
-
 fn delete_presets(config: &mut Config, names: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         return Err(anyhow::anyhow!("at least one preset name is required"));
@@ -1150,21 +1125,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preset_save_clones_active_and_selects_new_preset() {
-        let mut c = Config::default();
-        let active = c.active().cloned().unwrap();
-        save_active_preset(&mut c, "car").unwrap();
-        assert_eq!(c.active_preset, "car");
-        assert_eq!(c.presets["car"], active);
-    }
+    fn preset_clone_copies_source_contents_and_selects_it() {
+        let mut d = daemon_with(Config::default());
+        let source = d.saved_config.presets["mellow"].clone();
 
-    #[test]
-    fn preset_clone_copies_source_and_selects_dest() {
-        let mut c = Config::default();
-        let source = c.presets["mellow"].clone();
-        clone_preset(&mut c, "mellow", "night").unwrap();
-        assert_eq!(c.active_preset, "night");
-        assert_eq!(c.presets["night"], source);
+        d.apply(Request::ClonePreset {
+            source: "mellow".into(),
+            dest: "night".into(),
+        })
+        .unwrap();
+
+        // The clone copies the source verbatim, selects it, and commits immediately — no
+        // unsaved session, and it is on disk.
+        assert_eq!(d.config.active_preset, "night");
+        assert_eq!(d.config.presets["night"], source);
+        assert!(!d.has_unsaved_session());
+        assert_eq!(
+            Config::load_from(&d.config_path).unwrap().presets["night"],
+            source
+        );
     }
 
     #[test]
