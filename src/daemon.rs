@@ -61,12 +61,16 @@ pub struct Daemon {
     /// (output device id, sample rate Hz) the running engine was built for.
     engine_target: Option<(u32, u32)>,
     /// The effective target: the audio engine should be running iff this is true.
-    /// `reconcile` starts/stops the engine to match it.
-    ///
-    /// The user's last explicit on/off lives in `config.enabled` (persisted, restored at
-    /// startup); this flag additionally folds in the automatic suspends (Low Power Mode,
-    /// idle), which are runtime-only.
+    /// `reconcile` starts/stops the engine to match it. It folds `user_intent` together
+    /// with the automatic suspends (Low Power Mode, idle).
     engine_target_on: bool,
+    /// The user's last explicit on/off *intent*, in memory. Seeded from the persisted
+    /// `config.enabled` at startup and updated the instant `on`/`off` is handled — before
+    /// the persist that records it durably. The automatic-suspend logic (Low Power Mode,
+    /// idle) gates on this, not on `config.enabled`, so that a persist failure (which
+    /// leaves `config.enabled` on its old on-disk value, reported as a retryable error)
+    /// cannot desync the live idle/LPM behavior from what is actually running.
+    user_intent: bool,
     /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
     low_power: bool,
     /// Whether the engine is currently off because captured audio was silent long enough
@@ -84,10 +88,14 @@ impl Daemon {
             .unwrap_or_else(|| saved_config.clone());
         // Seed from the real state so the first poll doesn't fire a spurious edge.
         let low_power = sys::low_power_enabled();
+        // Runtime on/off intent, seeded from the persisted `enabled` and then tracked in
+        // memory so it stays correct even if a later persist fails (see `set_enabled`).
+        let user_intent = config.enabled;
         Ok(Self {
             // Restore the persisted on/off, respecting the Low-Power-Mode policy the same
             // way a live LPM edge would. `run` reconciles once before serving requests.
-            engine_target_on: config.enabled && !(config.auto_off_low_power && low_power),
+            engine_target_on: user_intent && !(config.auto_off_low_power && low_power),
+            user_intent,
             saved_config,
             config,
             config_path: Config::path(),
@@ -171,20 +179,24 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
+                self.user_intent = true;
                 self.idle_suspended = false;
                 self.engine_target_on = true;
                 // Override: starts even while Low Power Mode is active.
                 if let Err(e) = self.reconcile() {
-                    // A failed start is a failed enable: leave no half-on target behind,
-                    // or a later unrelated reconcile would start the EQ as a side effect
-                    // of a command that never succeeded.
+                    // A failed start is a failed enable: leave no half-on target or intent
+                    // behind, or a later unrelated reconcile (an LPM edge) would start the
+                    // EQ as a side effect of a command that never succeeded.
+                    self.user_intent = false;
                     self.engine_target_on = false;
                     return Err(e);
                 }
                 // Persist only after the engine actually started: recording enabled=true
                 // for a start that failed (capture permission not granted yet) would make
                 // a later daemon restart silently start the EQ although no `eqtune on`
-                // ever succeeded.
+                // ever succeeded. The live `user_intent` above already reflects the on
+                // state, so a persist failure here costs only durability, not correct
+                // runtime idle/LPM behavior.
                 self.set_enabled(true).context(
                     "the EQ is running, but the on state could not be saved — it would \
                      not survive a daemon restart; retry `eqtune on`",
@@ -194,7 +206,10 @@ impl Daemon {
             Request::Disable => {
                 // Stop the engine before anything fallible: `off` must never leave audio
                 // processing because a disk write failed. The stop path of `reconcile`
-                // is pure assignments and cannot fail.
+                // is pure assignments and cannot fail. Clearing `user_intent` first keeps
+                // a later LPM edge from restoring an EQ the user just turned off, even if
+                // the persist below fails and `config.enabled` stays on its stale value.
+                self.user_intent = false;
                 self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
@@ -307,7 +322,7 @@ impl Daemon {
                     // toggle's to lift: restarting the engine here with no media playing
                     // would contradict the idle policy (follow_low_power and
                     // SetAutoOffIdle apply the same guard).
-                    self.engine_target_on = self.config.enabled && !self.idle_suspended;
+                    self.engine_target_on = self.user_intent && !self.idle_suspended;
                 }
                 self.reconcile()?;
                 Ok(Response::Ok)
@@ -316,7 +331,7 @@ impl Daemon {
                 self.commit_setting(|c| c.auto_off_idle = on)?;
                 if !on && self.idle_suspended {
                     self.idle_suspended = false;
-                    if self.config.enabled && !(self.config.auto_off_low_power && self.low_power) {
+                    if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
                         self.engine_target_on = true;
                     }
                 }
@@ -450,7 +465,7 @@ impl Daemon {
         self.engine_target_on = if now {
             false
         } else {
-            self.config.enabled && !self.idle_suspended
+            self.user_intent && !self.idle_suspended
         };
         eprintln!(
             "low power mode {} — eqtune {}",
@@ -470,7 +485,7 @@ impl Daemon {
     /// default output device running again. The resume probe only runs while suspended;
     /// while the tap is active, eqtune itself keeps the output device running.
     fn follow_idle_activity(&mut self) {
-        if !self.config.auto_off_idle || !self.config.enabled {
+        if !self.config.auto_off_idle || !self.user_intent {
             return;
         }
 
@@ -536,9 +551,11 @@ impl Daemon {
         self.commit_setting(|c| c.active_preset = name.clone())
     }
 
-    /// Record the user's explicit on/off and persist it, so the state is restored at the
-    /// next daemon startup. `enabled` is a global toggle, not session state: drafts are
-    /// not committed along with it.
+    /// Persist the user's explicit on/off into `config.enabled`, so the state is restored
+    /// at the next daemon startup. This is the *durable* record only; the live runtime
+    /// intent is `self.user_intent`, updated by the `on`/`off` handlers before this call,
+    /// so a failed persist here costs durability but not correct idle/LPM behavior.
+    /// `enabled` is a global toggle, not session state: drafts are not committed with it.
     fn set_enabled(&mut self, on: bool) -> anyhow::Result<()> {
         self.commit_setting(|c| c.enabled = on)
     }
@@ -1681,6 +1698,41 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_off_persist_does_not_let_a_later_reconcile_restart_the_engine() {
+        // `eqtune off` stops the engine, but the persist fails, so `config.enabled` stays
+        // stale-on on disk (retryable). The live `user_intent` is off, and the automatic
+        // -suspend logic gates on that intent — so a later trigger (here, lifting the LPM
+        // policy) must not resurrect the EQ the user just turned off.
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.engine_target_on = true;
+        let blocker = tmp_path("off-lpm-not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::Disable).is_err());
+        assert!(
+            !d.user_intent,
+            "off clears the live intent even when the persist fails"
+        );
+        assert!(
+            d.config.enabled,
+            "the stale on-disk value is left untouched for a retry"
+        );
+
+        // Give the next command a writable path so the toggle itself can persist.
+        d.config_path = tmp_path("off-lpm-good.toml");
+        d.apply(Request::SetAutoOffLowPower(false)).unwrap();
+        assert!(
+            !d.engine_target_on,
+            "lifting the LPM policy must read the live off-intent, not the stale enabled=true"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
     fn redundant_disable_skips_the_config_write() {
         // Already off: `eqtune off` must not churn the disk (and on a first run must not
         // manufacture a config file).
@@ -1966,6 +2018,7 @@ mod tests {
 
     fn daemon_with(config: Config) -> TestDaemon {
         TestDaemon(Daemon {
+            user_intent: config.enabled,
             saved_config: config.clone(),
             config,
             config_path: tmp_path("daemon-config.toml"),

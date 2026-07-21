@@ -217,25 +217,32 @@ The daemon never starts/stops the engine ad hoc. Instead it keeps a small amount
 intent and *reconciles*:
 
 - `engine_target_on` — whether the engine *should* be running right now.
-- `config.enabled` — your last explicit `on`/`off`, remembered across an automatic
-  suspend. Persisted in the config file and restored at daemon startup, so an enabled EQ
-  survives a reboot or daemon restart.
+- `user_intent` — your last explicit `on`/`off`, in memory. The automatic suspends (Low
+  Power Mode, idle) gate on this. It is seeded at startup from the persisted
+  `config.enabled` and updated the instant a command is handled — before the write that
+  records it durably.
+- `config.enabled` — the *persisted* on/off, restored at daemon startup so an enabled EQ
+  survives a reboot or daemon restart. It mirrors disk; `user_intent` is what the live
+  reconcile logic reads, so a failed persist (reported as a retryable error) can never
+  desync the idle/LPM behavior from what is actually running.
 - `low_power` — the last-seen macOS Low Power Mode state.
 - `idle_suspended` — whether the engine is off because captured audio stayed silent.
 
 `reconcile()` simply makes reality match `engine_target_on`: start the engine if it should
 be on and isn't, drop it if it should be off and is. Every event routes through this:
 
-- Daemon startup restores the persisted `config.enabled` (respecting the Low-Power-Mode
-  policy), then reconciles once before serving requests. A start failure (capture
-  permission not yet granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
-- `eqtune on` starts the engine first and persists `config.enabled` only after a
-  successful start, so a failed start (permission not yet granted) never records an "on"
-  that a later restart would silently act on. `eqtune off` is the mirror image: it stops
-  the engine first — unconditionally — and then persists, so a failed config write can
-  cost persistence (reported as an error, retryable) but never leaves audio processing.
+- Daemon startup seeds `user_intent` from the persisted `config.enabled` and reconciles
+  once (respecting the Low-Power-Mode policy) before serving requests. A start failure
+  (capture permission not yet granted) is logged, not fatal — launchd KeepAlive must not
+  crash-loop.
+- `eqtune on` sets `user_intent`, starts the engine, and persists `config.enabled` only
+  after a successful start, so a failed start (permission not yet granted) never records
+  an "on" that a later restart would silently act on. `eqtune off` is the mirror image: it
+  clears `user_intent`, stops the engine first — unconditionally — then persists, so a
+  failed config write can cost persistence (reported as an error, retryable) but never
+  leaves audio processing nor lets a later reconcile restore the EQ.
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
-  engine off (a large power saving) while remembering `config.enabled`; leaving LPM
+  engine off (a large power saving) while remembering `user_intent`; leaving LPM
   restores it. An explicit `eqtune on` overrides and runs even under LPM.
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
   engine is running. After sustained silence it drops the engine; while suspended, it
