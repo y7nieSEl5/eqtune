@@ -324,8 +324,11 @@ The daemon deliberately separates "what is playing now" from "what is saved":
   save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
 - While `config != saved_config`, the working config is mirrored to a sibling
   `session.toml` (atomic temp-file + rename, but without the config's fsyncs: the mirror
-  is best-effort and rewritten on every live edit, so durability-grade flushes in the
-  single-threaded loop would buy nothing). The mirror is removed once the session
+  is best-effort, so durability-grade flushes in the single-threaded loop would buy
+  nothing). Writes are rate-limited: the first edit after a quiet period mirrors
+  immediately (an isolated edit is never at risk), but a burst within a short window is
+  coalesced into one write flushed from the poll loop, so dragging a control doesn't
+  rewrite the whole config on every step. The mirror is removed the moment the session
   resolves; if that removal fails, the resolving command reports it as an error, because
   a leftover draft would restore the just-resolved session at the next startup. At
   startup the daemon restores a leftover mirror as an unsaved draft — so a reboot,

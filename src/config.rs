@@ -315,12 +315,12 @@ impl Config {
     }
 
     /// Atomic like [`Config::save_to`] (readers never see a torn file) but without the
-    /// fsyncs, for the best-effort session-draft mirror: it is rewritten on every live
-    /// edit inside the daemon's single-threaded accept/poll loop, where two
-    /// durability-grade flushes per keystroke would stall request handling and the
-    /// device/low-power/idle polling for nothing — the worst a power loss can cost is
-    /// the most recent mirror write, and a file truncated by an ill-timed crash is
-    /// quarantined (not trusted) by [`Config::load_session`].
+    /// fsyncs, for the best-effort session-draft mirror: it is rewritten as the working
+    /// tuning changes inside the daemon's single-threaded accept/poll loop (rate-limited
+    /// so a burst of edits coalesces), where two durability-grade flushes per write would
+    /// stall request handling and the device/low-power/idle polling for nothing — the
+    /// worst a power loss can cost is the most recent mirror write, and a file truncated
+    /// by an ill-timed crash is quarantined (not trusted) by [`Config::load_session`].
     pub fn write_draft_to(&self, path: &Path) -> anyhow::Result<()> {
         self.write_atomically(path, false)
     }

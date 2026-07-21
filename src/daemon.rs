@@ -38,6 +38,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 /// How long captured audio must remain silent before the engine is suspended.
 const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
+/// Minimum spacing between session-draft mirror writes. The first edit after a quiet
+/// period is mirrored immediately (an isolated edit is never at risk of being lost); a
+/// *burst* of edits within this window is coalesced into one write flushed from the poll
+/// loop, so dragging a control doesn't rewrite the whole config on every step. The mirror
+/// is best-effort, so at most this much of an in-progress burst is at risk on a crash.
+const SESSION_MIRROR_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PRESET_NAME_LEN: usize = 64;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,6 +82,13 @@ pub struct Daemon {
     /// Whether the engine is currently off because captured audio was silent long enough
     /// to count as no active media.
     idle_suspended: bool,
+    /// A session-draft mirror write is pending: an edit changed the working config within
+    /// `SESSION_MIRROR_MIN_INTERVAL` of the last write, so the write was deferred to the
+    /// poll loop (`maybe_flush_draft`) to coalesce the burst. See `sync_session_file`.
+    draft_dirty: bool,
+    /// When the session-draft mirror was last written, for the rate limit above. Reset to
+    /// `None` when a session resolves, so the next session's first edit mirrors at once.
+    draft_last_write: Option<Instant>,
 }
 
 impl Daemon {
@@ -106,6 +119,8 @@ impl Daemon {
             engine: None,
             engine_target: None,
             low_power,
+            draft_dirty: false,
+            draft_last_write: None,
         })
     }
 
@@ -151,6 +166,7 @@ impl Daemon {
             self.follow_low_power();
             self.follow_idle_activity();
             self.follow_default_device();
+            self.maybe_flush_draft(Instant::now());
             std::thread::sleep(POLL);
         }
     }
@@ -582,10 +598,11 @@ impl Daemon {
     }
 
     /// Push the working config to the running engine (if any) and mirror the session
-    /// draft to disk. Every mutation of the working config funnels through here, so the
-    /// on-disk draft always matches `has_unsaved_session`: written while a draft exists,
-    /// removed once the session resolves (save, overwrite, discard, or any persist).
-    /// The engine push cannot fail; the returned error is `sync_session_file`'s.
+    /// draft to disk. Every mutation of the working config funnels through here. The
+    /// on-disk draft tracks `has_unsaved_session`: written while a draft exists (writes
+    /// coalesced by a rate limit, see `sync_session_file`), removed the moment the session
+    /// resolves (save, overwrite, discard, or any persist). The engine push cannot fail;
+    /// the returned error is `sync_session_file`'s.
     fn apply_current_settings(&mut self) -> anyhow::Result<()> {
         let synced = self.sync_session_file();
         if self.engine.is_some() {
@@ -603,22 +620,35 @@ impl Daemon {
 
     /// Mirror the session-draft state to disk so it survives a daemon restart.
     ///
-    /// A *write* failure is logged, not propagated: the edit already applied live, and
-    /// failing the command over a degraded draft mirror would be worse than a draft
-    /// that only lives in memory (the pre-mirror behavior). A *removal* failure is an
-    /// error: the leftover draft is authoritative restore state, so the next daemon
-    /// startup would resurrect the very session the command just resolved (a discarded
-    /// tuning coming back, or a stale draft shadowing a fresh save) — the resolving
-    /// command must not report success over that.
-    fn sync_session_file(&self) -> anyhow::Result<()> {
+    /// While an unsaved session exists the draft is written, but *rate-limited*: the first
+    /// edit after a quiet period mirrors immediately, and further edits within
+    /// `SESSION_MIRROR_MIN_INTERVAL` only mark `draft_dirty`, to be flushed once by
+    /// `maybe_flush_draft` in the poll loop. This coalesces a burst (dragging a control)
+    /// into a few writes instead of rewriting the whole config on every step. A *write*
+    /// failure is logged, not propagated: the edit already applied live, and failing the
+    /// command over a degraded best-effort mirror would be worse than a draft that only
+    /// lives in memory (the pre-mirror behavior).
+    ///
+    /// A *removal* (session resolved) is neither deferred nor best-effort: it happens now,
+    /// and a failure is an error. The leftover draft is authoritative restore state, so
+    /// the next daemon startup would resurrect the very session the command just resolved
+    /// (a discarded tuning coming back, or a stale draft shadowing a fresh save) — the
+    /// resolving command must not report success over that. Resolving also cancels any
+    /// pending deferred write and resets the rate limit.
+    fn sync_session_file(&mut self) -> anyhow::Result<()> {
         if self.has_unsaved_session() {
-            if let Err(e) = self.config.write_draft_to(&self.session_path) {
-                eprintln!(
-                    "could not mirror the session draft to {}: {e}",
-                    self.session_path.display()
-                );
+            let now = Instant::now();
+            if self.draft_write_due(now) {
+                self.write_draft(now);
+            } else {
+                self.draft_dirty = true; // flushed by `maybe_flush_draft`
             }
-        } else if let Err(e) = std::fs::remove_file(&self.session_path) {
+            return Ok(());
+        }
+        // Session resolved: cancel any pending mirror write and drop the file now.
+        self.draft_dirty = false;
+        self.draft_last_write = None;
+        if let Err(e) = std::fs::remove_file(&self.session_path) {
             if e.kind() != ErrorKind::NotFound {
                 return Err(anyhow::anyhow!(
                     "the tuning was applied, but the resolved session draft at {} could \
@@ -629,6 +659,36 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Whether enough time has passed since the last mirror write to write again now.
+    /// `None` (fresh session, or just resolved) always writes — the leading edge that
+    /// keeps an isolated edit mirrored immediately.
+    fn draft_write_due(&self, now: Instant) -> bool {
+        self.draft_last_write
+            .is_none_or(|last| now.duration_since(last) >= SESSION_MIRROR_MIN_INTERVAL)
+    }
+
+    /// Write the session-draft mirror (best-effort) and record the time for the rate
+    /// limit. Clears `draft_dirty` regardless of outcome; a failure leaves
+    /// `draft_last_write` untouched so the next edit retries promptly.
+    fn write_draft(&mut self, now: Instant) {
+        self.draft_dirty = false;
+        match self.config.write_draft_to(&self.session_path) {
+            Ok(()) => self.draft_last_write = Some(now),
+            Err(e) => eprintln!(
+                "could not mirror the session draft to {}: {e}",
+                self.session_path.display()
+            ),
+        }
+    }
+
+    /// Flush a deferred session-draft write once the rate-limit interval has elapsed.
+    /// Called from the poll loop, so a burst of edits lands as one coalesced write.
+    fn maybe_flush_draft(&mut self, now: Instant) {
+        if self.draft_dirty && self.draft_write_due(now) {
+            self.write_draft(now);
+        }
     }
 
     fn has_unsaved_session(&self) -> bool {
@@ -1922,6 +1982,58 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_edits_coalesces_into_one_deferred_mirror_write() {
+        let mut d = daemon_with(Config::default());
+        let t0 = Instant::now();
+
+        // The first edit after a quiet period mirrors immediately, so an isolated edit is
+        // never at risk of being lost across a restart.
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(
+            d.session_path.exists(),
+            "the first edit mirrors immediately"
+        );
+        assert!(!d.draft_dirty);
+
+        // Further edits within the min interval defer rather than rewrite the whole config
+        // on every step — they only mark the mirror dirty, leaving the earlier write on disk.
+        d.apply(Request::SetPreamp(-4.0)).unwrap();
+        d.apply(Request::SetPreamp(-5.0)).unwrap();
+        assert!(
+            d.draft_dirty,
+            "a burst within the interval defers the write"
+        );
+        assert_eq!(
+            Config::load_from(&d.session_path)
+                .unwrap()
+                .active()
+                .unwrap()
+                .preamp_db,
+            -3.0,
+            "the deferred edits are not flushed yet"
+        );
+
+        // A poll before the interval elapses is a no-op; once it elapses the latest state
+        // is flushed in a single coalesced write.
+        d.maybe_flush_draft(t0 + SESSION_MIRROR_MIN_INTERVAL / 2);
+        assert!(d.draft_dirty, "still within the interval — nothing flushed");
+        d.maybe_flush_draft(t0 + SESSION_MIRROR_MIN_INTERVAL * 2);
+        assert!(
+            !d.draft_dirty,
+            "the interval elapsed — the coalesced write lands"
+        );
+        assert_eq!(
+            Config::load_from(&d.session_path)
+                .unwrap()
+                .active()
+                .unwrap()
+                .preamp_db,
+            -5.0,
+            "the mirror now holds the latest edit"
+        );
+    }
+
+    #[test]
     fn discarding_a_session_removes_the_draft_mirror() {
         let mut d = daemon_with(Config::default());
 
@@ -2084,6 +2196,8 @@ mod tests {
             engine_target_on: false,
             low_power: false,
             idle_suspended: false,
+            draft_dirty: false,
+            draft_last_write: None,
         })
     }
 
