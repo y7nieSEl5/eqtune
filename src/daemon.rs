@@ -9,6 +9,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -53,15 +54,19 @@ pub struct Daemon {
     /// preset without overwriting the preset being edited.
     saved_config: Config,
     config_path: PathBuf,
+    /// Where the working config is mirrored while it differs from `saved_config`, so an
+    /// unsaved session survives a daemon restart. Removed once the session resolves.
+    session_path: PathBuf,
     engine: Option<(TapSession, EqHandle)>,
     /// (output device id, sample rate Hz) the running engine was built for.
     engine_target: Option<(u32, u32)>,
     /// The effective target: the audio engine should be running iff this is true.
     /// `reconcile` starts/stops the engine to match it.
+    ///
+    /// The user's last explicit on/off lives in `config.enabled` (persisted, restored at
+    /// startup); this flag additionally folds in the automatic suspends (Low Power Mode,
+    /// idle), which are runtime-only.
     engine_target_on: bool,
-    /// The user's last explicit on/off, remembered across a Low-Power-Mode auto-off so it
-    /// can be restored when Low Power Mode clears.
-    user_intent: bool,
     /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
     low_power: bool,
     /// Whether the engine is currently off because captured audio was silent long enough
@@ -71,17 +76,25 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new() -> anyhow::Result<Self> {
-        let config = Config::load()?;
+        let saved_config = Config::load()?;
+        let session_path = Config::session_path();
+        // Restore the unsaved session a previous daemon run left behind (reboot, crash,
+        // reinstall), if any — it stays a draft, resolved by the usual `off` prompt.
+        let config = Config::load_session(&session_path, &saved_config)
+            .unwrap_or_else(|| saved_config.clone());
+        // Seed from the real state so the first poll doesn't fire a spurious edge.
+        let low_power = sys::low_power_enabled();
         Ok(Self {
-            saved_config: config.clone(),
+            // Restore the persisted on/off, respecting the Low-Power-Mode policy the same
+            // way a live LPM edge would. `run` reconciles once before serving requests.
+            engine_target_on: config.enabled && !(config.auto_off_low_power && low_power),
+            saved_config,
             config,
             config_path: Config::path(),
+            session_path,
             engine: None,
             engine_target: None,
-            engine_target_on: false,
-            user_intent: false,
-            // Seed from the real state so the first poll doesn't fire a spurious edge.
-            low_power: sys::low_power_enabled(),
+            low_power,
             idle_suspended: false,
         })
     }
@@ -96,6 +109,15 @@ impl Daemon {
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
+
+        // Restore the last run's on state. A start failure (capture permission not yet
+        // granted, unsupported macOS) must not kill the daemon — under launchd KeepAlive
+        // that would crash-loop — so log it; `eqtune on` retries on demand.
+        if self.engine_target_on {
+            if let Err(e) = self.reconcile() {
+                eprintln!("could not restore the EQ at startup: {e}");
+            }
+        }
 
         loop {
             match listener.accept() {
@@ -149,19 +171,42 @@ impl Daemon {
         match req {
             Request::Status => Ok(Response::Status(self.status())),
             Request::Enable => {
-                self.user_intent = true;
                 self.idle_suspended = false;
                 self.engine_target_on = true;
-                self.reconcile()?; // override: starts even while Low Power Mode is active
+                // Override: starts even while Low Power Mode is active.
+                if let Err(e) = self.reconcile() {
+                    // A failed start is a failed enable: leave no half-on target behind,
+                    // or a later unrelated reconcile would start the EQ as a side effect
+                    // of a command that never succeeded.
+                    self.engine_target_on = false;
+                    return Err(e);
+                }
+                // Persist only after the engine actually started: recording enabled=true
+                // for a start that failed (capture permission not granted yet) would make
+                // a later daemon restart silently start the EQ although no `eqtune on`
+                // ever succeeded.
+                self.set_enabled(true).context(
+                    "the EQ is running, but the on state could not be saved — it would \
+                     not survive a daemon restart; retry `eqtune on`",
+                )?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::Disable => {
-                self.user_intent = false;
+                // Stop the engine before anything fallible: `off` must never leave audio
+                // processing because a disk write failed. The stop path of `reconcile`
+                // is pure assignments and cannot fail.
                 self.idle_suspended = false;
                 self.engine_target_on = false;
                 self.reconcile()?; // drops the TapSession -> large energy drop
+                self.set_enabled(false).context(
+                    "the EQ was stopped for this run, but the off state could not be \
+                     saved — a daemon restart would turn it back on; retry `eqtune off`",
+                )?;
                 if self.has_unsaved_session() {
-                    Ok(Response::UnsavedSession(self.tuning()))
+                    Ok(Response::UnsavedSession {
+                        tuning: self.tuning(),
+                        dirty_presets: self.dirty_preset_names(),
+                    })
                 } else {
                     Ok(Response::Ok)
                 }
@@ -174,8 +219,8 @@ impl Daemon {
                 if !self.config.presets.contains_key(&name) {
                     return Ok(Response::Error(format!("no such preset: {name}")));
                 }
-                self.config.active_preset = name;
-                self.apply_current_settings();
+                self.set_active_preset(name)?;
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SavePreset { name } => {
@@ -183,13 +228,16 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ClonePreset { source, dest } => {
+                // Cloning rebuilds the working config from the saved one, which would
+                // silently drop unsaved session edits — block it like the other
+                // preset-management commands until the session is resolved.
+                self.ensure_no_unsaved_session()?;
                 self.clone_preset(&source, &dest)?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::DeletePresets { names } => {
                 self.ensure_no_unsaved_session()?;
-                delete_presets(&mut self.config, &names)?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| delete_presets(c, &names))?;
                 Ok(Response::Presets {
                     active: self.config.active_preset.clone(),
                     names: self.config.presets.keys().cloned().collect(),
@@ -197,8 +245,7 @@ impl Daemon {
             }
             Request::RenamePreset { from, to } => {
                 self.ensure_no_unsaved_session()?;
-                rename_preset(&mut self.config, &from, &to)?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| rename_preset(c, &from, &to))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ExportPreset { name, path } => {
@@ -207,8 +254,7 @@ impl Daemon {
             }
             Request::ImportPreset { path, name } => {
                 self.ensure_no_unsaved_session()?;
-                import_preset(&mut self.config, &path, name.as_deref())?;
-                self.persist_and_apply()?;
+                self.commit_config(|c| import_preset(c, &path, name.as_deref()))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetBand { freq, gain_db, q } => {
@@ -235,7 +281,7 @@ impl Daemon {
                     });
                     preset.bands.sort_by(|a, b| a.freq.total_cmp(&b.freq));
                 }
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::RemoveBand { freq } => {
@@ -243,34 +289,34 @@ impl Daemon {
                 self.active_preset_mut()?
                     .bands
                     .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetPreamp(db) => {
                 validate_preamp(db)?;
                 self.active_preset_mut()?.preamp_db = db;
-                self.apply_current_settings();
+                self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SetAutoOffLowPower(on) => {
-                self.config.auto_off_low_power = on;
-                self.saved_config.auto_off_low_power = on;
-                self.saved_config.save_to(&self.config_path)?;
+                self.commit_setting(|c| c.auto_off_low_power = on)?;
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
                 } else if !on {
-                    self.engine_target_on = self.user_intent; // lift any LPM suppression
+                    // Lift any LPM suppression — but an idle suspension is not this
+                    // toggle's to lift: restarting the engine here with no media playing
+                    // would contradict the idle policy (follow_low_power and
+                    // SetAutoOffIdle apply the same guard).
+                    self.engine_target_on = self.config.enabled && !self.idle_suspended;
                 }
                 self.reconcile()?;
                 Ok(Response::Ok)
             }
             Request::SetAutoOffIdle(on) => {
-                self.config.auto_off_idle = on;
-                self.saved_config.auto_off_idle = on;
-                self.saved_config.save_to(&self.config_path)?;
+                self.commit_setting(|c| c.auto_off_idle = on)?;
                 if !on && self.idle_suspended {
                     self.idle_suspended = false;
-                    if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
+                    if self.config.enabled && !(self.config.auto_off_low_power && self.low_power) {
                         self.engine_target_on = true;
                     }
                 }
@@ -282,11 +328,12 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::SaveSessionOverwrite => {
-                self.persist_and_apply()?;
+                // Commit the working config — the session edits — exactly as it stands.
+                self.commit_config(|_| Ok(()))?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::DiscardSession => {
-                self.discard_session();
+                self.discard_session()?;
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::ResetPreset { name } => {
@@ -403,7 +450,7 @@ impl Daemon {
         self.engine_target_on = if now {
             false
         } else {
-            self.user_intent && !self.idle_suspended
+            self.config.enabled && !self.idle_suspended
         };
         eprintln!(
             "low power mode {} — eqtune {}",
@@ -423,7 +470,7 @@ impl Daemon {
     /// default output device running again. The resume probe only runs while suspended;
     /// while the tap is active, eqtune itself keeps the output device running.
     fn follow_idle_activity(&mut self) {
-        if !self.config.auto_off_idle || !self.user_intent {
+        if !self.config.auto_off_idle || !self.config.enabled {
             return;
         }
 
@@ -460,14 +507,66 @@ impl Daemon {
         }
     }
 
-    fn persist_and_apply(&mut self) -> anyhow::Result<()> {
-        self.config.save_to(&self.config_path)?;
-        self.saved_config = self.config.clone();
-        self.apply_current_settings();
+    /// Commit an immediately-persisted setting (a global toggle or the preset switch):
+    /// apply `set` to a copy of the saved config, persist that copy, and only then adopt
+    /// it into both in-memory configs. Persist-first is the invariant — on a failed
+    /// write nothing in memory changes, so `status` and the engine keep matching what is
+    /// actually on disk, and a retried command re-attempts the write instead of hitting
+    /// the no-op skip. Applying `set` to both configs keeps the field equal in `config`
+    /// and `saved_config`, so an immediate-commit change never shows up as an
+    /// unsaved-session diff. A change that alters nothing skips the disk write.
+    fn commit_setting(&mut self, set: impl Fn(&mut Config)) -> anyhow::Result<()> {
+        let mut next = self.saved_config.clone();
+        set(&mut next);
+        if next == self.saved_config {
+            return Ok(());
+        }
+        next.save_to(&self.config_path)?;
+        set(&mut self.config);
+        self.saved_config = next;
         Ok(())
     }
 
-    fn apply_current_settings(&mut self) {
+    /// Commit a preset switch. Switching is a selection, not a tuning edit: like the
+    /// global toggles it is persisted immediately, so it survives restarts and never
+    /// counts as an unsaved session by itself — `eqtune off` right after a switch must
+    /// not raise the save prompt. Draft edits to any preset's contents stay uncommitted;
+    /// only `active_preset` changes in the saved config.
+    fn set_active_preset(&mut self, name: String) -> anyhow::Result<()> {
+        self.commit_setting(|c| c.active_preset = name.clone())
+    }
+
+    /// Record the user's explicit on/off and persist it, so the state is restored at the
+    /// next daemon startup. `enabled` is a global toggle, not session state: drafts are
+    /// not committed along with it.
+    fn set_enabled(&mut self, on: bool) -> anyhow::Result<()> {
+        self.commit_setting(|c| c.enabled = on)
+    }
+
+    /// Commit a working-config mutation: mutate a clone, persist it, and adopt it in
+    /// memory only on success — the whole-config sibling of `commit_setting`. A failed
+    /// save leaves both configs (and so `status` and the engine) on the state the disk
+    /// still has, and a retry of the command re-attempts the write. Committing the
+    /// working config as it stands (resolving a session) is the identity mutation.
+    fn commit_config(
+        &mut self,
+        mutate: impl FnOnce(&mut Config) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut next = self.config.clone();
+        mutate(&mut next)?;
+        next.save_to(&self.config_path)?;
+        self.saved_config = next.clone();
+        self.config = next;
+        self.apply_current_settings()
+    }
+
+    /// Push the working config to the running engine (if any) and mirror the session
+    /// draft to disk. Every mutation of the working config funnels through here, so the
+    /// on-disk draft always matches `has_unsaved_session`: written while a draft exists,
+    /// removed once the session resolves (save, overwrite, discard, or any persist).
+    /// The engine push cannot fail; the returned error is `sync_session_file`'s.
+    fn apply_current_settings(&mut self) -> anyhow::Result<()> {
+        let synced = self.sync_session_file();
         if self.engine.is_some() {
             let fs = self
                 .engine_target
@@ -478,10 +577,56 @@ impl Daemon {
                 handle.store(settings); // lock-free live update
             }
         }
+        synced
+    }
+
+    /// Mirror the session-draft state to disk so it survives a daemon restart.
+    ///
+    /// A *write* failure is logged, not propagated: the edit already applied live, and
+    /// failing the command over a degraded draft mirror would be worse than a draft
+    /// that only lives in memory (the pre-mirror behavior). A *removal* failure is an
+    /// error: the leftover draft is authoritative restore state, so the next daemon
+    /// startup would resurrect the very session the command just resolved (a discarded
+    /// tuning coming back, or a stale draft shadowing a fresh save) — the resolving
+    /// command must not report success over that.
+    fn sync_session_file(&self) -> anyhow::Result<()> {
+        if self.has_unsaved_session() {
+            if let Err(e) = self.config.write_draft_to(&self.session_path) {
+                eprintln!(
+                    "could not mirror the session draft to {}: {e}",
+                    self.session_path.display()
+                );
+            }
+        } else if let Err(e) = std::fs::remove_file(&self.session_path) {
+            if e.kind() != ErrorKind::NotFound {
+                return Err(anyhow::anyhow!(
+                    "the tuning was applied, but the resolved session draft at {} could \
+                     not be removed ({e}); a daemon restart would restore it as unsaved \
+                     tuning — remove the file manually",
+                    self.session_path.display()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn has_unsaved_session(&self) -> bool {
         self.config != self.saved_config
+    }
+
+    /// Names of every preset whose working contents differ from the saved config — the
+    /// actual substance of an unsaved session. Immediate-commit fields (the preset
+    /// switch, global toggles) are equalized in both configs by `commit_setting` and so
+    /// never appear here; edits left on a previously active preset do.
+    fn dirty_preset_names(&self) -> Vec<String> {
+        self.config
+            .presets
+            .iter()
+            .filter(|(name, contents)| {
+                self.saved_config.presets.get(name.as_str()) != Some(contents)
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     fn ensure_no_unsaved_session(&self) -> anyhow::Result<()> {
@@ -494,8 +639,16 @@ impl Daemon {
         }
     }
 
+    /// Save the *active* preset's working tuning under `name` and switch to it. This
+    /// save consumes the active preset's unsaved edit, and — when `name` is an explicit
+    /// overwrite of an existing preset — supersedes any pending edit of that preset.
+    /// Unsaved edits to every other preset (left behind by a preset switch) are neither:
+    /// they are carried over into the new working config and stay an open session,
+    /// re-raised by the next `off` prompt, instead of being silently reverted to their
+    /// saved contents.
     fn save_session_as(&mut self, name: &str) -> anyhow::Result<()> {
-        validate_session_save_name(&self.saved_config, name)?;
+        validate_session_save_name(&self.saved_config, &self.config.active_preset, name)?;
+        let active_name = self.config.active_preset.clone();
         let preset = self
             .config
             .active()
@@ -504,8 +657,21 @@ impl Daemon {
         let mut next = self.saved_config.clone();
         next.presets.insert(name.to_string(), preset);
         next.active_preset = name.to_string();
-        self.config = next;
-        self.persist_and_apply()
+        // Persist first (commit_setting's invariant): a failed write changes nothing
+        // in memory.
+        next.save_to(&self.config_path)?;
+        let mut working = next.clone();
+        for (preset_name, contents) in &self.config.presets {
+            if *preset_name != active_name && preset_name != name {
+                working
+                    .presets
+                    .insert(preset_name.clone(), contents.clone());
+            }
+        }
+        self.saved_config = next;
+        self.config = working;
+        self.apply_current_settings()?;
+        Ok(())
     }
 
     fn clone_preset(&mut self, source: &str, dest: &str) -> anyhow::Result<()> {
@@ -519,30 +685,39 @@ impl Daemon {
         let mut next = self.saved_config.clone();
         next.presets.insert(dest.to_string(), preset);
         next.active_preset = dest.to_string();
+        // Persist first: a failed write must not leave a half-applied clone in the
+        // working config (which would read as a phantom unsaved session).
+        next.save_to(&self.config_path)?;
+        self.saved_config = next.clone();
         self.config = next;
-        self.persist_and_apply()
+        self.apply_current_settings()?;
+        Ok(())
     }
 
-    fn discard_session(&mut self) {
+    fn discard_session(&mut self) -> anyhow::Result<()> {
         self.config = self.saved_config.clone();
-        self.apply_current_settings();
+        self.apply_current_settings()
     }
 
+    // Every reset entry point ensures no unsaved session first, so the working config
+    // these two mutate equals the saved one.
     fn confirm_reset_preset(&mut self, name: &str, backups: &[PresetBackup]) -> anyhow::Result<()> {
-        let mut next = self.saved_config.clone();
-        apply_reset_backups(&mut next, backups)?;
-        reset_preset(&mut next, name)?;
-        self.config = next;
-        self.persist_and_apply()
+        self.commit_config(|c| {
+            apply_reset_backups(c, backups)?;
+            reset_preset(c, name)
+        })
     }
 
     fn confirm_reset_all(&mut self, backups: &[PresetBackup]) -> anyhow::Result<()> {
-        let mut next = self.saved_config.clone();
-        apply_reset_backups(&mut next, backups)?;
-        reset_shipped_presets(&mut next);
-        self.config = next;
+        self.commit_config(|c| {
+            apply_reset_backups(c, backups)?;
+            reset_shipped_presets(c);
+            Ok(())
+        })?;
+        // Only after the reset actually landed: a failed save must not lift the idle
+        // suspension and let the next reconcile restart the engine with nothing playing.
         self.idle_suspended = false;
-        self.persist_and_apply()
+        Ok(())
     }
 
     fn status(&self) -> Status {
@@ -830,9 +1005,13 @@ fn validate_new_preset_name(config: &Config, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_session_save_name(config: &Config, name: &str) -> anyhow::Result<()> {
+/// A session may be saved under a new name, a shipped name (a deliberate overwrite of a
+/// built-in), or the active preset's own name — saving the tuning back into the preset
+/// being edited is exactly the overwrite action, not an accident to prevent. Only the
+/// names of *other* custom presets are rejected, to prevent accidental loss.
+fn validate_session_save_name(config: &Config, active: &str, name: &str) -> anyhow::Result<()> {
     validate_preset_name(name)?;
-    if config.presets.contains_key(name) && !is_shipped_preset_name(name) {
+    if config.presets.contains_key(name) && !is_shipped_preset_name(name) && name != active {
         return Err(anyhow::anyhow!("preset already exists: {name}"));
     }
     Ok(())
@@ -1076,7 +1255,30 @@ mod tests {
     }
 
     #[test]
-    fn session_save_as_rejects_existing_custom_preset_name() {
+    fn session_save_as_rejects_another_custom_preset_name() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SavePreset {
+            name: "daily".into(),
+        })
+        .unwrap();
+        d.apply(Request::SavePreset {
+            name: "desk".into(),
+        })
+        .unwrap(); // active is now "desk"
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        // "daily" is someone else's preset — overwriting it by save-as would be the
+        // accidental loss the check exists to prevent.
+        let err = d
+            .apply(Request::SaveSessionAs {
+                name: "daily".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("preset already exists"));
+    }
+
+    #[test]
+    fn session_save_as_own_name_overwrites_the_active_custom_preset() {
         let mut d = daemon_with(Config::default());
         d.apply(Request::SavePreset {
             name: "daily".into(),
@@ -1084,12 +1286,15 @@ mod tests {
         .unwrap();
         d.apply(Request::SetPreamp(-3.0)).unwrap();
 
-        let err = d
-            .apply(Request::SaveSessionAs {
-                name: "daily".into(),
-            })
-            .unwrap_err();
-        assert!(err.to_string().contains("preset already exists"));
+        // Saving the session under the preset being edited is the overwrite action, not
+        // a name collision — it must not dead-end with "preset already exists".
+        d.apply(Request::SaveSessionAs {
+            name: "daily".into(),
+        })
+        .unwrap();
+        assert_eq!(d.config, d.saved_config);
+        assert_eq!(d.config.active_preset, "daily");
+        assert_eq!(d.saved_config.presets["daily"].preamp_db, -3.0);
     }
 
     #[test]
@@ -1120,7 +1325,84 @@ mod tests {
         d.apply(Request::SetPreamp(-3.0)).unwrap();
 
         let resp = d.apply(Request::Disable).unwrap();
-        assert!(matches!(resp, Response::UnsavedSession(_)));
+        assert!(matches!(resp, Response::UnsavedSession { .. }));
+    }
+
+    #[test]
+    fn off_reports_the_presets_that_actually_carry_unsaved_edits() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap(); // edit bright (active)
+        d.apply(Request::SetPreset("mellow".into())).unwrap(); // switch commits
+
+        // The unsaved diff lives on bright, not on the now-active mellow: the prompt
+        // data must name what would actually be overwritten or discarded.
+        match d.apply(Request::Disable).unwrap() {
+            Response::UnsavedSession {
+                tuning,
+                dirty_presets,
+            } => {
+                assert_eq!(tuning.preset, "mellow");
+                assert_eq!(dirty_presets, vec!["bright".to_string()]);
+            }
+            other => panic!("expected UnsavedSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_session_as_keeps_unsaved_edits_to_other_presets_open() {
+        let mut d = daemon_with(Config::default());
+        // Edit bright (active), then switch away: the switch commits immediately, the
+        // edit stays attached to bright as the open session.
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert!(d.has_unsaved_session());
+
+        // Saving the (pristine) active tuning under a new name consumes only the active
+        // preset's edits — bright's unsaved edit must not be silently reverted.
+        d.apply(Request::SaveSessionAs {
+            name: "party".into(),
+        })
+        .unwrap();
+
+        assert_eq!(d.saved_config.active_preset, "party");
+        assert_eq!(
+            d.saved_config.presets["party"],
+            d.saved_config.presets["mellow"]
+        );
+        assert_eq!(
+            d.config.presets["bright"].preamp_db, -3.0,
+            "bright's unsaved edit must survive the save-as"
+        );
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -8.0);
+        assert!(
+            d.has_unsaved_session(),
+            "the remaining edit stays an open session"
+        );
+        assert!(
+            d.session_path.exists(),
+            "…and stays mirrored for a daemon restart"
+        );
+    }
+
+    #[test]
+    fn preset_clone_is_blocked_by_an_unsaved_session() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        // Cloning rebuilds the working config from the saved one; with a session open
+        // that would silently drop the working edit.
+        let err = d
+            .apply(Request::ClonePreset {
+                source: "mellow".into(),
+                dest: "night".into(),
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("unsaved tuning changes"));
+        assert!(!d.config.presets.contains_key("night"));
+        assert_eq!(
+            d.config.presets["bright"].preamp_db, -3.0,
+            "the working edit must not be dropped"
+        );
     }
 
     #[test]
@@ -1329,6 +1611,259 @@ mod tests {
     }
 
     #[test]
+    fn disable_persists_enabled_off() {
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+
+        let resp = d.apply(Request::Disable).unwrap();
+        assert!(matches!(resp, Response::Ok));
+
+        assert!(!d.config.enabled);
+        assert!(!d.saved_config.enabled);
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert!(
+            !on_disk.enabled,
+            "off must be persisted for the next startup"
+        );
+    }
+
+    #[test]
+    fn disabling_lowpower_auto_off_does_not_lift_an_idle_suspension() {
+        // EQ enabled but idle-suspended (no media): turning the LPM policy off must not
+        // restart the engine — only new device activity (or an explicit `on`) lifts an
+        // idle suspension.
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.idle_suspended = true;
+        d.engine_target_on = false;
+
+        d.apply(Request::SetAutoOffLowPower(false)).unwrap();
+
+        assert!(
+            !d.engine_target_on,
+            "lifting LPM suppression must not override an idle suspension"
+        );
+        assert!(d.idle_suspended);
+    }
+
+    #[test]
+    fn disable_with_a_failing_save_still_stops_the_engine_and_a_retry_persists() {
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.engine_target_on = true;
+        let blocker = tmp_path("off-not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::Disable).is_err());
+        // The engine must be stopped regardless of the persist failure…
+        assert!(
+            !d.engine_target_on,
+            "off must stop the engine even if the config write fails"
+        );
+        // …while the recorded intent stays truthful to disk (still on), so a retry
+        // re-attempts the write instead of hitting the no-op skip.
+        assert!(d.config.enabled);
+        assert!(d.saved_config.enabled);
+
+        d.config_path = good_path;
+        d.apply(Request::Disable).unwrap();
+        assert!(!d.config.enabled);
+        assert!(!Config::load_from(&d.config_path).unwrap().enabled);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn redundant_disable_skips_the_config_write() {
+        // Already off: `eqtune off` must not churn the disk (and on a first run must not
+        // manufacture a config file).
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::Disable).unwrap();
+        assert!(!d.config_path.exists());
+    }
+
+    #[test]
+    fn preset_switch_save_failure_leaves_state_untouched_and_a_retry_persists() {
+        let mut d = daemon_with(Config::default());
+        // An unwritable config path: its parent is a regular file, so save_to must fail.
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::SetPreset("mellow".into())).is_err());
+        // On a failed save nothing in memory may change, or `status` would report a
+        // preset the disk (and after the skipped apply, the engine) does not have.
+        assert_eq!(d.config.active_preset, "bright");
+        assert_eq!(d.saved_config.active_preset, "bright");
+
+        // A retry must actually retry the write, not hit the no-op skip.
+        d.config_path = good_path;
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert_eq!(d.config.active_preset, "mellow");
+        assert_eq!(
+            Config::load_from(&d.config_path).unwrap().active_preset,
+            "mellow"
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn preset_delete_save_failure_leaves_state_untouched_and_a_retry_persists() {
+        let mut d = daemon_with(Config::default());
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        let names = vec!["mellow".to_string()];
+        assert!(
+            d.apply(Request::DeletePresets {
+                names: names.clone()
+            })
+            .is_err()
+        );
+        // The delete must not survive in memory: the disk still has the preset, and a
+        // half-applied working config would read as a phantom unsaved session whose
+        // retry ("no such preset") could never persist the deletion.
+        assert!(d.config.presets.contains_key("mellow"));
+        assert!(d.saved_config.presets.contains_key("mellow"));
+        assert!(!d.has_unsaved_session());
+
+        d.config_path = good_path;
+        d.apply(Request::DeletePresets { names }).unwrap();
+        assert!(!d.config.presets.contains_key("mellow"));
+        assert!(
+            !Config::load_from(&d.config_path)
+                .unwrap()
+                .presets
+                .contains_key("mellow")
+        );
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn session_overwrite_save_failure_keeps_the_session_open() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.has_unsaved_session());
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::SaveSessionOverwrite).is_err());
+        // The edits were not committed, so they must stay an open session (draft mirror
+        // included) rather than being adopted as saved while the disk disagrees.
+        assert!(d.has_unsaved_session());
+        assert!(d.session_path.exists());
+
+        d.config_path = good_path;
+        d.apply(Request::SaveSessionOverwrite).unwrap();
+        assert!(!d.has_unsaved_session());
+        assert!(!d.session_path.exists());
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert_eq!(on_disk.active().unwrap().preamp_db, -3.0);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn reset_all_save_failure_keeps_the_idle_suspension() {
+        let mut d = daemon_with(Config::default());
+        d.idle_suspended = true;
+        let blocker = tmp_path("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::ConfirmReset { backups: vec![] }).is_err());
+        // A reset that did not land must not lift the idle suspension: the next
+        // reconcile would restart the engine with nothing playing.
+        assert!(d.idle_suspended);
+
+        d.config_path = good_path;
+        d.apply(Request::ConfirmReset { backups: vec![] }).unwrap();
+        assert!(!d.idle_suspended);
+        let _ = std::fs::remove_file(&blocker);
+    }
+
+    #[test]
+    fn preset_switch_commits_immediately_and_is_not_an_unsaved_session() {
+        let mut d = daemon_with(Config::default());
+
+        // Re-selecting the already-active preset must not churn the disk.
+        d.apply(Request::SetPreset("bright".into())).unwrap();
+        assert!(!d.config_path.exists());
+
+        // A real switch commits: no unsaved session, no draft mirror, persisted on disk
+        // — `eqtune off` right after `eqtune p mellow` must not raise the save prompt,
+        // and a daemon restart must come back on mellow.
+        d.apply(Request::SetPreset("mellow".into())).unwrap();
+        assert_eq!(d.saved_config.active_preset, "mellow");
+        assert!(!d.has_unsaved_session());
+        assert!(!d.session_path.exists());
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert_eq!(on_disk.active_preset, "mellow");
+    }
+
+    #[test]
+    fn live_edits_mirror_a_session_draft_and_committing_removes_it() {
+        let mut d = daemon_with(Config::default());
+
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        let draft = Config::load_from(&d.session_path).unwrap();
+        assert_eq!(
+            draft.presets[&draft.active_preset].preamp_db, -3.0,
+            "the unsaved edit must be mirrored to the session file"
+        );
+
+        d.apply(Request::SaveSessionOverwrite).unwrap();
+        assert!(
+            !d.session_path.exists(),
+            "a committed session must remove the draft mirror"
+        );
+    }
+
+    #[test]
+    fn discarding_a_session_removes_the_draft_mirror() {
+        let mut d = daemon_with(Config::default());
+
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.session_path.exists());
+
+        d.apply(Request::DiscardSession).unwrap();
+        assert!(
+            !d.session_path.exists(),
+            "a discarded session must remove the draft mirror"
+        );
+    }
+
+    #[test]
+    fn discard_surfaces_a_draft_that_could_not_be_removed() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+        assert!(d.session_path.exists());
+
+        // Make the draft unremovable: remove_file on a directory fails. A leftover
+        // draft would restore the discarded tuning at the next startup, so the discard
+        // must not report success over it.
+        std::fs::remove_file(&d.session_path).unwrap();
+        std::fs::create_dir(&d.session_path).unwrap();
+
+        let err = d.apply(Request::DiscardSession).unwrap_err();
+        assert!(err.to_string().contains("session draft"));
+        // The in-memory discard itself still applied (a retry is idempotent).
+        assert_eq!(d.config, d.saved_config);
+    }
+
+    #[test]
     fn handle_does_not_block_on_a_silent_client() {
         // A client that connects but never sends a full request line must not wedge the
         // single-threaded daemon: the read timeout `run` sets turns it into an error.
@@ -1400,18 +1935,47 @@ mod tests {
         );
     }
 
-    fn daemon_with(config: Config) -> Daemon {
-        Daemon {
+    /// A `Daemon` plus RAII cleanup of its on-disk footprint (the config and
+    /// session-draft files), so no test can leak temp files by asserting early or by
+    /// exercising a path that leaves the draft behind on purpose.
+    struct TestDaemon(Daemon);
+
+    impl Drop for TestDaemon {
+        fn drop(&mut self) {
+            for path in [&self.0.config_path, &self.0.session_path] {
+                if std::fs::remove_file(path).is_err() {
+                    // Some tests plant a directory there to force removal failures.
+                    let _ = std::fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+
+    impl std::ops::Deref for TestDaemon {
+        type Target = Daemon;
+        fn deref(&self) -> &Daemon {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for TestDaemon {
+        fn deref_mut(&mut self) -> &mut Daemon {
+            &mut self.0
+        }
+    }
+
+    fn daemon_with(config: Config) -> TestDaemon {
+        TestDaemon(Daemon {
             saved_config: config.clone(),
             config,
             config_path: tmp_path("daemon-config.toml"),
+            session_path: tmp_path("daemon-session.toml"),
             engine: None,
             engine_target: None,
             engine_target_on: false,
-            user_intent: false,
             low_power: false,
             idle_suspended: false,
-        }
+        })
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {

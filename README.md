@@ -6,7 +6,7 @@ A lightweight, system-wide audio equalizer for macOS.
 
 Mac speakers and headphone outputs are tuned conservatively out of the box — often mid-heavy and a bit flat, so music can sound closed-in. macOS has **no built-in system-wide EQ**, and the existing tools tend to be heavyweight: they install loopback/kernel drivers and *replace* your default output device, which breaks macOS's normal "switch to the headphones when I plug them in" behaviour.
 
-eqtune taps the system audio mix with Apple's modern **Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no code signing), applies a parametric EQ, and plays the result back to your **current** output device. Because it never hijacks the default device, plugging in EarPods or Bluetooth keeps working normally. It ships a few curated presets and lets you tweak any frequency yourself.
+eqtune taps the system audio mix with Apple's modern **Core Audio process-tap API** (macOS 14.2+, no driver, no kernel extension, no Developer ID certificate), applies a parametric EQ, and plays the result back to your **current** output device. Because it never hijacks the default device, plugging in EarPods or Bluetooth keeps working normally. It ships a few curated presets and lets you tweak any frequency yourself.
 
 ## Requirements
 
@@ -58,9 +58,16 @@ eqtune install | uninstall            # manage the launchd daemon
 - `eqtune on` and every edit (`preset`/`band`/`band-rm`/`preamp`/`reset`) print the
   resulting curve — the active preset, preamp, and each band — with the band you just
   changed flagged. `eqtune off` confirms the native Apple audio path is restored.
-- Tuning edits apply **live** (no audio restart). On `eqtune off`, eqtune asks whether
-  to save the latest tuning as a new preset, overwrite the active preset name, or discard
-  the session changes.
+- Tuning edits apply **live** (no audio restart). If you edited bands or the preamp,
+  `eqtune off` asks whether to save the latest tuning as a new preset, overwrite the
+  active preset name, or discard the session changes. Switching presets is saved
+  immediately and never triggers that prompt by itself; edits stay attached to the
+  preset you made them on, and the prompt names every preset that still has unsaved
+  edits.
+- eqtune **remembers its state across restarts**: after a reboot (or daemon restart) it
+  comes back on if you left it on, with the preset — including tuning edits you haven't
+  saved yet — you were listening to. Unsaved edits stay unsaved; the `eqtune off` prompt
+  still decides whether to keep them.
 - For the no-eqtune native Apple sound, use `eqtune off`.
 - To save battery, eqtune **auto-disables while no media is active** and resumes when
   playback starts again. It also auto-disables while macOS Low Power Mode is on and

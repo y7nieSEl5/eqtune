@@ -125,10 +125,14 @@ accept/poll loop.
 
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
-to the audio thread via `EqHandle::store` — without restarting playback. The daemon keeps
-a separate snapshot of the last saved config; on `eqtune off`, any difference becomes an
-interactive save/overwrite/discard prompt. Explicit library-management commands
-(`preset-save`, import, rename, delete, reset, …) persist immediately.
+to the audio thread via `EqHandle::store` — without restarting playback. Editing commands
+(`band`, `band-rm`, `preamp`) are session drafts: the daemon keeps a separate snapshot of
+the last saved config, and on `eqtune off` any content difference becomes an interactive
+save/overwrite/discard prompt. While a difference exists it is also mirrored to a
+session-draft file, so an unresolved session survives a daemon restart (§8). A preset
+*switch* is a selection, not an edit: it commits to the saved config immediately (like the
+global toggles) and never raises the prompt by itself. Explicit library-management
+commands (`preset-save`, import, rename, delete, reset, …) also persist immediately.
 
 ---
 
@@ -213,17 +217,26 @@ The daemon never starts/stops the engine ad hoc. Instead it keeps a small amount
 intent and *reconciles*:
 
 - `engine_target_on` — whether the engine *should* be running right now.
-- `user_intent` — your last explicit `on`/`off`, remembered across an automatic suspend.
+- `config.enabled` — your last explicit `on`/`off`, remembered across an automatic
+  suspend. Persisted in the config file and restored at daemon startup, so an enabled EQ
+  survives a reboot or daemon restart.
 - `low_power` — the last-seen macOS Low Power Mode state.
 - `idle_suspended` — whether the engine is off because captured audio stayed silent.
 
 `reconcile()` simply makes reality match `engine_target_on`: start the engine if it should
 be on and isn't, drop it if it should be off and is. Every event routes through this:
 
-- `eqtune on` / `off` set `user_intent` + `engine_target_on`, then reconcile.
+- Daemon startup restores the persisted `config.enabled` (respecting the Low-Power-Mode
+  policy), then reconciles once before serving requests. A start failure (capture
+  permission not yet granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
+- `eqtune on` starts the engine first and persists `config.enabled` only after a
+  successful start, so a failed start (permission not yet granted) never records an "on"
+  that a later restart would silently act on. `eqtune off` is the mirror image: it stops
+  the engine first — unconditionally — and then persists, so a failed config write can
+  cost persistence (reported as an error, retryable) but never leaves audio processing.
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
-  engine off (a large power saving) while remembering `user_intent`; leaving LPM restores
-  it. An explicit `eqtune on` overrides and runs even under LPM.
+  engine off (a large power saving) while remembering `config.enabled`; leaving LPM
+  restores it. An explicit `eqtune on` overrides and runs even under LPM.
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
   engine is running. After sustained silence it drops the engine; while suspended, it
   polls Core Audio's default-output-device activity and resumes when playback starts.
@@ -257,9 +270,9 @@ for "media is streaming" rather than a per-app media-session API.
 ## 8. Persistence & packaging
 
 - **Config** (`src/config.rs`) is TOML at `~/Library/Application Support/eqtune/config.toml`:
-  named presets (each a list of bands + a preamp) plus global toggles (`limiter`,
-  `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a first run
-  needs no file. Loads validate every preset against the realtime engine's limits
+  named presets (each a list of bands + a preamp) plus global toggles (`enabled`,
+  `limiter`, `auto_off_low_power`, `auto_off_idle`, …). It ships working defaults, so a
+  first run needs no file. Loads validate every preset against the realtime engine's limits
   (finite values, practical ranges, and at most 64 bands). A malformed or unrunnable config
   is moved aside as `config.toml.corrupt` or `config.toml.corrupt.N` and eqtune continues
   from shipped defaults, preserving the bad file for manual recovery. Saves write a sibling
@@ -278,28 +291,58 @@ for "media is streaming" rather than a per-app media-session API.
   request to the daemon; omitted export paths default to `<preset>.toml` in that directory.
 
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
-  so the daemon starts at login and is restarted if it dies. `eqtune install` copies the
-  binary to a stable location, skips self-copies, and either bootstraps a new agent or
-  restarts an already-loaded one with `launchctl kickstart -k` to avoid the
-  bootout/bootstrap race.
-- **No code signing.** Locally-built binaries aren't quarantined, so Gatekeeper never
-  applies. `build.rs` embeds an `Info.plist` into the binary so macOS shows a proper
-  audio-capture permission prompt without an Apple Developer account.
+  so the daemon starts at login and is restarted if it dies. `eqtune install` stages the
+  binary as a sibling temp file, ad-hoc signs that staged copy locally, atomically renames
+  it into the stable daemon location, and verifies launchd reaches the running state after
+  bootstrapping or restarting the agent. A healthy loaded agent still restarts with
+  `launchctl kickstart -k`; if launchd keeps stale launch constraints and the restarted
+  job fails to run, install falls back to bootout + bootstrap.
+- **No Developer ID signing.** The installer uses local ad-hoc signing for the daemon
+  copy, so no Apple Developer account, certificate, notarization, driver, or kernel
+  extension is needed. `build.rs` embeds an `Info.plist` into the binary so macOS shows a
+  proper audio-capture permission prompt.
 
 ### Session drafts and shipped presets
 
 The daemon deliberately separates "what is playing now" from "what is saved":
 
-- `config` is the working config. `preset`, `band`, `band-rm`, and `preamp` mutate this
-  copy and immediately push new `EqSettings` to the audio thread, but do not write TOML.
+- `config` is the working config. `band`, `band-rm`, and `preamp` mutate this copy and
+  immediately push new `EqSettings` to the audio thread, but do not write the saved
+  config. `preset` (a switch of `active_preset`) commits to the saved config immediately,
+  so switching alone never counts as an unsaved session.
 - `saved_config` mirrors the last config written to disk. It is the source for discard,
   save-as, and reset operations, so unrelated draft edits are not accidentally persisted.
+- While `config != saved_config`, the working config is mirrored to a sibling
+  `session.toml` (atomic temp-file + rename, but without the config's fsyncs: the mirror
+  is best-effort and rewritten on every live edit, so durability-grade flushes in the
+  single-threaded loop would buy nothing). The mirror is removed once the session
+  resolves; if that removal fails, the resolving command reports it as an error, because
+  a leftover draft would restore the just-resolved session at the next startup. At
+  startup the daemon restores a leftover mirror as an unsaved draft — so a reboot,
+  crash, or reinstall does not silently lose live edits, and the `off` prompt still
+  decides their fate. Only preset *contents* are trusted from the mirror, preset by
+  preset, for names the saved config knows — a legitimate draft only ever modifies
+  existing presets, so a stale one can neither delete a just-saved preset nor smuggle
+  one in. The active preset and global toggles always come from the saved config, since
+  switches and toggle changes commit immediately and a stale draft must not revert them.
+  An unreadable or unrunnable mirror is moved aside as `session.toml.corrupt` and ignored.
 - `eqtune off` stops the audio engine first. If `config != saved_config`, the daemon
-  returns `UnsavedSession(Tuning)`. The CLI then prompts for one of three outcomes.
+  returns `UnsavedSession` carrying the active tuning plus the names of every preset
+  whose working contents differ from the saved config. Edits stay attached to the preset
+  they were made on across preset switches, so those names can include presets other
+  than the active one; the CLI names them instead of implying the active curve is all
+  there is, and offers save-by-name only when the active preset itself has edits.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a
   clone of `saved_config`. If the name is unused, it creates a user preset. If the name is
-  one of the shipped names (`bright`, `mellow`, `pro`), it overwrites that local shipped
-  preset copy. Existing non-shipped names are rejected to prevent accidental loss.
+  one of the shipped names (`bright`, `mellow`, `pro`) or the active preset's own name, it
+  overwrites that preset — saving back into the preset being edited is the overwrite
+  action, not a collision. Names of *other* custom presets are rejected to prevent
+  accidental loss. The save consumes the active preset's edits (and, on an explicit
+  overwrite, supersedes pending edits of the overwritten preset); unsaved edits on any
+  other preset are carried into the new working config and stay an open session for the
+  next `off` prompt, never silently reverted. `preset-clone`, like the other
+  preset-management commands, is rejected while a session is open — it rebuilds the
+  working config from the saved one, which would drop those edits.
 - Overwrite (`SaveSessionOverwrite`) writes the entire working config as-is, preserving
   the active preset name. This is the direct path for "I tuned bright; make my device's
   bright sound like this now."

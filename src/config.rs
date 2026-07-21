@@ -25,6 +25,11 @@ pub struct Preset {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     pub active_preset: String,
+    /// The user's last explicit `on`/`off`. Restored at daemon startup so an enabled EQ
+    /// survives a reboot or daemon restart. Absent in older config files, hence the
+    /// serde default (off, matching the pre-field behavior).
+    #[serde(default)]
+    pub enabled: bool,
     pub limiter: bool,
     pub auto_follow_new_devices: bool,
     /// Automatically disable the EQ engine while macOS Low Power Mode is active (an
@@ -172,6 +177,7 @@ impl Default for Config {
         );
         Self {
             active_preset: "bright".to_string(),
+            enabled: false,
             limiter: true,
             auto_follow_new_devices: true,
             auto_off_low_power: true,
@@ -205,12 +211,9 @@ impl Config {
         // under launchd KeepAlive a hard error would restart the daemon into the same failure
         // forever and lose every preset. Back the bad file up for manual recovery and continue
         // with defaults.
-        let reason = match toml::from_str::<Config>(&contents) {
-            Ok(config) => match config.first_unusable_preset() {
-                Some((name, err)) => format!("preset {name:?} cannot be applied ({err})"),
-                None => return Ok(config),
-            },
-            Err(e) => format!("invalid TOML ({e})"),
+        let reason = match Self::parse_usable(&contents) {
+            Ok(config) => return Ok(config),
+            Err(reason) => reason,
         };
         // Move the bad file aside — both to preserve it for manual recovery and to get it
         // out of the way so the next save writes a fresh config. If the move fails we must
@@ -233,34 +236,136 @@ impl Config {
         Ok(Self::default())
     }
 
+    /// Standard location of the session-draft file: the working (unsaved) tuning the
+    /// daemon mirrors to disk while it differs from the saved config, so a reboot or
+    /// daemon restart does not lose it.
+    pub fn session_path() -> PathBuf {
+        Self::path().with_file_name("session.toml")
+    }
+
+    /// Restore a session draft left behind by a previous daemon run (reboot, crash,
+    /// reinstall). Returns the working config to continue from, or `None` when no usable
+    /// draft exists.
+    ///
+    /// Only preset contents are taken from the draft, and only preset by preset, for
+    /// names that exist in `saved`; `active_preset` and every global toggle (`enabled`,
+    /// `limiter`, `auto_off_*`, …) come from `saved`. A legitimate draft only ever
+    /// *modifies* presets of its saved base — session edits touch the active preset's
+    /// contents, never the preset set — so a draft can neither delete a preset the
+    /// saved config has (e.g. one committed by the very save that resolved the session,
+    /// when a crash landed between the config write and the draft's removal) nor smuggle
+    /// one in. Preset switches and toggle changes are committed to the saved config
+    /// immediately by their handlers, so a stale draft must not revert them — or
+    /// manufacture a phantom "unsaved changes" diff out of a switch or toggle alone.
+    ///
+    /// An unreadable or engine-unrunnable draft is moved aside like a bad config
+    /// (`.corrupt` backup) and ignored. Unlike [`Config::load_from`], a failed move-aside
+    /// is not an error: the committed config is untouched, and the draft file is
+    /// overwritten by the next live edit anyway.
+    pub fn load_session(path: &Path, saved: &Config) -> Option<Config> {
+        let contents = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(e) => {
+                eprintln!(
+                    "eqtune: could not read session draft {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        };
+        // The merged result needs no re-check: `saved` was validated by its own load and
+        // the adopted contents by this parse (a draft carrying any unusable preset is
+        // quarantined wholesale, adopted or not).
+        let reason = match Self::parse_usable(&contents) {
+            Ok(draft) => {
+                let mut config = saved.clone();
+                for (name, preset) in draft.presets {
+                    if let Some(slot) = config.presets.get_mut(&name) {
+                        *slot = preset;
+                    }
+                }
+                return Some(config);
+            }
+            Err(reason) => reason,
+        };
+        let backup = quarantine_path(path);
+        match std::fs::rename(path, &backup) {
+            Ok(()) => eprintln!(
+                "eqtune: session draft at {} is unusable ({reason}); backed up to {} and ignored",
+                path.display(),
+                backup.display()
+            ),
+            Err(e) => eprintln!(
+                "eqtune: session draft at {} is unusable ({reason}) and could not be moved \
+                 aside ({e}); ignored",
+                path.display()
+            ),
+        }
+        None
+    }
+
     /// Persist to [`Config::path`], creating the parent directory if needed.
     pub fn save(&self) -> anyhow::Result<()> {
         self.save_to(&Self::path())
     }
 
     pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        self.write_atomically(path, true)
+    }
+
+    /// Atomic like [`Config::save_to`] (readers never see a torn file) but without the
+    /// fsyncs, for the best-effort session-draft mirror: it is rewritten on every live
+    /// edit inside the daemon's single-threaded accept/poll loop, where two
+    /// durability-grade flushes per keystroke would stall request handling and the
+    /// device/low-power/idle polling for nothing — the worst a power loss can cost is
+    /// the most recent mirror write, and a file truncated by an ill-timed crash is
+    /// quarantined (not trusted) by [`Config::load_session`].
+    pub fn write_draft_to(&self, path: &Path) -> anyhow::Result<()> {
+        self.write_atomically(path, false)
+    }
+
+    fn write_atomically(&self, path: &Path, durable: bool) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        // Write to a sibling temp file, fsync it, then atomically rename it into place and
-        // fsync the directory. A crash or power loss mid-write can then only truncate the
-        // throwaway temp file, never the live config. The fsyncs are what make that true:
-        // without them the rename can reach disk before the bytes do, so a crash could leave
-        // `path` pointing at an empty or partial file — the very truncation this prevents.
+        // Write to a sibling temp file, then atomically rename it into place, so a crash
+        // mid-write can only truncate the throwaway temp file, never the live file. When
+        // `durable`, additionally fsync the file before the rename and the directory
+        // after it: without those a power loss could apply the rename before the bytes
+        // reach disk, leaving `path` pointing at an empty or partial file.
         let tmp = with_suffix(path, ".tmp");
         {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(contents.as_bytes())?;
-            file.sync_all()?;
+            if durable {
+                file.sync_all()?;
+            }
         }
         std::fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
+        if durable {
+            if let Some(parent) = path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
             }
         }
         Ok(())
+    }
+
+    /// Parse `contents` and check that every preset is runnable by the real-time
+    /// engine. On failure returns the human-readable reason the quarantine paths log —
+    /// one definition of "usable" and one reason format shared by the config file and
+    /// the session draft, so their validation and diagnostics cannot drift apart.
+    fn parse_usable(contents: &str) -> Result<Config, String> {
+        match toml::from_str::<Config>(contents) {
+            Ok(config) => match config.first_unusable_preset() {
+                Some((name, err)) => Err(format!("preset {name:?} cannot be applied ({err})")),
+                None => Ok(config),
+            },
+            Err(e) => Err(format!("invalid TOML ({e})")),
+        }
     }
 
     /// The name and validation error of the first preset the real-time engine could not
@@ -383,6 +488,7 @@ mod tests {
             !c.presets.contains_key("original"),
             "original should be removed"
         );
+        assert!(!c.enabled);
         assert!(c.limiter);
         assert!(c.auto_follow_new_devices);
         assert!(c.auto_off_low_power);
@@ -439,6 +545,7 @@ bands = []
         let c: Config = toml::from_str(toml).unwrap();
         assert!(c.auto_off_low_power, "absent field should default to true");
         assert!(c.auto_off_idle, "absent field should default to true");
+        assert!(!c.enabled, "absent enabled field should default to off");
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
@@ -504,6 +611,141 @@ bands = []
             dir.join("config.toml.corrupt.1").exists(),
             "the second bad config must be preserved under a distinct name"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_missing_returns_none() {
+        let saved = Config::default();
+        assert!(
+            Config::load_session(Path::new("/nonexistent/eqtune-xyz/session.toml"), &saved)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn load_session_takes_preset_contents_from_draft_and_the_rest_from_saved() {
+        let dir = unique_dir("session-merge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+
+        // The draft carries an edit, but also a stale active preset and toggle values
+        // (switches and toggles commit immediately, so the saved config is their truth).
+        let mut draft = Config {
+            active_preset: "pro".into(),
+            enabled: false,
+            auto_off_idle: false,
+            ..Config::default()
+        };
+        draft.presets.get_mut("mellow").unwrap().preamp_db = -3.0;
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        let saved = Config {
+            active_preset: "mellow".into(),
+            enabled: true,
+            ..Config::default()
+        };
+        let restored = Config::load_session(&path, &saved).unwrap();
+
+        // Preset contents come from the draft…
+        assert_eq!(restored.presets["mellow"].preamp_db, -3.0);
+        // …and the active preset and every global toggle come from the saved config.
+        assert_eq!(
+            restored.active_preset, "mellow",
+            "stale draft must not revert the committed preset switch"
+        );
+        assert!(restored.enabled, "stale draft must not revert `enabled`");
+        assert!(
+            restored.auto_off_idle,
+            "stale draft must not revert toggles"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_keeps_presets_the_stale_draft_lacks() {
+        // Crash window: `preset-save daily` committed config.toml (which gained "daily")
+        // but the daemon died before the now-resolved draft was removed. The stale
+        // draft's preset map must not shadow the committed one — "daily" survives.
+        let dir = unique_dir("session-stale");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+
+        let mut draft = Config::default(); // no "daily"
+        draft.presets.get_mut("bright").unwrap().preamp_db = -3.0;
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        let mut saved = Config {
+            active_preset: "daily".into(),
+            ..Config::default()
+        };
+        saved.presets.insert(
+            "daily".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: -6.0,
+            },
+        );
+        let restored = Config::load_session(&path, &saved).unwrap();
+
+        assert_eq!(
+            restored.presets["daily"].preamp_db, -6.0,
+            "a preset committed to the saved config must survive a stale draft"
+        );
+        assert_eq!(restored.active_preset, "daily");
+        // Contents of presets both sides know still come from the draft.
+        assert_eq!(restored.presets["bright"].preamp_db, -3.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_ignores_draft_presets_unknown_to_saved() {
+        // A session can only modify existing presets, never add one — a draft key the
+        // saved config does not know is stale garbage and must not be smuggled in.
+        let dir = unique_dir("session-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+
+        let mut draft = Config::default();
+        draft.presets.insert(
+            "ghost".into(),
+            Preset {
+                bands: vec![],
+                preamp_db: 0.0,
+            },
+        );
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        let restored = Config::load_session(&path, &Config::default()).unwrap();
+        assert!(!restored.presets.contains_key("ghost"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_quarantines_invalid_toml() {
+        let dir = unique_dir("session-corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+        std::fs::write(&path, "not valid toml {{{").unwrap();
+
+        assert!(Config::load_session(&path, &Config::default()).is_none());
+        assert!(dir.join("session.toml.corrupt").exists());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_session_quarantines_unrunnable_draft() {
+        let dir = unique_dir("session-badpreset");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.toml");
+        let mut draft = Config::default();
+        draft.presets.get_mut("bright").unwrap().bands[0].q = 0.0;
+        std::fs::write(&path, toml::to_string_pretty(&draft).unwrap()).unwrap();
+
+        assert!(Config::load_session(&path, &Config::default()).is_none());
+        assert!(dir.join("session.toml.corrupt").exists());
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

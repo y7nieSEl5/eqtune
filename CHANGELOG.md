@@ -6,6 +6,64 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- The on/off state is now persisted (`enabled` in `config.toml`) and restored at daemon
+  startup, so an enabled EQ survives a reboot or daemon restart instead of requiring
+  `eqtune on` after every login. Restoring respects the Low Power Mode auto-off policy,
+  and a failed engine start at startup is logged rather than crash-looping the daemon.
+  `eqtune on` records the state only after the engine actually started (a failed start
+  is never restored later as a silent "on"), and `eqtune off` always stops the engine
+  first — a failed config write is reported and retryable, but never keeps audio
+  processing.
+- Unsaved session tuning (band and preamp edits) is mirrored to a `session.toml` draft
+  file and restored — still as an unsaved draft — after a daemon restart, so a reboot,
+  crash, or reinstall no longer silently discards live edits. The `eqtune off`
+  save/overwrite/discard prompt is unchanged. Only preset contents are trusted from the
+  draft (preset by preset, for presets the saved config knows); the active preset and
+  global toggles always come from the saved config, and an unusable draft is moved
+  aside as `session.toml.corrupt`.
+
+### Changed
+
+- `eqtune preset <name>` now persists the switch immediately, like the global toggles.
+  Switching presets no longer counts as "unsaved tuning changes", so `eqtune off` right
+  after a switch no longer raises the save/overwrite/discard prompt (it still does for
+  actual band/preamp edits), and preset-management commands are no longer blocked by a
+  mere switch.
+
+### Fixed
+
+- `eqtune install` now stages daemon binary updates as a sibling temp file, ad-hoc signs
+  the staged copy before atomically replacing the installed daemon, and verifies launchd
+  reaches the running state. If an already-loaded service keeps stale launch constraints
+  and `kickstart -k` leaves it spawn-failed, install falls back to bootout + bootstrap
+  instead of reporting success over a dead daemon.
+- CLI invocations no longer panic with "failed printing to stdout: Broken pipe" when
+  their output pipe closes early (e.g. `eqtune status | head`); they now exit quietly
+  like any Unix filter. The daemon still ignores `SIGPIPE`, so a client disconnecting
+  mid-response cannot kill it.
+- The `eqtune off` save prompt's save-by-name path now accepts the active preset's own
+  name as an overwrite, instead of dead-ending with "preset already exists" for custom
+  presets; the name prompt says so. Names of other custom presets are still rejected.
+- Saving the session by name no longer silently reverts unsaved edits left on a
+  previously active preset (edit `bright`, switch to `mellow`, `off`, save — the
+  `bright` edits used to be dropped while the CLI printed "saved tuning"). Those edits
+  now stay an open session that the next `eqtune off` asks about, and the prompt names
+  every preset that actually carries unsaved edits instead of showing only the active
+  curve.
+- `eqtune preset-clone` is now rejected while unsaved tuning changes are active, like
+  the other preset-management commands — it used to rebuild the working config from the
+  saved one and silently drop the session edits.
+- `eqtune lowpower off` no longer restarts the engine while it is idle-suspended with no
+  media playing; the idle policy keeps it suspended until playback resumes.
+- Preset-management commands (`preset-rm`, `preset-rename`, `preset-import`, `reset`) and
+  the save prompt's overwrite path no longer adopt a change in memory when the config
+  write fails. A failed save now leaves `status`, the engine, and the disk in agreement
+  and retrying the command re-attempts the write — it used to leave a half-applied change
+  behind that read as phantom unsaved tuning. A failed `reset` also no longer lifts an
+  idle suspension.
+
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.

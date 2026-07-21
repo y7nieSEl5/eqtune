@@ -33,6 +33,22 @@ unsafe extern "C" {
     fn eqtune_tap_stop(session: *mut RawSession);
 }
 
+/// Restore the default `SIGPIPE` disposition, so the process dies quietly — like any
+/// Unix filter — when its output pipe closes early (e.g. `eqtune status | head`). Rust
+/// ignores `SIGPIPE` by default, which turns the closed pipe into a `println!` panic
+/// ("failed printing to stdout: Broken pipe") instead.
+///
+/// Client commands only: the daemon must keep `SIGPIPE` ignored, because a control-socket
+/// client disconnecting mid-response would otherwise kill the daemon; with the signal
+/// ignored that surfaces as a handled `EPIPE` write error. (Known trade-off on the client:
+/// a socket write racing a dying daemon now exits silently instead of printing an error —
+/// the common daemon-not-running case still fails at `connect` with the friendly message.)
+pub fn restore_default_sigpipe() {
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 /// The current default output device's `AudioObjectID`, if one exists.
 pub fn default_output_device() -> Option<u32> {
     let id = unsafe { eqtune_default_output_device() };
