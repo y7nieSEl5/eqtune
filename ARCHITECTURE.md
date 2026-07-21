@@ -232,9 +232,12 @@ intent and *reconciles*:
 be on and isn't, drop it if it should be off and is. Every event routes through this:
 
 - Daemon startup seeds `user_intent` from the persisted `config.enabled` and reconciles
-  once (respecting the Low-Power-Mode policy) before serving requests. A start failure
-  (capture permission not yet granted) is logged, not fatal — launchd KeepAlive must not
-  crash-loop.
+  once (respecting the Low-Power-Mode policy) before serving requests. When idle auto-off
+  is enabled the restore is *lazy* — the engine starts suspended and `follow_idle_activity`
+  starts it once playback is actually detected, so a login/restart with nothing playing
+  never runs the tap through startup silence; with idle auto-off disabled there is no
+  resume probe, so the restore is eager. A start failure (capture permission not yet
+  granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
 - `eqtune on` sets `user_intent`, starts the engine, and persists `config.enabled` only
   after a successful start, so a failed start (permission not yet granted) never records
   an "on" that a later restart would silently act on. `eqtune off` is the mirror image: it

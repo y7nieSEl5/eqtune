@@ -91,10 +91,13 @@ impl Daemon {
         // Runtime on/off intent, seeded from the persisted `enabled` and then tracked in
         // memory so it stays correct even if a later persist fails (see `set_enabled`).
         let user_intent = config.enabled;
+        let lpm_suppressed = config.auto_off_low_power && low_power;
+        let (engine_target_on, idle_suspended) =
+            initial_engine_state(user_intent, config.auto_off_idle, lpm_suppressed);
         Ok(Self {
-            // Restore the persisted on/off, respecting the Low-Power-Mode policy the same
-            // way a live LPM edge would. `run` reconciles once before serving requests.
-            engine_target_on: user_intent && !(config.auto_off_low_power && low_power),
+            // `run` reconciles once before serving requests; only the eager path needs it.
+            engine_target_on,
+            idle_suspended,
             user_intent,
             saved_config,
             config,
@@ -103,7 +106,6 @@ impl Daemon {
             engine: None,
             engine_target: None,
             low_power,
-            idle_suspended: false,
         })
     }
 
@@ -118,9 +120,11 @@ impl Daemon {
         listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
 
-        // Restore the last run's on state. A start failure (capture permission not yet
-        // granted, unsupported macOS) must not kill the daemon — under launchd KeepAlive
-        // that would crash-loop — so log it; `eqtune on` retries on demand.
+        // Restore the last run's on state (eager path only; the idle-aware restore starts
+        // suspended and lets `follow_idle_activity` start the engine on real playback). A
+        // start failure (capture permission not yet granted, unsupported macOS) must not
+        // kill the daemon — under launchd KeepAlive that would crash-loop — so log it;
+        // `eqtune on` retries on demand.
         if self.engine_target_on {
             if let Err(e) = self.reconcile() {
                 eprintln!("could not restore the EQ at startup: {e}");
@@ -842,6 +846,19 @@ fn current_target() -> (u32, u32) {
         .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f64)
         .round() as u32;
     (dev, rate)
+}
+
+/// Initial `(engine_target_on, idle_suspended)` for a daemon restoring the persisted
+/// on/off at startup. When the EQ was on and idle auto-off is enabled, restore *suspended*
+/// so `follow_idle_activity` starts the engine only once the output device is actually
+/// playing — a login/restart with nothing playing then never runs the tap through startup
+/// silence. Otherwise restore eagerly, honoring Low-Power-Mode suppression. The suspended
+/// flag is kept even under LPM so that when LPM clears the idle probe (not an eager
+/// LPM-restore) governs the first start.
+fn initial_engine_state(user_intent: bool, auto_off_idle: bool, lpm_suppressed: bool) -> (bool, bool) {
+    let lazy_start = user_intent && auto_off_idle;
+    let engine_target_on = user_intent && !lpm_suppressed && !lazy_start;
+    (engine_target_on, lazy_start)
 }
 
 #[cfg(test)]
@@ -1999,6 +2016,24 @@ mod tests {
                 .to_string()
                 .contains("in time")
         );
+    }
+
+    #[test]
+    fn initial_engine_state_starts_suspended_when_idle_auto_off_is_on() {
+        // On + idle auto-off on: restore suspended (engine off, idle_suspended set) so the
+        // resume probe starts the engine only when playback actually begins — no tap run
+        // through startup silence.
+        assert_eq!(initial_engine_state(true, true, false), (false, true));
+        // On + idle auto-off off: no resume probe to lean on, so restore eagerly.
+        assert_eq!(initial_engine_state(true, false, false), (true, false));
+        // Off: nothing to restore, either way.
+        assert_eq!(initial_engine_state(false, true, false), (false, false));
+        assert_eq!(initial_engine_state(false, false, false), (false, false));
+        // Low Power Mode suppresses the eager start; the suspended path is already off but
+        // keeps idle_suspended so the idle probe (not an LPM-restore) owns the first start
+        // once LPM clears.
+        assert_eq!(initial_engine_state(true, false, true), (false, false));
+        assert_eq!(initial_engine_state(true, true, true), (false, true));
     }
 
     /// A `Daemon` plus RAII cleanup of its on-disk footprint (the config and
