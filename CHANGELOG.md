@@ -10,19 +10,23 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 - The on/off state is now persisted (`enabled` in `config.toml`) and restored at daemon
   startup, so an enabled EQ survives a reboot or daemon restart instead of requiring
-  `eqtune on` after every login. Restoring respects the Low Power Mode auto-off policy,
-  and a failed engine start at startup is logged rather than crash-looping the daemon.
+  `eqtune on` after every login. Restoring respects the Low Power Mode auto-off policy —
+  and, when idle auto-off is enabled, restores *suspended* and starts on the first
+  playback rather than running the tap through startup silence — and a failed engine
+  start at startup is logged rather than crash-looping the daemon.
   `eqtune on` records the state only after the engine actually started (a failed start
   is never restored later as a silent "on"), and `eqtune off` always stops the engine
   first — a failed config write is reported and retryable, but never keeps audio
-  processing.
+  processing (nor lets a later Low Power Mode cycle restore an EQ you turned off).
 - Unsaved session tuning (band and preamp edits) is mirrored to a `session.toml` draft
   file and restored — still as an unsaved draft — after a daemon restart, so a reboot,
   crash, or reinstall no longer silently discards live edits. The `eqtune off`
   save/overwrite/discard prompt is unchanged. Only preset contents are trusted from the
   draft (preset by preset, for presets the saved config knows); the active preset and
   global toggles always come from the saved config, and an unusable draft is moved
-  aside as `session.toml.corrupt`.
+  aside as `session.toml.corrupt`. Draft writes are rate-limited, so a burst of edits
+  (dragging a control) coalesces into a few writes instead of rewriting the whole config
+  on every step.
 
 ### Changed
 

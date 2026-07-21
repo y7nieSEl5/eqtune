@@ -118,11 +118,12 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 于是，我需要在合适的时候让daemon自己停止运行engine。
 
 - `engine_target_on`：engine现在该在运行
-- `config.enabled`：用户明确指令的on/off。它会随config持久化，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。`eqtune on`只有在engine真正启动成功后才写入"on"（启动失败绝不会在下次重启时被悄悄恢复成开启）；`eqtune off`则相反：先无条件停止engine，再持久化——写盘失败会报错并可重试，但绝不会让音频继续被处理。
+- `user_intent`：用户明确指令的on/off，存在内存里。自动挂起（低电量、静音）都以它为准。它在启动时用持久化的`config.enabled`初始化，之后每次`on`/`off`一进来就立刻更新——早于把它写盘的那一步。
+- `config.enabled`：持久化的on/off，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。它只是磁盘上的记录，实时的reconcile逻辑读的是`user_intent`，所以一次写盘失败（会报错、可重试）绝不会让idle/低电量的行为和实际运行状态脱节。`eqtune on`先设`user_intent`、启动engine，只有启动成功后才写入`config.enabled`（启动失败绝不会在下次重启时被悄悄恢复成开启）；`eqtune off`则相反：先清掉`user_intent`、无条件停止engine，再持久化——写盘失败会报错并可重试，但绝不会让音频继续被处理，也不会让之后的reconcile把EQ又开回来。
 - `low_power`：MacBook在低电量模式下吗？都低电量模式了，就别调衡了吧。
 - `idle_suspended`: 没有捕获到任何音频呢？没放音乐，engine运行着干嘛呢？
 
-`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。daemon启动时也会按恢复的`config.enabled`（并遵循低电量模式策略）先reconcile一次；如果此时启动engine失败（比如还没授予捕获权限），只记录日志而不退出，避免launchd KeepAlive反复重启。
+`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。daemon启动时用持久化的`config.enabled`初始化`user_intent`（并遵循低电量模式策略）先reconcile一次。如果开启了idle自动关闭，这次恢复是"懒"的——engine先挂起，等`follow_idle_activity`真正检测到在放音频时才启动，这样开机/重启时没在放音乐就不会白白让tap空跑一段静音；没开idle自动关闭时没有resume探测可依赖，就直接恢复启动。如果此时启动engine失败（比如还没授予捕获权限），只记录日志而不退出，避免launchd KeepAlive反复重启。
 
 > 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教generation改变时同步filter的coeffs; (b) 0dB被忽略，因此不消耗biquad; (c) 持续静音时跳过逐sample处理。
 
@@ -132,10 +133,11 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
   我在多次尝试之后设置了bright，mellow和pro三种自带的默认调教，具体特征见README。
   加载config时会先验证每个preset是否能被实时engine安全运行：数值必须有限且在范围内，preset最多64个band。无法解析或无法运行的config会被移动到`config.toml.corrupt`或带编号的同名备份，然后用内置默认值继续启动，避免launchd KeepAlive反复重启同一个坏配置。保存config时会先写同目录临时文件、fsync、再原子rename并fsync目录，以降低崩溃或断电时截断正式config的风险。
   daemon拥有实时调教和上一个被保存的调教。band/preamp编辑只改变当前正在运行的config，`off`指令会出触发对实时调教的保存与否、命名、覆盖其它已存在调教等一系列行为。切换preset（`eqtune preset`）则是"选择"而非"编辑"：它像全局开关一样立即写入已保存的config，单独切换不会触发`off`时的保存询问。按名保存只消耗当前preset的编辑（对已有preset的显式覆盖也会取代该preset的待定编辑）；留在其它preset上的未保存编辑会被带入新的工作config，仍是一个未关闭的session，由下一次`off`继续询问，绝不会被悄悄还原。`preset-clone`与其它preset管理命令一样，在session未解决时会被拒绝——它会用已保存的config重建工作config，否则会丢掉这些编辑。
-  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的临时文件+原子rename，但省略config的fsync：镜像是尽力而为的，每次实时编辑都会重写，在单线程循环里做耐久级flush毫无收益），一致后镜像会被删除；删除失败会作为错误上报，因为残留的镜像会在下次启动时复活刚刚解决掉的session。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只逐preset地信任已保存config里存在的preset的内容——合法的草稿只会修改既有preset，因此过期草稿既不能删掉刚保存的preset也不能夹带新preset；当前active preset和全局开关一律以已保存的config为准（它们都是立即提交的）。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
+  当实时调教与已保存的config不一致时，实时调教还会被镜像到旁边的`session.toml`（同样的临时文件+原子rename，但省略config的fsync：镜像是尽力而为的，在单线程循环里做耐久级flush毫无收益；写入还会限速——静默一段后的第一次编辑立刻镜像（单个孤立编辑绝不会有丢失风险），短时间窗口内的连续编辑则合并成一次、由poll循环flush，所以拖动一个控件不会每动一下就重写整个config），session一解决镜像就会被删除；删除失败会作为错误上报，因为残留的镜像会在下次启动时复活刚刚解决掉的session。daemon启动时会把遗留的镜像恢复成"未保存的草稿"，所以重启、崩溃或重装不会悄悄丢掉你还没保存的实时改动，`off`时的保存/覆盖/丢弃询问照旧。镜像里只逐preset地信任已保存config里存在的preset的内容——合法的草稿只会修改既有preset，因此过期草稿既不能删掉刚保存的preset也不能夹带新preset；当前active preset和全局开关一律以已保存的config为准（它们都是立即提交的）。无法解析或无法运行的镜像会被移到`session.toml.corrupt`后忽略。
   这样的保存方式自然也就允许调教的import和export。为了减小文件尺寸，import/export使用一个更小的单preset TOML格式（只包含`name`, `preamp_db`和`bands`）。在CLI中，import/export相对路径默认按当前工作目录解析。
 
-- **launchd** LaunchAgent plist和`RunAtLoad`, `KeepAlive`, 来保证daemon在login时开始运行。`eqtune install`把二进制可执行文件复制到稳定的位置；如果daemon已经加载，则用`launchctl kickstart -k`原地重启新binary，避免`bootout`之后立刻`bootstrap`时撞上KeepAlive job尚未完全退出的race。
+- **launchd** LaunchAgent plist配合`RunAtLoad`和`KeepAlive`，保证daemon在login时启动、挂了会被重启。`eqtune install`会把binary先暂存为同目录临时文件、在这份暂存副本上本地做ad-hoc签名、再原子rename到稳定位置，并在bootstrap或重启agent后确认launchd确实进入了running状态。已经健康加载的agent仍用`launchctl kickstart -k`原地重启；如果launchd残留了过期的启动约束、重启后的job起不来，install会退回到bootout+bootstrap。
+- **无需Developer ID签名。** 安装时对daemon副本用本地ad-hoc签名，所以不需要Apple开发者账号、证书、公证、驱动或内核扩展。`build.rs`把`Info.plist`嵌进binary，让macOS弹出正常的音频捕获授权提示。
 
 ## FAQ
 
