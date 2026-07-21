@@ -855,7 +855,11 @@ fn current_target() -> (u32, u32) {
 /// silence. Otherwise restore eagerly, honoring Low-Power-Mode suppression. The suspended
 /// flag is kept even under LPM so that when LPM clears the idle probe (not an eager
 /// LPM-restore) governs the first start.
-fn initial_engine_state(user_intent: bool, auto_off_idle: bool, lpm_suppressed: bool) -> (bool, bool) {
+fn initial_engine_state(
+    user_intent: bool,
+    auto_off_idle: bool,
+    lpm_suppressed: bool,
+) -> (bool, bool) {
     let lazy_start = user_intent && auto_off_idle;
     let engine_target_on = user_intent && !lpm_suppressed && !lazy_start;
     (engine_target_on, lazy_start)
@@ -1862,7 +1866,10 @@ mod tests {
         d.config_path = blocker.join("config.toml");
 
         assert!(d.apply(Request::ConfirmReset { backups: vec![] }).is_err());
-        assert!(d.idle_suspended, "a failed reset must not disturb the suspension");
+        assert!(
+            d.idle_suspended,
+            "a failed reset must not disturb the suspension"
+        );
 
         d.config_path = good_path;
         d.apply(Request::ConfirmReset { backups: vec![] }).unwrap();
