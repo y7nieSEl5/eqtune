@@ -717,7 +717,12 @@ impl Daemon {
     }
 
     // Every reset entry point ensures no unsaved session first, so the working config
-    // these two mutate equals the saved one.
+    // these two mutate equals the saved one. Both rewrite only preset *contents* and
+    // leave the engine-lifecycle state (idle_suspended, engine_target_on) untouched: if
+    // the engine was idle-suspended, it stays suspended and the resume probe restarts it
+    // with the reset tuning when playback returns. Clearing the suspension here without
+    // reconciling would instead strand the engine off (the resume probe only runs while
+    // suspended); reconciling would restart it just to process silence — wasteful.
     fn confirm_reset_preset(&mut self, name: &str, backups: &[PresetBackup]) -> anyhow::Result<()> {
         self.commit_config(|c| {
             apply_reset_backups(c, backups)?;
@@ -730,11 +735,7 @@ impl Daemon {
             apply_reset_backups(c, backups)?;
             reset_shipped_presets(c);
             Ok(())
-        })?;
-        // Only after the reset actually landed: a failed save must not lift the idle
-        // suspension and let the next reconcile restart the engine with nothing playing.
-        self.idle_suspended = false;
-        Ok(())
+        })
     }
 
     fn status(&self) -> Status {
@@ -1827,8 +1828,16 @@ mod tests {
     }
 
     #[test]
-    fn reset_all_save_failure_keeps_the_idle_suspension() {
-        let mut d = daemon_with(Config::default());
+    fn reset_all_leaves_an_idle_suspension_intact() {
+        // Resetting presets only rewrites saved tuning; it must not touch the engine
+        // lifecycle. An idle-suspended engine stays suspended on both the failed and the
+        // successful save — the resume probe brings it back (with the reset tuning) when
+        // playback returns, rather than the reset stranding it off or restarting it just
+        // to process silence.
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
         d.idle_suspended = true;
         let blocker = tmp_path("not-a-dir");
         std::fs::write(&blocker, b"").unwrap();
@@ -1836,13 +1845,18 @@ mod tests {
         d.config_path = blocker.join("config.toml");
 
         assert!(d.apply(Request::ConfirmReset { backups: vec![] }).is_err());
-        // A reset that did not land must not lift the idle suspension: the next
-        // reconcile would restart the engine with nothing playing.
-        assert!(d.idle_suspended);
+        assert!(d.idle_suspended, "a failed reset must not disturb the suspension");
 
         d.config_path = good_path;
         d.apply(Request::ConfirmReset { backups: vec![] }).unwrap();
-        assert!(!d.idle_suspended);
+        assert!(
+            d.idle_suspended,
+            "a successful reset leaves the suspension for the resume probe to lift"
+        );
+        assert!(
+            !d.engine_target_on,
+            "reset must not turn the engine target back on"
+        );
         let _ = std::fs::remove_file(&blocker);
     }
 
