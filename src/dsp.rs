@@ -281,7 +281,7 @@ const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
 /// ever locking the audio thread.
 ///
 /// Every field is private, so the only way to obtain a value is [`EqSettings::new`],
-/// which stamps a fresh [`generation`](Self::generation). That makes the snapshot
+/// which stamps a fresh `generation`. That makes the snapshot
 /// genuinely immutable: content and stamp cannot drift apart, so the [`Processor`]'s
 /// generation-based change detection can never miss an edit (the hazard a
 /// clone-then-mutate of public fields would otherwise open).
