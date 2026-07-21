@@ -75,8 +75,17 @@ fn service_is_running(service: &str) -> bool {
     service_state_is_running(&stdout)
 }
 
+/// Whether `launchctl print` output reports the job in the running state. Parsed
+/// leniently so it doesn't hinge on launchd's exact formatting: match the `state` key
+/// (whatever whitespace surrounds the `=`) whose value's first token is `running`, which
+/// also tolerates a trailing annotation like a pid. Multi-word states (`not running`,
+/// `spawn failed`) and other keys (`last exit state`) don't match.
 fn service_state_is_running(output: &str) -> bool {
-    output.lines().any(|line| line.trim() == "state = running")
+    output.lines().any(|line| {
+        line.split_once('=').is_some_and(|(key, value)| {
+            key.trim() == "state" && value.split_whitespace().next() == Some("running")
+        })
+    })
 }
 
 fn wait_for_service_running(service: &str) -> anyhow::Result<()> {
@@ -292,13 +301,23 @@ mod tests {
     }
 
     #[test]
-    fn service_state_parser_requires_running_state() {
+    fn service_state_parser_accepts_running_state_tolerantly() {
+        // The canonical line, plus formatting variations that must still count as running:
+        // arbitrary whitespace around `=`, and a trailing annotation on the value.
         assert!(service_state_is_running(
             "\tstate = running\n\tprogram = /x/eqtune\n"
         ));
+        assert!(service_state_is_running("state=running\n"));
+        assert!(service_state_is_running("   state   =   running   \n"));
+        assert!(service_state_is_running("\tstate = running (pid 4321)\n"));
+        // Non-running states must not match — including multi-word states and other keys
+        // that merely contain the word "running".
         assert!(!service_state_is_running(
             "\tstate = spawn failed\n\tstate = active\n"
         ));
+        assert!(!service_state_is_running("\tstate = not running\n"));
+        assert!(!service_state_is_running("\tlast exit state = running\n"));
+        assert!(!service_state_is_running("\tprogram = /usr/bin/running\n"));
     }
 
     #[test]
@@ -366,12 +385,18 @@ mod tests {
     }
 
     fn test_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-wide counter guarantees uniqueness across parallel test threads even
+        // when the clock is too coarse to distinguish two calls; the timestamp is kept only
+        // to keep any leftover directory greppable/ordered if a test fails to clean up.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "eqtune-launchd-{}-{name}-{nanos}",
+            "eqtune-launchd-{}-{name}-{nanos}-{seq}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();

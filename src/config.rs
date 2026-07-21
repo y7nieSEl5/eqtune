@@ -549,11 +549,20 @@ bands = []
     }
 
     fn unique_dir(tag: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-wide counter guarantees uniqueness across parallel test threads even
+        // when the clock is too coarse to distinguish two calls; the timestamp is kept only
+        // to keep any leftover directory greppable/ordered if a test fails to clean up.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("eqtune-cfg-{}-{unique}-{tag}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "eqtune-cfg-{}-{nanos}-{seq}-{tag}",
+            std::process::id()
+        ))
     }
 
     #[test]

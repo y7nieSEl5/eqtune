@@ -2202,12 +2202,19 @@ mod tests {
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
-        let unique = std::time::SystemTime::now()
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // A process-wide counter guarantees uniqueness across parallel test threads even
+        // when the clock is too coarse to distinguish two calls (otherwise colliding paths
+        // race each other's file ops and flake). The timestamp is kept only to keep any
+        // leftover file greppable/ordered if a test ever fails to clean up.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "eqtune-test-{}-{unique}-{name}",
+            "eqtune-test-{}-{nanos}-{seq}-{name}",
             std::process::id()
         ))
     }
