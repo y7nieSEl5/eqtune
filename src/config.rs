@@ -31,7 +31,6 @@ pub struct Config {
     #[serde(default)]
     pub enabled: bool,
     pub limiter: bool,
-    pub auto_follow_new_devices: bool,
     /// Automatically disable the EQ engine while macOS Low Power Mode is active (an
     /// explicit `eqtune on` still overrides it). Defaults on; absent in older config
     /// files, hence the serde default.
@@ -179,7 +178,6 @@ impl Default for Config {
             active_preset: "bright".to_string(),
             enabled: false,
             limiter: true,
-            auto_follow_new_devices: true,
             auto_off_low_power: true,
             auto_off_idle: true,
             presets,
@@ -501,7 +499,6 @@ mod tests {
         );
         assert!(!c.enabled);
         assert!(c.limiter);
-        assert!(c.auto_follow_new_devices);
         assert!(c.auto_off_low_power);
         assert!(c.auto_off_idle);
     }
@@ -547,7 +544,6 @@ mod tests {
         let toml = r#"
 active_preset = "bright"
 limiter = true
-auto_follow_new_devices = true
 
 [presets.bright]
 preamp_db = -8.0

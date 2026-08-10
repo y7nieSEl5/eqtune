@@ -1,12 +1,18 @@
 //! Client↔daemon control protocol over a Unix domain socket (newline-delimited JSON).
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::dsp::Band;
+
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Tuning and preset-list responses can be larger than requests, but still have a firm
+/// ceiling so a wedged or replaced daemon cannot grow the short-lived CLI without bound.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct PresetBackup {
@@ -153,21 +159,34 @@ pub fn send(req: &Request) -> anyhow::Result<Response> {
             "could not reach the eqtune daemon ({e}). Is it running? Try `eqtune install` then `eqtune on`."
         )
     })?;
+    stream.set_read_timeout(Some(CLIENT_TIMEOUT))?;
+    stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
 
     let mut line = serde_json::to_string(req)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()?;
 
-    let mut reader = BufReader::new(stream);
-    let mut resp = String::new();
-    reader.read_line(&mut resp)?;
-    Ok(serde_json::from_str(resp.trim_end())?)
+    read_response(stream)
+}
+
+fn read_response(reader: impl Read) -> anyhow::Result<Response> {
+    let mut reader = BufReader::new(reader).take((MAX_RESPONSE_BYTES + 1) as u64);
+    let mut resp = Vec::new();
+    reader.read_until(b'\n', &mut resp)?;
+    if resp.len() > MAX_RESPONSE_BYTES {
+        anyhow::bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+    }
+    if resp.is_empty() {
+        anyhow::bail!("daemon closed the connection without a response");
+    }
+    Ok(serde_json::from_slice(&resp)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn request_round_trips() {
@@ -296,5 +315,18 @@ mod tests {
             let s = serde_json::to_string(&r).unwrap();
             assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), r);
         }
+    }
+
+    #[test]
+    fn response_reader_rejects_an_oversized_line() {
+        let oversized = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+        let error = read_response(Cursor::new(oversized)).unwrap_err();
+        assert!(error.to_string().contains("response exceeds"));
+    }
+
+    #[test]
+    fn response_reader_rejects_an_empty_reply() {
+        let error = read_response(Cursor::new(Vec::<u8>::new())).unwrap_err();
+        assert!(error.to_string().contains("without a response"));
     }
 }
