@@ -17,6 +17,30 @@ static void log_err(const char *what, OSStatus st) {
 // helpers section below; the single query lives there so nothing here re-implements it.
 static AudioObjectID default_output_device(void);
 
+static bool copy_stream_format(AudioDeviceID device,
+                               AudioObjectPropertyScope scope,
+                               AudioStreamBasicDescription *format) {
+    UInt32 size = sizeof(*format);
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyStreamFormat,
+        .mScope = scope,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    return AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, format) == noErr;
+}
+
+// The Rust processor consumes one interleaved stereo Float32 buffer. Establish that
+// contract before the IOProc starts instead of reinterpreting an arbitrary hardware
+// layout as floats in the real-time callback.
+static bool supported_stereo_float_format(const AudioStreamBasicDescription *format) {
+    return format->mFormatID == kAudioFormatLinearPCM &&
+           (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
+           (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0 &&
+           format->mBitsPerChannel == 32 &&
+           format->mChannelsPerFrame == 2 &&
+           format->mBytesPerFrame == 2 * sizeof(float);
+}
+
 uint32_t eqtune_default_output_device(void) {
     return (uint32_t)default_output_device();
 }
@@ -152,14 +176,31 @@ static OSStatus io_proc(AudioObjectID inDevice,
         return noErr;
     }
 
+    // Start-up validation establishes a single interleaved stereo stream. Keep a runtime
+    // guard as well: Core Audio must never make us cast or copy an unexpected layout if a
+    // device changes its stream topology underneath the aggregate.
+    if (outOutputData->mNumberBuffers != 1 ||
+        !outOutputData->mBuffers[0].mData ||
+        outOutputData->mBuffers[0].mNumberChannels != 2) {
+        for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
+            AudioBuffer *out = &outOutputData->mBuffers[b];
+            if (out->mData) {
+                memset(out->mData, 0, out->mDataByteSize);
+            }
+        }
+        return noErr;
+    }
+
     for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
         AudioBuffer *out = &outOutputData->mBuffers[b];
         float *out_data = (float *)out->mData;
-        UInt32 channels = out->mNumberChannels ? out->mNumberChannels : 1;
+        UInt32 channels = out->mNumberChannels;
         UInt32 frames = out->mDataByteSize / sizeof(float) / channels;
 
         // Fill the output from the matching tap input buffer (system audio).
-        if (inInputData && b < inInputData->mNumberBuffers && inInputData->mBuffers[b].mData) {
+        if (inInputData && inInputData->mNumberBuffers == 1 &&
+            inInputData->mBuffers[0].mData &&
+            inInputData->mBuffers[0].mNumberChannels == channels) {
             const AudioBuffer *in = &inInputData->mBuffers[b];
             UInt32 copy = in->mDataByteSize < out->mDataByteSize ? in->mDataByteSize : out->mDataByteSize;
             memcpy(out_data, in->mData, copy);
@@ -233,7 +274,32 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
             return NULL;
         }
 
+
+        AudioStreamBasicDescription input_format = {0};
+        AudioStreamBasicDescription output_format = {0};
+        bool formats_ok = copy_stream_format(aggregate, kAudioObjectPropertyScopeInput,
+                                             &input_format) &&
+                          copy_stream_format(aggregate, kAudioObjectPropertyScopeOutput,
+                                             &output_format) &&
+                          supported_stereo_float_format(&input_format) &&
+                          supported_stereo_float_format(&output_format) &&
+                          input_format.mSampleRate == output_format.mSampleRate;
+        if (!formats_ok) {
+            fprintf(stderr,
+                    "eqtune shim: aggregate device does not expose matching interleaved "
+                    "stereo Float32 input/output streams\n");
+            AudioHardwareDestroyAggregateDevice(aggregate);
+            AudioHardwareDestroyProcessTap(tap);
+            return NULL;
+        }
+
         struct eqtune_tap_session *s = calloc(1, sizeof(struct eqtune_tap_session));
+        if (!s) {
+            fprintf(stderr, "eqtune shim: could not allocate tap session\n");
+            AudioHardwareDestroyAggregateDevice(aggregate);
+            AudioHardwareDestroyProcessTap(tap);
+            return NULL;
+        }
         s->tap = tap;
         s->aggregate = aggregate;
         s->cb = cb;

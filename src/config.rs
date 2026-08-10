@@ -360,10 +360,23 @@ impl Config {
     /// the session draft, so their validation and diagnostics cannot drift apart.
     fn parse_usable(contents: &str) -> Result<Config, String> {
         match toml::from_str::<Config>(contents) {
-            Ok(config) => match config.first_unusable_preset() {
-                Some((name, err)) => Err(format!("preset {name:?} cannot be applied ({err})")),
-                None => Ok(config),
-            },
+            Ok(config) => {
+                if config.presets.is_empty() {
+                    return Err("preset library is empty".to_string());
+                }
+                if !config.presets.contains_key(&config.active_preset) {
+                    return Err(format!(
+                        "active preset {:?} does not exist",
+                        config.active_preset
+                    ));
+                }
+                match config.first_unusable_preset() {
+                    Some((name, err)) => {
+                        Err(format!("preset {name:?} cannot be applied ({err})"))
+                    }
+                    None => Ok(config),
+                }
+            }
             Err(e) => Err(format!("invalid TOML ({e})")),
         }
     }
@@ -818,13 +831,43 @@ bands = []
         let dir = unique_dir("roundtrip");
         let path = dir.join("config.toml");
         let c = Config {
-            active_preset: "flat".to_string(),
+            active_preset: "mellow".to_string(),
             ..Config::default()
         };
         c.save_to(&path).unwrap();
         let back = Config::load_from(&path).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(c, back);
+    }
+
+    #[test]
+    fn load_from_quarantines_empty_preset_library() {
+        let dir = unique_dir("empty-library");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut c = Config::default();
+        c.presets.clear();
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_quarantines_missing_active_preset() {
+        let dir = unique_dir("missing-active");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let c = Config {
+            active_preset: "missing".to_string(),
+            ..Config::default()
+        };
+        std::fs::write(&path, toml::to_string_pretty(&c).unwrap()).unwrap();
+
+        assert_eq!(Config::load_from(&path).unwrap(), Config::default());
+        assert!(dir.join("config.toml.corrupt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
