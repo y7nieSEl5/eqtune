@@ -371,9 +371,7 @@ impl Config {
                     ));
                 }
                 match config.first_unusable_preset() {
-                    Some((name, err)) => {
-                        Err(format!("preset {name:?} cannot be applied ({err})"))
-                    }
+                    Some((name, err)) => Err(format!("preset {name:?} cannot be applied ({err})")),
                     None => Ok(config),
                 }
             }
