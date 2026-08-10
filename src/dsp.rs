@@ -337,12 +337,21 @@ impl Processor {
             self.last_generation = Some(settings.generation);
         }
 
-        // Skip the per-sample EQ on sustained silence: silent in → silent out, so once any
-        // filter ring-out has been rendered (after SILENCE_SKIP_BLOCKS) we can leave the
-        // already-correct buffer untouched and do no per-sample work.
+        // Skip the per-sample EQ on sustained silence. Before entering the skip state,
+        // reset every section: merely freezing its delay elements would preserve an old
+        // filter tail and inject it when audio resumes. Near-silent input is zeroed while
+        // skipped so bypassing the preamp/filter path cannot leak a different signal.
         if silent {
             self.silent_blocks = self.silent_blocks.saturating_add(1);
             if self.silent_blocks > SILENCE_SKIP_BLOCKS {
+                if self.silent_blocks == SILENCE_SKIP_BLOCKS + 1 {
+                    for cascade in &mut self.channels {
+                        for bq in cascade {
+                            bq.reset();
+                        }
+                    }
+                }
+                buf.fill(0.0);
                 return silent;
             }
         } else {
@@ -560,6 +569,30 @@ mod tests {
             "audio after silence must be EQ'd"
         );
         assert!(buf.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn entering_silence_skip_clears_filter_memory() {
+        let mut p = Processor::new(1);
+        let s = EqSettings::new(&[peak(20.0)], 48_000.0, 0.0, false);
+
+        // Excite a slow, low-frequency section so three zero blocks are not enough for its
+        // internal delay elements to decay naturally to exact zero.
+        let mut impulse = vec![0.0f32; 64];
+        impulse[0] = 1.0;
+        p.run(&s, &mut impulse, 1);
+        for _ in 0..=SILENCE_SKIP_BLOCKS {
+            let mut silence = vec![0.0f32; 64];
+            p.run(&s, &mut silence, 1);
+        }
+
+        assert!(
+            p.channels
+                .iter()
+                .flatten()
+                .all(|bq| bq.z1 == 0.0 && bq.z2 == 0.0),
+            "the first skipped block must clear stale filter state"
+        );
     }
 
     #[test]
