@@ -250,6 +250,18 @@ impl Daemon {
                 active: self.config.active_preset.clone(),
                 names: self.config.presets.keys().cloned().collect(),
             }),
+            Request::ShowPreset(name) => {
+                let name = name.as_deref().unwrap_or(&self.config.active_preset);
+                let Some(preset) = self.config.presets.get(name) else {
+                    return Ok(Response::Error(format!("no such preset: {name}")));
+                };
+                Ok(Response::Tuning(Tuning {
+                    enabled: self.engine.is_some(),
+                    preset: name.to_string(),
+                    preamp_db: preset.preamp_db,
+                    bands: preset.bands.clone(),
+                }))
+            }
             Request::SetPreset(name) => {
                 if !self.config.presets.contains_key(&name) {
                     return Ok(Response::Error(format!("no such preset: {name}")));
@@ -1123,6 +1135,45 @@ fn validate_preset_name(name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preset_show_reads_without_switching_or_persisting() {
+        let mut d = daemon_with(Config::default());
+        let before = d.config.clone();
+        let response = d.apply(Request::ShowPreset(Some("mellow".into()))).unwrap();
+
+        let Response::Tuning(tuning) = response else {
+            panic!("expected tuning response");
+        };
+        assert_eq!(tuning.preset, "mellow");
+        assert_eq!(tuning.preamp_db, before.presets["mellow"].preamp_db);
+        assert_eq!(tuning.bands, before.presets["mellow"].bands);
+        assert_eq!(d.config, before);
+        assert_eq!(d.saved_config, before);
+    }
+
+    #[test]
+    fn preset_show_without_a_name_uses_the_active_working_tuning() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        let Response::Tuning(tuning) = d.apply(Request::ShowPreset(None)).unwrap() else {
+            panic!("expected tuning response");
+        };
+        assert_eq!(tuning.preset, "bright");
+        assert_eq!(tuning.preamp_db, -3.0);
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -8.0);
+    }
+
+    #[test]
+    fn preset_show_rejects_an_unknown_name() {
+        let mut d = daemon_with(Config::default());
+        assert_eq!(
+            d.apply(Request::ShowPreset(Some("missing".into())))
+                .unwrap(),
+            Response::Error("no such preset: missing".into())
+        );
+    }
 
     #[test]
     fn preset_clone_copies_source_contents_and_selects_it() {

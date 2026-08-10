@@ -27,6 +27,9 @@ enum Command {
     /// List available presets (active one marked with *).
     #[command(visible_alias = "ls")]
     Presets,
+    /// Show the active preset's curve, or another preset by name.
+    #[command(name = "preset-show")]
+    PresetShow { name: Option<String> },
     /// Switch the active preset.
     #[command(visible_alias = "p")]
     Preset { name: String },
@@ -144,6 +147,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         Command::Off => Request::Disable,
         Command::Status => Request::Status,
         Command::Presets => Request::ListPresets,
+        Command::PresetShow { name } => Request::ShowPreset(name.clone()),
         Command::Preset { name } => Request::SetPreset(name.clone()),
         Command::PresetSave { name } => Request::SavePreset { name: name.clone() },
         Command::PresetClone { source, dest } => Request::ClonePreset {
@@ -190,6 +194,10 @@ fn print_response(cmd: &Command, resp: &Response) {
         Response::Tuning(t) => {
             // A one-line echo of what just changed, then the full resulting curve.
             let changed = match cmd {
+                Command::PresetShow { .. } => {
+                    print_preset(t);
+                    return;
+                }
                 Command::On => {
                     println!("eqtune on");
                     None
@@ -561,6 +569,16 @@ fn send_confirm_reset(cmd: &Command, backups: Vec<PresetBackup>) -> anyhow::Resu
 fn print_curve(t: &Tuning, changed: Option<f32>) {
     let state = if t.enabled { "enabled" } else { "disabled" };
     println!("{} ({state}) · preamp {}", t.preset, fmt_gain(t.preamp_db));
+    print_bands(t, changed);
+}
+
+/// Print a preset without implying that a named, inactive preset is currently applied.
+fn print_preset(t: &Tuning) {
+    println!("{} · preamp {}", t.preset, fmt_gain(t.preamp_db));
+    print_bands(t, None);
+}
+
+fn print_bands(t: &Tuning, changed: Option<f32>) {
     if t.bands.is_empty() {
         println!("  (no bands — flat)");
         return;
@@ -687,5 +705,17 @@ mod tests {
     #[test]
     fn preset_rm_requires_at_least_one_name() {
         assert!(Cli::try_parse_from(["eqtune", "preset-rm"]).is_err());
+    }
+
+    #[test]
+    fn preset_show_accepts_an_optional_name() {
+        let cli = Cli::try_parse_from(["eqtune", "preset-show"]).unwrap();
+        assert!(matches!(cli.command, Command::PresetShow { name: None }));
+
+        let cli = Cli::try_parse_from(["eqtune", "preset-show", "mellow"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::PresetShow { name: Some(name) } if name == "mellow"
+        ));
     }
 }

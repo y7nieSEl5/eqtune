@@ -40,6 +40,7 @@ On the first `eqtune on`, macOS asks for audio-capture permission.
 ```
 eqtune on | off | status              # start / stop / inspect
 eqtune presets | preset <name>        # list / switch preset (short: ls / p <name>)
+eqtune preset-show [name]             # show active or named preset without switching
 eqtune preset-save <name>             # save active tuning as a preset
 eqtune preset-clone <src> <name>      # clone a preset and switch to the clone
 eqtune preset-rename <old> <new>      # rename a preset
@@ -82,7 +83,9 @@ eqtune install | uninstall            # manage the launchd daemon
 | `mellow` | warmer |
 | `pro` | crisp and detailed |
 
-Switch with `eqtune preset <name>` (or just `eqtune p <name>`), then fine-tune live with `eqtune band` / `eqtune preamp`.
+Inspect the active curve with `eqtune preset-show`, or any preset without switching to it
+with `eqtune preset-show <name>`. Switch with `eqtune preset <name>` (or just `eqtune p
+<name>`), then fine-tune live with `eqtune band` / `eqtune preamp`.
 You can temporarily tune any preset, including `bright`, `mellow`, and `pro`; when you
 turn eqtune off, choose whether to save the result as a new preset, overwrite that preset
 name on your device, or discard it. When saving by name, entering `bright`, `mellow`, or

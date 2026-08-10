@@ -21,6 +21,7 @@ pub enum Request {
     Enable,
     Disable,
     ListPresets,
+    ShowPreset(Option<String>),
     SetPreset(String),
     SavePreset {
         name: String,
@@ -175,6 +176,8 @@ mod tests {
             Request::Disable,
             Request::Reset,
             Request::ListPresets,
+            Request::ShowPreset(None),
+            Request::ShowPreset(Some("mellow".into())),
             Request::SetPreset("flat".into()),
             Request::SavePreset { name: "car".into() },
             Request::ClonePreset {

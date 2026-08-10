@@ -83,7 +83,8 @@ and **all** the macOS-specific, unsafe, can't-fail-gracefully code is concentrat
 `src/ipc.rs` defines the entire protocol as two Rust enums:
 
 ```rust
-enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
+enum Request  { Status, Enable, Disable, ListPresets, ShowPreset(Option<String>),
+                SetPreset(String),
                 SavePreset { name }, ClonePreset { source, dest },
                 DeletePresets { names }, RenamePreset { from, to },
                 ExportPreset { name, path }, ImportPreset { path, name },
@@ -299,6 +300,8 @@ for "media is streaming" rather than a per-app media-session API.
   `bands`) for sharing settings without copying the whole config file. The CLI resolves
   relative import/export paths against the user's current directory before sending the
   request to the daemon; omitted export paths default to `<preset>.toml` in that directory.
+  `preset-show [name]` reads the active or named preset from the working config without
+  switching presets or writing anything, so it also reflects any live unsaved edits.
 
 - **launchd** (`src/launchd.rs`) writes a LaunchAgent plist with `RunAtLoad` + `KeepAlive`
   so the daemon starts at login and is restarted if it dies. `eqtune install` stages the

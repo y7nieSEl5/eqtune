@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `eqtune preset-show [name]` prints the active or named preset's preamp and bands
+  without switching presets or changing configuration.
+
 ## [0.4.0] - 2026-07-21
 
 ### Added
@@ -71,7 +78,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 ### Waiting to be implemented
 
 - `eqtune limiter on|off` to toggle the existing limiter setting from the CLI.
-- `eqtune curve` / `eqtune preset-show [name]` to print EQ bands without changing state.
 - CLI support for low-shelf and high-shelf bands, not just peaking filters.
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
 - `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
