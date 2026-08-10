@@ -6,6 +6,25 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Planned
+
+- CLI support for low-shelf and high-shelf bands, not just peaking filters.
+- A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
+- `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
+- `eqtune response` to print a frequency-response table using the existing DSP math.
+- Per-output-device preset assignment for automatically selecting speaker, headphone, or
+  DAC tuning.
+- Machine-readable response export (CSV/JSON), dry/wet control, and click-free active
+  bypass for measurement and A/B workflows.
+- Limiter threshold/headroom controls, preset metadata and schema versioning, and
+  non-interactive save/reset options for scripts.
+- Structured engine diagnostics including capture permission, stream format, channel
+  layout, suspension reason, and the last engine error.
+- Offline DSP benchmarks and callback timing telemetry, followed by event-driven Core
+  Audio listeners to replace fixed-rate device and power-state polling where practical.
+
+## [0.5.0] - 2026-08-10
+
 ### Added
 
 - `eqtune preset-show [name]` prints the active or named preset's preamp and bands
@@ -103,23 +122,6 @@ This project follows [Semantic Versioning](https://semver.org/).
   behind that read as phantom unsaved tuning. A failed `reset` also no longer lifts an
   idle suspension.
 
-### Waiting to be implemented
-
-- CLI support for low-shelf and high-shelf bands, not just peaking filters.
-- A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
-- `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
-- `eqtune response` to print a frequency-response table using the existing DSP math.
-- Per-output-device preset assignment for automatically selecting speaker, headphone, or
-  DAC tuning.
-- Machine-readable response export (CSV/JSON), dry/wet control, and click-free active
-  bypass for measurement and A/B workflows.
-- Limiter threshold/headroom controls, preset metadata and schema versioning, and
-  non-interactive save/reset options for scripts.
-- Structured engine diagnostics including capture permission, stream format, channel
-  layout, suspension reason, and the last engine error.
-- Offline DSP benchmarks and callback timing telemetry, followed by event-driven Core
-  Audio listeners to replace fixed-rate device and power-state polling where practical.
-
 ## [0.3.1] - 2026-07-06
 
 ### Fixed
@@ -184,3 +186,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 - `eqtune on` now explicitly overrides Low Power Mode when requested, so the EQ can keep running even while battery-saving mode is active.
 - The EQ engine is lighter in steady state: filter coefficients are only rebuilt when the EQ changes, 0 dB bands are dropped from the live processing chain, and silence is skipped.
 - `eqtune on` and edit commands continue to print the resulting curve, and edits still apply live while persisting to the user config file.
+
+[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.0

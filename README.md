@@ -1,5 +1,10 @@
 # eqtune
 
+[![Crates.io](https://img.shields.io/crates/v/eqtune.svg)](https://crates.io/crates/eqtune)
+[![docs.rs](https://docs.rs/eqtune/badge.svg)](https://docs.rs/eqtune)
+[![CI](https://github.com/y7nieSEl5/eqtune/actions/workflows/ci.yml/badge.svg)](https://github.com/y7nieSEl5/eqtune/actions/workflows/ci.yml)
+[![License](https://img.shields.io/crates/l/eqtune.svg)](LICENSE-MIT)
+
 A lightweight, system-wide audio equalizer for macOS.
 
 ## Why
@@ -14,12 +19,17 @@ eqtune taps the system audio mix with Apple's modern **Core Audio process-tap AP
 - Xcode Command Line Tools — `xcode-select --install` (clang + CoreAudio)
 - Rust — https://rustup.rs
 
+eqtune currently processes matching interleaved stereo Float32 aggregate streams. If an
+output device exposes an unsupported layout, eqtune refuses to start the tap and records
+the reason in `~/Library/Application Support/eqtune/daemon.log` instead of risking
+corrupted audio.
+
 ## Install
 
 From crates.io:
 
 ```sh
-cargo install eqtune
+cargo install --locked eqtune
 eqtune install
 eqtune on
 ```
@@ -34,6 +44,16 @@ eqtune on
 
 On the first `eqtune on`, macOS asks for audio-capture permission.
 (Rebuilding changes the binary's ad-hoc signature, so macOS may re-ask. That's expected.)
+
+To upgrade, install the new crate and refresh the managed daemon copy:
+
+```sh
+cargo install --locked eqtune --force
+eqtune install
+```
+
+[GitHub Releases](https://github.com/y7nieSEl5/eqtune/releases) contains versioned source
+archives and release notes. The supported installable distribution is the crates.io package.
 
 ## Usage
 
