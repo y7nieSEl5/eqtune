@@ -206,7 +206,9 @@ atomic-swap pattern means a live EQ edit is just "allocate a new `EqSettings`, s
 pointer," and the next audio block picks it up cleanly. The processor also reserves
 capacity for `MAX_BANDS` (64) per channel when it is created, and every mutation/import/load
 path enforces that cap, so adopting a larger preset resizes within existing capacity
-instead of allocating on the audio thread.
+instead of allocating on the audio thread. Snapshots also retain each coefficient's source
+band metadata. When an edit, insertion, or removal changes the band occupying a cascade
+slot, that section's delay state is reset rather than being inherited by an unrelated band.
 
 `src/sys.rs` wires this up: `process_trampoline` is the `extern "C"` function the shim
 calls. It loads the current settings and runs the processor over the buffer. The
@@ -274,7 +276,9 @@ attacks this on two fronts:
 - **Make each block cheaper.** The real-time `Processor` (a) re-copies filter coefficients
   only when the settings generation changes (steady-state blocks do zero coefficient
   work), (b) drops 0 dB "identity" bands at design time so they cost no biquad, and (c)
-  skips per-sample processing entirely during sustained silence.
+  skips per-sample processing entirely during sustained silence. Entering that skip state
+  clears the biquad delay memory first, so a suspended filter tail cannot reappear when
+  playback resumes.
 
 Idle suspension uses captured silence while running and Core Audio output-device activity
 while suspended. That keeps the implementation small, but it is still a practical proxy

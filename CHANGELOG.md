@@ -15,6 +15,30 @@ This project follows [Semantic Versioning](https://semver.org/).
 - `eqtune completions bash|zsh|fish` generates shell completion scripts directly from
   the CLI definition without contacting the daemon.
 
+### Changed
+
+- The obsolete `auto_follow_new_devices` config field has been removed. Output-device
+  following remains always on; older configs containing the unused key continue to load,
+  and the key disappears on the next config save.
+- The build now renders the embedded Info.plist from a template using the Cargo package
+  version, so macOS metadata cannot drift behind the released binary version.
+
+### Fixed
+
+- Sustained-silence processing now clears biquad delay memory before skipping DSP work,
+  preventing an old low-frequency or high-Q filter tail from reappearing when playback
+  resumes.
+- Live band insertions, removals, and edits no longer let a band inherit filter state from
+  a different band that previously occupied the same cascade index.
+- The Core Audio shim validates matching interleaved stereo Float32 input/output formats
+  before starting and safely rejects an unexpected runtime buffer topology instead of
+  reinterpreting arbitrary device buffers as floats.
+- Config loading now rejects and preserves configs with an empty preset library or a
+  missing active preset instead of accepting a state that normal tuning commands cannot use.
+- CLI control connections now use read/write deadlines, cap daemon replies at 1 MiB, and
+  report an empty reply, preventing a stuck or invalid daemon from hanging or growing the
+  client without bound.
+
 ## [0.4.0] - 2026-07-21
 
 ### Added
@@ -85,6 +109,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
 - `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
 - `eqtune response` to print a frequency-response table using the existing DSP math.
+- Per-output-device preset assignment for automatically selecting speaker, headphone, or
+  DAC tuning.
+- Machine-readable response export (CSV/JSON), dry/wet control, and click-free active
+  bypass for measurement and A/B workflows.
+- Limiter threshold/headroom controls, preset metadata and schema versioning, and
+  non-interactive save/reset options for scripts.
+- Structured engine diagnostics including capture permission, stream format, channel
+  layout, suspension reason, and the last engine error.
+- Offline DSP benchmarks and callback timing telemetry, followed by event-driven Core
+  Audio listeners to replace fixed-rate device and power-state polling where practical.
 
 ## [0.3.1] - 2026-07-06
 

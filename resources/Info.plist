@@ -7,7 +7,7 @@
     <key>CFBundleName</key>
     <string>eqtune</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>@EQTUNE_VERSION@</string>
     <key>NSAudioCaptureUsageDescription</key>
     <string>eqtune captures system audio so it can apply your equalizer and play it back to your speakers or headphones.</string>
     <key>NSMicrophoneUsageDescription</key>
