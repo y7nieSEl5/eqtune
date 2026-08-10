@@ -368,40 +368,6 @@ impl Processor {
     }
 }
 
-/// A legacy 9-band, graphic-EQ-style tuning used by DSP tests and low-level examples:
-/// a broad ~-5 dB low/low-mid cut, a scoop through 1-2 kHz to tame harsh mids, a small
-/// lift of air up top, with +7 dB make-up gain ([`DEFAULT_PREAMP_DB`]).
-///
-/// This is not the shipped preset library; user-facing defaults live in `Config::default`.
-///
-/// Modeled as peaking filters at ~octave Q (the conventional graphic-EQ shape); pure
-/// data, tunable live via `eqtune band`.
-pub fn default_bands() -> Vec<Band> {
-    const Q: f32 = 1.41;
-    [
-        (32.0, -5.0),
-        (64.0, -5.0),
-        (125.0, -5.0),
-        (500.0, -5.0),
-        (1_000.0, -10.0),
-        (2_000.0, -15.0),
-        (4_000.0, -4.0),
-        (8_000.0, 2.0),
-        (16_000.0, 0.0),
-    ]
-    .into_iter()
-    .map(|(freq, gain_db)| Band {
-        kind: BandKind::Peaking,
-        freq,
-        gain_db,
-        q: Q,
-    })
-    .collect()
-}
-
-/// Default make-up gain that pairs with [`default_bands`].
-pub const DEFAULT_PREAMP_DB: f32 = 7.0;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,9 +443,9 @@ mod tests {
     #[test]
     fn processor_applies_and_handles_band_count_change() {
         let mut p = Processor::new(2);
-        let s9 = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let s2 = EqSettings::new(&[peak(500.0), peak(2_000.0)], 48_000.0, 3.0, true);
         let mut buf = vec![0.3f32; 512 * 2];
-        p.run(&s9, &mut buf, 2);
+        p.run(&s2, &mut buf, 2);
         assert!(buf.iter().all(|x| x.is_finite() && x.abs() <= 1.0));
         // Shrink to one band — the cascade must resize without panicking. Every
         // constructed snapshot carries a distinct generation, so the audio thread picks
@@ -574,7 +540,7 @@ mod tests {
     #[test]
     fn sustained_silence_skips_then_resumes() {
         let mut p = Processor::new(2);
-        let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let s = EqSettings::new(&[peak(1_000.0)], 48_000.0, 3.0, true);
 
         // Past the skip threshold: silence stays silent (and the skip path is exercised).
         for _ in 0..(SILENCE_SKIP_BLOCKS + 5) {
@@ -601,7 +567,7 @@ mod tests {
         // The audio callback drives idle detection off this return value, so it must
         // reflect the block's input regardless of how the block is processed.
         let mut p = Processor::new(2);
-        let s = EqSettings::new(&default_bands(), 48_000.0, DEFAULT_PREAMP_DB, true);
+        let s = EqSettings::new(&[peak(1_000.0)], 48_000.0, 3.0, true);
         let mut quiet = vec![0.0f32; 256 * 2];
         assert!(
             p.run(&s, &mut quiet, 2),
