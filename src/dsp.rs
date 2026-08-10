@@ -207,6 +207,10 @@ const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
 /// clone-then-mutate of public fields would otherwise open).
 #[derive(Clone, Debug)]
 pub struct EqSettings {
+    /// The source band for each coefficient, in the same order. The processor uses this
+    /// metadata to distinguish an unchanged section from a different band that moved into
+    /// the same vector slot after an insertion, removal, or edit.
+    bands: Vec<Band>,
     coeffs: Vec<Coeffs>,
     preamp: f32,
     limiter: bool,
@@ -230,11 +234,12 @@ impl EqSettings {
     /// 0 dB are skipped: they are mathematically identity, so omitting them saves a
     /// biquad per sample with no audible change.
     pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
-        let coeffs: Vec<Coeffs> = bands
+        let bands: Vec<Band> = bands
             .iter()
             .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
-            .map(|b| Coeffs::design(b, fs))
+            .copied()
             .collect();
+        let coeffs: Vec<Coeffs> = bands.iter().map(|b| Coeffs::design(b, fs)).collect();
         // The real-time [`Processor`] reserves `MAX_BANDS` capacity per cascade and resizes
         // to `coeffs.len()` each block without reallocating — which holds only while a
         // snapshot never carries more than `MAX_BANDS` sections. The mutation edges
@@ -248,6 +253,7 @@ impl EqSettings {
             coeffs.len()
         );
         Self {
+            bands,
             coeffs,
             preamp: db_to_lin(preamp_db),
             limiter,
@@ -284,6 +290,9 @@ fn block_is_silent(buf: &[f32]) -> bool {
 /// of the same band count, so live edits don't click) and processes in place.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
+    /// Band metadata corresponding to the current cascade slots. Capacity is reserved on
+    /// construction so updating it on the audio thread cannot allocate.
+    band_layout: Vec<Band>,
     /// Generation of the [`EqSettings`] last synced into the cascades, or `None` before the
     /// first block. Every constructed snapshot carries a unique generation, so "did it
     /// change?" is a value comparison — immune to an `Arc` being freed and its heap address
@@ -303,6 +312,7 @@ impl Processor {
             channels: (0..channels)
                 .map(|_| Vec::with_capacity(MAX_BANDS))
                 .collect(),
+            band_layout: Vec::with_capacity(MAX_BANDS),
             last_generation: None,
             silent_blocks: 0,
         }
@@ -326,14 +336,31 @@ impl Processor {
             // was constructed with that capacity reserved, so this resize stays within
             // capacity and does not allocate on the audio thread.
             let n = settings.coeffs.len();
+            let old_n = self.band_layout.len();
             for cascade in self.channels.iter_mut() {
                 if cascade.len() != n {
                     cascade.resize(n, Biquad::new(Coeffs::identity()));
                 }
-                for (bq, c) in cascade.iter_mut().zip(settings.coeffs.iter()) {
+                for (index, (bq, c)) in cascade.iter_mut().zip(settings.coeffs.iter()).enumerate() {
+                    // Filter delay memory is meaningful only for the exact band that
+                    // produced it. Reset if an insertion/removal shifted another band into
+                    // this slot, or if frequency/gain/Q/kind changed in place.
+                    if index >= old_n || self.band_layout[index] != settings.bands[index] {
+                        bq.reset();
+                    }
                     bq.set_coeffs(*c);
                 }
             }
+            self.band_layout.resize(
+                n,
+                Band {
+                    kind: BandKind::Peaking,
+                    freq: 20.0,
+                    gain_db: 0.0,
+                    q: 1.0,
+                },
+            );
+            self.band_layout.copy_from_slice(&settings.bands);
             self.last_generation = Some(settings.generation);
         }
 
@@ -522,6 +549,7 @@ mod tests {
     fn processor_reserves_capacity_so_run_never_reallocates() {
         let mut p = Processor::new(2);
         let cap_before: Vec<usize> = p.channels.iter().map(|c| c.capacity()).collect();
+        let layout_cap_before = p.band_layout.capacity();
         assert!(
             cap_before.iter().all(|&c| c >= MAX_BANDS),
             "each cascade must reserve MAX_BANDS up front"
@@ -544,6 +572,30 @@ mod tests {
             cap_before, cap_after,
             "syncing coefficients must not reallocate the audio-thread cascades"
         );
+        assert_eq!(layout_cap_before, p.band_layout.capacity());
+    }
+
+    #[test]
+    fn changed_or_shifted_bands_do_not_inherit_filter_memory() {
+        let mut p = Processor::new(1);
+        let original = EqSettings::new(&[peak(1_000.0), peak(5_000.0)], 48_000.0, 0.0, false);
+        let mut impulse = vec![0.0f32; 32];
+        impulse[0] = 1.0;
+        p.run(&original, &mut impulse, 1);
+        assert!(p.channels[0].iter().any(|bq| bq.z1 != 0.0 || bq.z2 != 0.0));
+
+        // Inserting ahead of both existing sections changes every vector position. A zero
+        // block after the update must remain exactly zero rather than emitting state that
+        // belonged to the old occupants of those positions.
+        let inserted = EqSettings::new(
+            &[peak(200.0), peak(1_000.0), peak(5_000.0)],
+            48_000.0,
+            0.0,
+            false,
+        );
+        let mut silence = vec![0.0f32; 32];
+        p.run(&inserted, &mut silence, 1);
+        assert!(silence.iter().all(|sample| *sample == 0.0));
     }
 
     #[test]
