@@ -12,6 +12,8 @@ This project follows [Semantic Versioning](https://semver.org/).
   without switching presets or changing configuration.
 - `eqtune limiter on|off` now toggles the global soft limiter from the CLI, persists the
   setting immediately, and applies it live without creating an unsaved tuning session.
+- `eqtune completions bash|zsh|fish` generates shell completion scripts directly from
+  the CLI definition without contacting the daemon.
 
 ## [0.4.0] - 2026-07-21
 
@@ -83,7 +85,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 - A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
 - `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
 - `eqtune response` to print a frequency-response table using the existing DSP math.
-- Shell completion generation for zsh, bash, and fish.
 
 ## [0.3.1] - 2026-07-06
 

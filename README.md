@@ -54,6 +54,7 @@ eqtune limiter on | off               # toggle the soft limiter (default on)
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune idle on | off                  # auto-off while no media is active (default on)
 eqtune reset [preset]                 # restore all shipped presets, or one preset
+eqtune completions bash|zsh|fish      # print a shell completion script
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
@@ -75,6 +76,37 @@ eqtune install | uninstall            # manage the launchd daemon
   playback starts again. It also auto-disables while macOS Low Power Mode is on and
   resumes when it turns off. An explicit `eqtune on` overrides Low Power Mode; turn
   these behaviours off with `eqtune idle off` or `eqtune lowpower off`.
+
+### Shell completion
+
+After installing eqtune, add the block for your shell to its startup file. These forms
+generate completions from the installed binary at shell startup, so they automatically
+pick up new commands after an eqtune upgrade.
+
+```sh
+# zsh (~/.zshrc)
+autoload -Uz compinit
+compinit
+source <(eqtune completions zsh)
+
+# bash (~/.bashrc)
+source <(eqtune completions bash)
+
+# fish (~/.config/fish/config.fish)
+eqtune completions fish | source
+```
+
+Zsh's `source` line must run after `compinit`, which defines the `compdef` function used
+by the generated script. Frameworks such as Oh My Zsh commonly initialize `compinit`
+themselves; in that case, omit the two initialization lines above and put only the
+`source <(...)` line after the framework setup. Reload the startup file (for example,
+`source ~/.zshrc`) or open a new terminal, then type `eqtune ` and press Tab.
+
+Bash needs no separate initialization or `bash-completion` package for this generated
+script; it uses Bash's built-in programmable-completion commands. Fish completion is
+enabled natively, so sourcing the generated Fish script is also sufficient. In every
+case, `eqtune` must already be installed and available on `PATH` when the startup file
+runs.
 
 ## Presets
 

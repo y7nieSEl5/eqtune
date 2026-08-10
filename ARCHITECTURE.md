@@ -40,8 +40,10 @@ plus a thin native shim:
 
 The same executable becomes the **client** or the **daemon** depending on the
 subcommand: `eqtune daemon` (hidden, launched by launchd) runs the long-lived process;
-every other command (`on`, `off`, `band`, `preset`, …) is a thin client that opens the
-socket, sends **one** request, prints the reply, and exits.
+control commands (`on`, `off`, `band`, `preset`, …) are thin clients that open the
+socket, send **one** request, print the reply, and exit. `completions` is local-only: it
+generates a bash, zsh, or fish completion script from the clap command definition and
+never contacts the daemon.
 
 ### Two planes
 

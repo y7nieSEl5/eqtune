@@ -4,7 +4,8 @@
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::aot::{Bash, Fish, Zsh, generate};
 
 use eqtune::daemon::Daemon;
 use eqtune::ipc::{self, PresetBackup, Request, Response, Tuning};
@@ -83,6 +84,8 @@ enum Command {
     Install,
     /// Stop and remove the LaunchAgent.
     Uninstall,
+    /// Generate a shell completion script on stdout.
+    Completions { shell: CompletionShell },
 }
 
 /// An on/off argument for toggle subcommands (parsed as `on` / `off`).
@@ -90,6 +93,14 @@ enum Command {
 enum Toggle {
     On,
     Off,
+}
+
+/// Shells supported by the static completion generator.
+#[derive(Clone, Copy, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -113,6 +124,10 @@ fn main() -> anyhow::Result<()> {
             eqtune::launchd::uninstall()?;
             println!("eqtune daemon removed. (Config kept; delete");
             println!("~/Library/Application Support/eqtune to remove everything.)");
+            Ok(())
+        }
+        Command::Completions { shell } => {
+            write_completions(shell, &mut io::stdout());
             Ok(())
         }
         client_cmd => {
@@ -183,7 +198,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
         Command::Reset { name: Some(name) } => Request::ResetPreset { name: name.clone() },
         Command::Reset { name: None } => Request::Reset,
-        Command::Daemon | Command::Install | Command::Uninstall => {
+        Command::Daemon | Command::Install | Command::Uninstall | Command::Completions { .. } => {
             unreachable!("handled above")
         }
     })
@@ -662,6 +677,15 @@ fn absolute_path(path: &PathBuf) -> anyhow::Result<PathBuf> {
     }
 }
 
+fn write_completions(shell: CompletionShell, out: &mut dyn Write) {
+    let mut cmd = Cli::command();
+    match shell {
+        CompletionShell::Bash => generate(Bash, &mut cmd, "eqtune", out),
+        CompletionShell::Zsh => generate(Zsh, &mut cmd, "eqtune", out),
+        CompletionShell::Fish => generate(Fish, &mut cmd, "eqtune", out),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,5 +762,23 @@ mod tests {
             assert!(Cli::try_parse_from(["eqtune", "limiter", state]).is_ok());
         }
         assert!(Cli::try_parse_from(["eqtune", "limiter", "maybe"]).is_err());
+    }
+
+    #[test]
+    fn completions_support_bash_zsh_and_fish() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let mut script = Vec::new();
+            write_completions(shell, &mut script);
+            let script = String::from_utf8(script).unwrap();
+            assert!(script.contains("eqtune"));
+            assert!(script.contains("preset-show"));
+            assert!(script.contains("limiter"));
+        }
+
+        assert!(Cli::try_parse_from(["eqtune", "completions", "powershell"]).is_err());
     }
 }
