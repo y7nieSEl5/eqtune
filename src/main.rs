@@ -68,6 +68,8 @@ enum Command {
     /// Set the preamp make-up gain, in dB.
     #[command(allow_negative_numbers = true)]
     Preamp { db: f32 },
+    /// Toggle the soft limiter (on/off).
+    Limiter { state: Toggle },
     /// Toggle auto-off while macOS Low Power Mode is active (on/off).
     Lowpower { state: Toggle },
     /// Toggle auto-off while no media is active (on/off).
@@ -176,6 +178,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         },
         Command::BandRm { freq } => Request::RemoveBand { freq: *freq },
         Command::Preamp { db } => Request::SetPreamp(*db),
+        Command::Limiter { state } => Request::SetLimiter(matches!(state, Toggle::On)),
         Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
         Command::Reset { name: Some(name) } => Request::ResetPreset { name: name.clone() },
@@ -258,6 +261,16 @@ fn print_response(cmd: &Command, resp: &Response) {
         }
         Response::Ok => match cmd {
             Command::Off => println!("eqtune off — native Apple audio restored"),
+            Command::Limiter { state } => {
+                println!(
+                    "limiter: {}",
+                    if matches!(state, Toggle::On) {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            }
             Command::Lowpower { state } => {
                 println!(
                     "auto-off in Low Power Mode: {}",
@@ -717,5 +730,13 @@ mod tests {
             cli.command,
             Command::PresetShow { name: Some(name) } if name == "mellow"
         ));
+    }
+
+    #[test]
+    fn limiter_accepts_only_on_or_off() {
+        for state in ["on", "off"] {
+            assert!(Cli::try_parse_from(["eqtune", "limiter", state]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["eqtune", "limiter", "maybe"]).is_err());
     }
 }

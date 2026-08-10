@@ -89,7 +89,8 @@ enum Request  { Status, Enable, Disable, ListPresets, ShowPreset(Option<String>)
                 DeletePresets { names }, RenamePreset { from, to },
                 ExportPreset { name, path }, ImportPreset { path, name },
                 SetBand { freq, gain_db, q }, RemoveBand { freq },
-                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
+                SetPreamp(f32), SetLimiter(bool),
+                SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
                 SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
@@ -110,8 +111,9 @@ requests are prevalidated before mutation, so missing/duplicate names or attempt
 delete every preset leave the config unchanged. Reset requests return
 `ResetWouldOverwrite` when modified shipped presets would be replaced; the CLI can then
 send a confirm request with optional backup preset names. Export writes a single-preset
-TOML file and replies `Ok`. `SetAutoOffLowPower` and `SetAutoOffIdle` reply `Ok` and the
-client renders the confirmation.
+TOML file and replies `Ok`. `SetLimiter`, `SetAutoOffLowPower`, and `SetAutoOffIdle`
+reply `Ok` and the client renders the confirmation. The limiter toggle is persisted as a
+global setting and pushed to a running engine immediately; it is not a preset edit.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in

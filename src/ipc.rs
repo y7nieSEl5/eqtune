@@ -54,6 +54,7 @@ pub enum Request {
         freq: f32,
     },
     SetPreamp(f32),
+    SetLimiter(bool),
     SetAutoOffLowPower(bool),
     SetAutoOffIdle(bool),
     SaveSessionAs {
@@ -206,6 +207,7 @@ mod tests {
             },
             Request::RemoveBand { freq: 2000.0 },
             Request::SetPreamp(7.0),
+            Request::SetLimiter(false),
             Request::SetAutoOffLowPower(false),
             Request::SetAutoOffIdle(false),
             Request::SaveSessionAs {

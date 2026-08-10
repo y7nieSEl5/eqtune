@@ -345,6 +345,11 @@ impl Daemon {
                 self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
+            Request::SetLimiter(on) => {
+                self.commit_setting(|c| c.limiter = on)?;
+                self.apply_current_settings()?;
+                Ok(Response::Ok)
+            }
             Request::SetAutoOffLowPower(on) => {
                 self.commit_setting(|c| c.auto_off_low_power = on)?;
                 if on && self.low_power {
@@ -1173,6 +1178,42 @@ mod tests {
                 .unwrap(),
             Response::Error("no such preset: missing".into())
         );
+    }
+
+    #[test]
+    fn limiter_toggle_persists_without_committing_tuning_edits() {
+        let mut d = daemon_with(Config::default());
+        d.apply(Request::SetPreamp(-3.0)).unwrap();
+
+        d.apply(Request::SetLimiter(false)).unwrap();
+
+        assert!(!d.config.limiter);
+        assert!(!d.saved_config.limiter);
+        assert!(d.has_unsaved_session());
+        assert_eq!(d.config.presets["bright"].preamp_db, -3.0);
+        assert_eq!(d.saved_config.presets["bright"].preamp_db, -8.0);
+        let on_disk = Config::load_from(&d.config_path).unwrap();
+        assert!(!on_disk.limiter);
+        assert_eq!(on_disk.presets["bright"].preamp_db, -8.0);
+    }
+
+    #[test]
+    fn limiter_save_failure_leaves_state_untouched_and_retryable() {
+        let mut d = daemon_with(Config::default());
+        let blocker = tmp_path("limiter-not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let good_path = d.config_path.clone();
+        d.config_path = blocker.join("config.toml");
+
+        assert!(d.apply(Request::SetLimiter(false)).is_err());
+        assert!(d.config.limiter);
+        assert!(d.saved_config.limiter);
+
+        d.config_path = good_path;
+        d.apply(Request::SetLimiter(false)).unwrap();
+        assert!(!d.config.limiter);
+        assert!(!Config::load_from(&d.config_path).unwrap().limiter);
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]

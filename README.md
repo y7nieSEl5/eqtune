@@ -50,6 +50,7 @@ eqtune preset-import <file> [name]    # import a preset, optionally renaming it
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
 eqtune band-rm <freq_hz>              # remove the band nearest a frequency
 eqtune preamp <db>                    # overall make-up gain
+eqtune limiter on | off               # toggle the soft limiter (default on)
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune idle on | off                  # auto-off while no media is active (default on)
 eqtune reset [preset]                 # restore all shipped presets, or one preset
@@ -117,6 +118,9 @@ be 20-20000 Hz, band gains -24 to +24 dB, Q 0.1-10, and preamp -60 to +12 dB.
 Presets are capped at 64 bands. If a hand-edited config is malformed or contains values
 the realtime engine cannot run, eqtune preserves it as `config.toml.corrupt` (or a
 numbered sibling) and starts from shipped defaults instead of crash-looping.
+The soft limiter is enabled by default to keep boosted output bounded; advanced users can
+toggle it globally with `eqtune limiter on|off`. The change is persisted immediately and
+applies live without becoming part of a preset's unsaved tuning session.
 
 ## Battery & energy
 
