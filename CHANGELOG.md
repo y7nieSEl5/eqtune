@@ -6,30 +6,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
-
-- `band-rm` now removes exactly one band whose configured frequency matches the request,
-  reports its actual frequency, and leaves the tuning unchanged with a useful error when
-  no band matches or the active preset has no bands.
-- CLI help and the English and Chinese architecture notes now describe the current
-  `preset-save` overwrite rules, structured unsaved-session response, and the fact that
-  lock-free live updates are not yet transition-smoothed.
-
-### Fixed
-
-- docs.rs builds now skip the Objective-C shim, framework links, and Info.plist embedding.
-  docs.rs cross-documents the macOS target from Linux without Apple Clang or the macOS SDK;
-  normal macOS builds still perform every native build step.
-- Interactive save/reset prompts now distinguish EOF from an explicit empty answer. If
-  input closes before a choice, no save, overwrite, discard, or reset confirmation is
-  sent, so unresolved session drafts remain available to resolve later.
-- `eqtune uninstall` now distinguishes an already-absent service from a real `launchctl`
-  failure, reports file-removal failures, and no longer uses the obsolete `launchctl
-  unload` fallback. The Makefile also preserves a failed uninstall exit status.
-- Daemon startup now holds a nonblocking advisory lock, refuses to replace a live control
-  socket (including one owned by an older daemon), and removes only a verified stale Unix
-  socket instead of blindly deleting the path.
-
 ### Roadmap
 
 The remaining order keeps audio recovery ahead of new DSP and routing features. Release
@@ -87,6 +63,32 @@ resulting state.
 - A continuous dry/wet control only if the click-free bypass endpoints prove insufficient;
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
+
+## [0.5.1] - 2026-08-20
+
+### Changed
+
+- `band-rm` now removes exactly one band whose configured frequency matches the request,
+  reports its actual frequency, and leaves the tuning unchanged with a useful error when
+  no band matches or the active preset has no bands.
+- CLI help and the English and Chinese architecture notes now describe the current
+  `preset-save` overwrite rules, structured unsaved-session response, and the fact that
+  lock-free live updates are not yet transition-smoothed.
+
+### Fixed
+
+- docs.rs builds now skip the Objective-C shim, framework links, and Info.plist embedding.
+  docs.rs cross-documents the macOS target from Linux without Apple Clang or the macOS SDK;
+  normal macOS builds still perform every native build step.
+- Interactive save/reset prompts now distinguish EOF from an explicit empty answer. If
+  input closes before a choice, no save, overwrite, discard, or reset confirmation is
+  sent, so unresolved session drafts remain available to resolve later.
+- `eqtune uninstall` now distinguishes an already-absent service from a real `launchctl`
+  failure, reports file-removal failures, and no longer uses the obsolete `launchctl
+  unload` fallback. The Makefile also preserves a failed uninstall exit status.
+- Daemon startup now holds a nonblocking advisory lock, refuses to replace a live control
+  socket (including one owned by an older daemon), and removes only a verified stale Unix
+  socket instead of blindly deleting the path.
 
 ## [0.5.0] - 2026-08-10
 
@@ -252,5 +254,6 @@ resulting state.
 - The EQ engine is lighter in steady state: filter coefficients are only rebuilt when the EQ changes, 0 dB bands are dropped from the live processing chain, and silence is skipped.
 - `eqtune on` and edit commands continue to print the resulting curve, and edits still apply live while persisting to the user config file.
 
-[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.1
 [0.5.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.0
