@@ -85,6 +85,7 @@ daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令
 因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。
 
 daemon对这行JSON也有硬边界：一次请求必须在总计5秒内读完，且不能超过64 KiB。这个检查会在每次读取后执行，包括读到结尾换行符的那一次，因此沉默连接、慢速滴字节、或一直不发换行的client都不能卡住单线程的accept/poll循环。
+daemon在接触control socket之前会先获取一个nonblocking advisory lock，所以第二个daemon会直接退出，不能替换第一个daemon的socket或与它争用config和Core Audio状态。对于旧版本留下的socket，启动过程也会先探测，只会删除已经确认失效的Unix socket。
 
 ### audio plane
 

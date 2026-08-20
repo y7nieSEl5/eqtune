@@ -5,6 +5,8 @@
 //! works" without manually re-selecting output).
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -45,6 +47,102 @@ const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
 /// is best-effort, so at most this much of an in-progress burst is at risk on a crash.
 const SESSION_MIRROR_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PRESET_NAME_LEN: usize = 64;
+
+/// Process-lifetime advisory lock for the daemon. The lock file intentionally remains on
+/// disk after exit: deleting it would let two processes lock different inodes during a
+/// startup race. Closing the file releases the kernel lock automatically.
+#[derive(Debug)]
+struct DaemonLock {
+    _file: std::fs::File,
+}
+
+impl DaemonLock {
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("could not open daemon lock {}", path.display()))?;
+        // SAFETY: `file` owns a valid descriptor for the duration of the call and remains
+        // alive inside `DaemonLock` for as long as the daemon is serving.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+            {
+                anyhow::bail!("another eqtune daemon is already running");
+            }
+            return Err(error)
+                .with_context(|| format!("could not lock daemon lock {}", path.display()));
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// Bind the control socket without deleting a live daemon's endpoint. A connection probe
+/// preserves compatibility with older eqtune daemons that predate `DaemonLock`; only a
+/// verified stale Unix socket is removed and rebound.
+fn bind_control_listener(path: &Path) -> anyhow::Result<UnixListener> {
+    match UnixListener::bind(path) {
+        Ok(listener) => return Ok(listener),
+        Err(e) if e.kind() == ErrorKind::AddrInUse => {}
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not bind control socket {}", path.display()));
+        }
+    }
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_socket() => anyhow::bail!(
+            "control socket path exists but is not a Unix socket: {}",
+            path.display()
+        ),
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return UnixListener::bind(path)
+                .with_context(|| format!("could not bind control socket {}", path.display()));
+        }
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("could not inspect control socket {}", path.display()));
+        }
+    }
+
+    match UnixStream::connect(path) {
+        Ok(_) => anyhow::bail!(
+            "another eqtune daemon is already listening on {}",
+            path.display()
+        ),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_socket() => {
+                    std::fs::remove_file(path).with_context(|| {
+                        format!("could not remove stale control socket {}", path.display())
+                    })?;
+                }
+                Ok(_) => anyhow::bail!(
+                    "control socket path changed to a non-socket while probing: {}",
+                    path.display()
+                ),
+                Err(inspect) if inspect.kind() == ErrorKind::NotFound => {}
+                Err(inspect) => {
+                    return Err(inspect).with_context(|| {
+                        format!("could not recheck control socket {}", path.display())
+                    });
+                }
+            }
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("could not probe existing control socket {}", path.display())
+            });
+        }
+    }
+
+    UnixListener::bind(path)
+        .with_context(|| format!("could not bind control socket {}", path.display()))
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PresetFile {
@@ -130,8 +228,8 @@ impl Daemon {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let _ = std::fs::remove_file(&path); // clear any stale socket
-        let listener = UnixListener::bind(&path)?;
+        let _daemon_lock = DaemonLock::acquire(&path.with_extension("lock"))?;
+        let listener = bind_control_listener(&path)?;
         listener.set_nonblocking(true)?;
         eprintln!("eqtune daemon listening on {}", path.display());
 
@@ -2302,6 +2400,53 @@ mod tests {
         // once LPM clears.
         assert_eq!(initial_engine_state(true, false, true), (false, false));
         assert_eq!(initial_engine_state(true, true, true), (false, true));
+    }
+
+    #[test]
+    fn daemon_lock_allows_only_one_holder() -> anyhow::Result<()> {
+        let path = tmp_path("daemon.lock");
+        let first = DaemonLock::acquire(&path)?;
+
+        let error = DaemonLock::acquire(&path).unwrap_err();
+        assert!(error.to_string().contains("already running"));
+
+        drop(first);
+        let next = DaemonLock::acquire(&path)?;
+        drop(next);
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn control_socket_replaces_stale_socket_but_not_live_listener() -> anyhow::Result<()> {
+        let stale_path = tmp_path("stale.sock");
+        let stale = UnixListener::bind(&stale_path)?;
+        drop(stale);
+
+        let replacement = bind_control_listener(&stale_path)?;
+        drop(replacement);
+        std::fs::remove_file(&stale_path)?;
+
+        let live_path = tmp_path("live.sock");
+        let live = UnixListener::bind(&live_path)?;
+        let error = bind_control_listener(&live_path).unwrap_err();
+        assert!(error.to_string().contains("already listening"));
+        drop(live);
+        std::fs::remove_file(live_path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn control_socket_does_not_delete_an_unrelated_file() -> anyhow::Result<()> {
+        let path = tmp_path("not-a-socket");
+        std::fs::write(&path, b"keep me")?;
+
+        let error = bind_control_listener(&path).unwrap_err();
+
+        assert!(error.to_string().contains("not a Unix socket"));
+        assert_eq!(std::fs::read(&path)?, b"keep me");
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 
     /// A `Daemon` plus RAII cleanup of its on-disk footprint (the config and

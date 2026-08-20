@@ -136,6 +136,11 @@ every buffer append, including the append that contains the terminating newline,
 silent client, slow byte-drip, or newline-less flood cannot wedge the single-threaded
 accept/poll loop.
 
+Daemon startup takes a nonblocking advisory lock before touching the control socket. A
+second daemon therefore exits without replacing the first one's socket or competing for
+config and Core Audio state. Startup also probes an occupied socket for compatibility with
+older daemons; it removes the path only when it is a verified stale Unix socket.
+
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
 to the audio thread via `EqHandle::store` — without restarting playback. Editing commands
