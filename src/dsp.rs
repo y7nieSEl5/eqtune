@@ -286,8 +286,10 @@ fn block_is_silent(buf: &[f32]) -> bool {
 }
 
 /// Real-time, audio-thread-local filter state. Each block it syncs its biquad
-/// coefficients to the supplied [`EqSettings`] (filter memory persists across updates
-/// of the same band count, so live edits don't click) and processes in place.
+/// coefficients to the supplied [`EqSettings`] and processes in place. Unchanged bands
+/// retain their filter memory, but changed coefficients, preamp, and limiter state are
+/// adopted at a block boundary without transition smoothing, so a live edit is lock-free
+/// but not guaranteed to be click-free.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
     /// Band metadata corresponding to the current cascade slots. Capacity is reserved on

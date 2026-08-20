@@ -34,7 +34,7 @@ enum Command {
     /// Switch the active preset.
     #[command(visible_alias = "p")]
     Preset { name: String },
-    /// Save the active tuning as a new preset and switch to it.
+    /// Save the active tuning under a new, active, or shipped preset name.
     #[command(name = "preset-save")]
     PresetSave { name: String },
     /// Clone an existing preset to a new name and switch to it.

@@ -108,6 +108,7 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 请注意
 `EqSettings`（音频线程中所需全部参数的不可变快照）和`Processor`（音频线程本地的filter状态）通过`Arc<ArcSwap<EqSettings>>`相连接。control线程通过一次原子指针交换发布新快照，audio线程在每个block中用`load()`读取快照，无需等待。**audio线程是lock-free的**，这很重要，因为实时音频处理中阻塞或等待互斥锁可能引发优先级反转和掉帧。
+不过，新的coefficients、preamp和limiter状态目前仍会在audio block边界直接生效，并没有transition smoothing。因此lock-free只保证audio线程不会等待control线程，并不保证每次实时调教都完全没有click。
 每个`EqSettings`在构造时都会带上唯一的generation stamp，且内部字段保持私有，所以audio线程根据generation判断是否需要同步新coefficients，而不是依赖`Arc`的堆地址；即使allocator复用了同一个地址，也不会漏掉一次实时调教更新。`Processor`在创建时也会按`MAX_BANDS`（64）为每个声道预留容量，所有添加、导入、加载preset的路径都会执行同一个上限校验，因此切换到更大的preset时也不会在audio线程重新分配内存。
 `src/sys.rs`负责把它俩连起来。`process-trampoline`是shim调用的`extern "C"`函数。它加载当前设置之后在buffer中运行processor。`TapSession`拥有原生session，在`Drop`的时候可以停止音频，所以这顺便很好地实现了`eqtune off`，本质就是drop掉`TapSession`，而且这可以避免泄露Core Audio对象或者以错误的方式终止它们。
 

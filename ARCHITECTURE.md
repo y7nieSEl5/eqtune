@@ -53,10 +53,11 @@ It helps to think of eqtune as two independent planes:
   JSON. Low frequency, human-driven, never touches the audio thread directly.
 - **Audio plane** — the real-time loop. A Core Audio I/O callback that fires hundreds of
   times a second and must never block. The control plane hands it new settings
-  *lock-free* so a live EQ edit never stalls or glitches playback.
+  *lock-free* so a live EQ edit never waits on a control-thread lock.
 
-Keeping these planes decoupled is the central design idea, and it's what makes "edit the
-EQ while music is playing, with no click" work.
+Keeping these planes decoupled is the central design idea. Settings are currently adopted
+at an audio-block boundary without transition smoothing, however, so lock-free publication
+does not by itself guarantee a click-free edit.
 
 ---
 
@@ -97,7 +98,8 @@ enum Request  { Status, Enable, Disable, ListPresets, ShowPreset(Option<String>)
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
 enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
-                ResetWouldOverwrite { names }, UnsavedSession(Tuning), Error(String) }
+                ResetWouldOverwrite { names },
+                UnsavedSession { tuning, dirty_presets }, Error(String) }
 ```
 
 A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a single line
@@ -106,9 +108,10 @@ The daemon's accept loop (`Daemon::run`) handles each connection, deserializes t
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
 active preset, preamp, and bands) so the CLI can print the resulting curve. `Disable`
 returns `UnsavedSession` instead of `Ok` when live tuning edits have not been resolved;
-the CLI then asks whether to save as a new preset, overwrite the active preset, or
-discard. Preset save/clone/rename/import reply with `Tuning` because they switch to the
-resulting preset. Preset deletion replies with the updated preset list. Multi-delete
+the response carries the active tuning plus every preset name that still has edits. The
+CLI then asks whether to save the active tuning by name, overwrite all dirty presets, or
+discard them. Preset save/clone/rename/import reply with `Tuning` because they switch to
+the resulting preset. Preset deletion replies with the updated preset list. Multi-delete
 requests are prevalidated before mutation, so missing/duplicate names or attempts to
 delete every preset leave the config unchanged. Reset requests return
 `ResetWouldOverwrite` when modified shipped presets would be replaced; the CLI can then
@@ -298,9 +301,11 @@ for "media is streaming" rather than a per-app media-session API.
   temp file, fsync it, atomically rename it into place, and fsync the directory so a crash
   cannot easily truncate the live config. The daemon holds both a working config and the last saved config: live
   tuning edits affect only the working config until the `off` prompt resolves them.
-  Preset-management commands mutate the saved preset map directly: new preset names cannot
-  overwrite existing custom names, deleting the last preset is rejected, and deleting the
-  active preset selects another remaining preset before live settings are applied.
+  Preset-management commands mutate the saved preset map directly. `preset-save` can create
+  a name, overwrite the active preset's own name, or overwrite a shipped preset, but it
+  refuses to replace an unrelated custom preset. Deleting the last preset is rejected, and
+  deleting the active preset selects another remaining preset before live settings are
+  applied.
   `reset <name>` restores one shipped preset from `Config::default()`; `reset` without a
   name restores all shipped presets while preserving user-created presets and global
   toggles.
