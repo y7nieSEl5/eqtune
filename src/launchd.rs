@@ -6,8 +6,10 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
+
+use anyhow::Context;
 
 const LABEL: &str = "app.eqtune.daemon";
 const STARTUP_CHECKS: usize = 20;
@@ -58,12 +60,43 @@ pub fn install() -> anyhow::Result<()> {
 
 /// Whether launchd already has `service` (a `gui/<uid>/<label>` target) loaded.
 fn service_is_loaded(service: &str) -> bool {
-    launchctl(["print", service])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    query_service_loaded(service).unwrap_or(false)
+}
+
+/// Query launchd without conflating "not loaded" with an inability to run or query
+/// `launchctl`. Install uses the best-effort boolean wrapper above; uninstall uses this
+/// checked form because it must not delete the files after merely guessing that the
+/// daemon is stopped.
+fn query_service_loaded(service: &str) -> anyhow::Result<bool> {
+    let output = launchctl(["print", service]).output()?;
+    classify_service_query(
+        output.status.success(),
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+fn classify_service_query(
+    success: bool,
+    status_code: Option<i32>,
+    stderr: &str,
+) -> anyhow::Result<bool> {
+    if success {
+        return Ok(true);
+    }
+    // On supported macOS releases, `launchctl print` reports an absent service with
+    // exit 113 and this diagnostic. Require both: an unrelated launchctl failure must be
+    // surfaced rather than treated as proof that it is safe to delete the daemon binary.
+    if status_code == Some(113) && stderr.contains("Could not find service") {
+        return Ok(false);
+    }
+    anyhow::bail!(
+        "could not query launchd service (status {}): {}",
+        status_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated by signal".into()),
+        stderr.trim()
+    )
 }
 
 fn service_is_running(service: &str) -> bool {
@@ -159,15 +192,24 @@ fn launchctl<const N: usize>(args: [&str; N]) -> Command {
 /// Stop and remove the LaunchAgent and the installed binary (config is left in place).
 pub fn uninstall() -> anyhow::Result<()> {
     let domain = format!("gui/{}", uid());
+    let service = format!("{domain}/{LABEL}");
     let plist = plist_path();
-    let _ = Command::new("launchctl")
-        .arg("bootout")
-        .arg(format!("{domain}/{LABEL}"))
-        .status();
-    let _ = launchctl(["unload", plist.to_string_lossy().as_ref()]).status();
-    let _ = fs::remove_file(&plist);
-    let _ = fs::remove_file(installed_bin());
+    if query_service_loaded(&service)? {
+        run_launchctl(&["bootout".into(), service])?;
+    }
+    remove_file_if_exists(&plist, "LaunchAgent plist")?;
+    remove_file_if_exists(&installed_bin(), "installed binary")?;
     Ok(())
+}
+
+fn remove_file_if_exists(path: &Path, description: &str) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("could not remove {description} {}", path.display()))
+        }
+    }
 }
 
 fn install_binary(current: &Path, dest: &Path) -> anyhow::Result<bool> {
@@ -318,6 +360,44 @@ mod tests {
         assert!(!service_state_is_running("\tstate = not running\n"));
         assert!(!service_state_is_running("\tlast exit state = running\n"));
         assert!(!service_state_is_running("\tprogram = /usr/bin/running\n"));
+    }
+
+    #[test]
+    fn service_query_distinguishes_absence_from_real_failure() {
+        assert!(classify_service_query(true, Some(0), "").unwrap());
+        assert!(
+            !classify_service_query(
+                false,
+                Some(113),
+                "Could not find service \"app.eqtune.daemon\" in domain"
+            )
+            .unwrap()
+        );
+        assert!(classify_service_query(false, Some(1), "Operation not permitted").is_err());
+        assert!(classify_service_query(false, Some(113), "unexpected failure").is_err());
+    }
+
+    #[test]
+    fn uninstall_file_removal_is_idempotent_and_truthful() -> anyhow::Result<()> {
+        let dir = test_dir("uninstall-files");
+        let installed = dir.join("eqtune");
+        fs::write(&installed, b"binary")?;
+
+        remove_file_if_exists(&installed, "installed binary")?;
+        remove_file_if_exists(&installed, "installed binary")?;
+        assert!(!installed.exists());
+
+        let not_a_file = dir.join("not-a-file");
+        fs::create_dir(&not_a_file)?;
+        let error = remove_file_if_exists(&not_a_file, "LaunchAgent plist").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("could not remove LaunchAgent plist")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+        Ok(())
     }
 
     #[test]

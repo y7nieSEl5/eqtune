@@ -13,7 +13,7 @@ install: build
 	@echo "  ln -sf \"$$HOME/Library/Application Support/eqtune/eqtune\" /usr/local/bin/eqtune"
 
 uninstall:
-	-./target/release/eqtune uninstall
+	./target/release/eqtune uninstall
 
 test:
 	cargo test

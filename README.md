@@ -233,6 +233,10 @@ Core Audio shim, and *why* it's built this way — see [ARCHITECTURE.md](ARCHITE
 make uninstall      # or: eqtune uninstall
 ```
 
+Uninstall is safe to repeat when the service or files are already absent. It keeps your
+config, and reports any real launchd or file-removal failure instead of printing success
+for a partial uninstall.
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your
