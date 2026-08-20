@@ -1,7 +1,7 @@
 //! eqtune CLI entry point. Either runs the long-lived daemon or acts as a thin client
 //! that sends a single control request to it over the Unix socket.
 
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
@@ -509,10 +509,18 @@ fn resolve_unsaved_session(active_preset: &str, dirty_presets: &[String]) -> any
 }
 
 fn read_line_trimmed() -> anyhow::Result<String> {
+    let stdin = io::stdin();
+    read_line_trimmed_from(&mut stdin.lock())
+}
+
+fn read_line_trimmed_from(reader: &mut impl BufRead) -> anyhow::Result<String> {
     let mut line = String::new();
-    let read = io::stdin().read_line(&mut line)?;
+    let read = reader.read_line(&mut line)?;
     if read == 0 {
-        return Ok(String::new());
+        anyhow::bail!(
+            "input closed before the prompt was resolved; no save, overwrite, discard, \
+             or reset action was taken"
+        );
     }
     Ok(line.trim().to_string())
 }
@@ -725,6 +733,18 @@ mod tests {
         assert_eq!(fmt_q(1.41), "1.41");
         assert_eq!(fmt_q(2.0), "2");
         assert_eq!(fmt_q(0.7), "0.7");
+    }
+
+    #[test]
+    fn prompt_input_distinguishes_eof_from_an_explicit_empty_line() {
+        let error = read_line_trimmed_from(&mut &b""[..]).unwrap_err();
+        assert!(error.to_string().contains("input closed"));
+
+        assert_eq!(read_line_trimmed_from(&mut &b"\n"[..]).unwrap(), "");
+        assert_eq!(
+            read_line_trimmed_from(&mut &b"  overwrite \n"[..]).unwrap(),
+            "overwrite"
+        );
     }
 
     #[test]

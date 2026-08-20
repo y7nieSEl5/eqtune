@@ -365,7 +365,10 @@ The daemon deliberately separates "what is playing now" from "what is saved":
   whose working contents differ from the saved config. Edits stay attached to the preset
   they were made on across preset switches, so those names can include presets other
   than the active one; the CLI names them instead of implying the active curve is all
-  there is, and offers save-by-name only when the active preset itself has edits.
+  there is, and offers save-by-name only when the active preset itself has edits. EOF at
+  any follow-up prompt is an error rather than an empty/default answer, so the CLI sends
+  no save, overwrite, discard, or reset request and the mirrored draft remains available
+  to resolve later.
 - Save by name (`SaveSessionAs`) takes the active working preset and writes it into a
   clone of `saved_config`. If the name is unused, it creates a user preset. If the name is
   one of the shipped names (`bright`, `mellow`, `pro`) or the active preset's own name, it
