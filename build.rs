@@ -1,14 +1,18 @@
 //! Build script: on macOS, compiles the Objective-C Core Audio shim, links the audio
-//! frameworks, and embeds an Info.plist. eqtune is macOS-only (Core Audio), so on other
-//! targets this is a no-op (lets the crate at least configure, e.g. for a docs.rs build).
+//! frameworks, and embeds an Info.plist. eqtune is macOS-only (Core Audio), so native
+//! build steps are skipped on other targets and when docs.rs cross-documents the macOS
+//! target from its Linux builder, where no Apple compiler or SDK is available.
 
 fn main() {
     println!("cargo:rerun-if-changed=shim/tap_shim.m");
     println!("cargo:rerun-if-changed=shim/tap_shim.h");
     println!("cargo:rerun-if-changed=resources/Info.plist");
     println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
+    println!("cargo:rerun-if-env-changed=DOCS_RS");
 
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+    if std::env::var_os("DOCS_RS").is_some()
+        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+    {
         return;
     }
 

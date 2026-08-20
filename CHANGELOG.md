@@ -17,6 +17,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- docs.rs builds now skip the Objective-C shim, framework links, and Info.plist embedding.
+  docs.rs cross-documents the macOS target from Linux without Apple Clang or the macOS SDK;
+  normal macOS builds still perform every native build step.
 - Interactive save/reset prompts now distinguish EOF from an explicit empty answer. If
   input closes before a choice, no save, overwrite, discard, or reset confirmation is
   sent, so unresolved session drafts remain available to resolve later.
