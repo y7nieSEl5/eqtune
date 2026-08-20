@@ -6,21 +6,32 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- `band-rm` now removes exactly one band whose configured frequency matches the request,
+  reports its actual frequency, and leaves the tuning unchanged with a useful error when
+  no band matches or the active preset has no bands.
+- CLI help and the English and Chinese architecture notes now describe the current
+  `preset-save` overwrite rules, structured unsaved-session response, and the fact that
+  lock-free live updates are not yet transition-smoothed.
+
+### Fixed
+
+- Interactive save/reset prompts now distinguish EOF from an explicit empty answer. If
+  input closes before a choice, no save, overwrite, discard, or reset confirmation is
+  sent, so unresolved session drafts remain available to resolve later.
+- `eqtune uninstall` now distinguishes an already-absent service from a real `launchctl`
+  failure, reports file-removal failures, and no longer uses the obsolete `launchctl
+  unload` fallback. The Makefile also preserves a failed uninstall exit status.
+- Daemon startup now holds a nonblocking advisory lock, refuses to replace a live control
+  socket (including one owned by an older daemon), and removes only a verified stale Unix
+  socket instead of blindly deleting the path.
+
 ### Roadmap
 
-The order below keeps correctness and audio recovery ahead of new DSP and routing
-features. Release processing stays single-threaded, uses one Core Audio tap and one DSP
-engine, and gains no generic metadata, routing-rule, or always-on telemetry subsystem.
-
-#### 0.5.1 — Correctness and truthful behavior
-
-- Make interactive prompts EOF-safe without discarding unresolved session drafts.
-- Make `band-rm` remove the genuinely nearest band and report what it removed.
-- Report uninstall failures truthfully, remove the obsolete `launchctl unload` fallback,
-  and prevent a second daemon from replacing the live daemon's socket.
-- Correct the English and Chinese architecture/help claims: live updates are lock-free but
-  not yet transition-smoothed, `preset-save` deliberately supports certain overwrites, and
-  `UnsavedSession` has the current structured response shape.
+The remaining order keeps audio recovery ahead of new DSP and routing features. Release
+processing stays single-threaded, uses one Core Audio tap and one DSP engine, and gains no
+generic metadata, routing-rule, or always-on telemetry subsystem.
 
 #### 0.6.0 — Fail-safe, self-recovering engine
 
