@@ -89,6 +89,12 @@ pub enum Response {
     /// The active tuning after `on` or any EQ edit, so the client can show the resulting
     /// curve (preset, preamp, and bands).
     Tuning(Tuning),
+    /// Result of removing the band matching the requested frequency. Returning the removed
+    /// band lets the CLI report the action precisely rather than echoing only the request.
+    BandRemoved {
+        tuning: Tuning,
+        removed: Band,
+    },
     Presets {
         active: String,
         names: Vec<String>,
@@ -293,6 +299,20 @@ mod tests {
                     },
                 ],
             }),
+            Response::BandRemoved {
+                tuning: Tuning {
+                    enabled: true,
+                    preset: "bright".into(),
+                    preamp_db: -8.0,
+                    bands: vec![],
+                },
+                removed: crate::dsp::Band {
+                    kind: crate::dsp::BandKind::Peaking,
+                    freq: 1000.0,
+                    gain_db: 4.5,
+                    q: 1.41,
+                },
+            },
             Response::Presets {
                 active: "default".into(),
                 names: vec!["default".into(), "flat".into()],

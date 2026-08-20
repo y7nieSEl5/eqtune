@@ -63,7 +63,7 @@ enum Command {
         #[arg(default_value_t = 1.0)]
         q: f32,
     },
-    /// Remove the band nearest <freq_hz>.
+    /// Remove the band at <freq_hz>.
     #[command(name = "band-rm")]
     BandRm { freq: f32 },
     /// Set the preamp make-up gain, in dB.
@@ -254,10 +254,7 @@ fn print_response(cmd: &Command, resp: &Response) {
                     );
                     Some(*freq)
                 }
-                Command::BandRm { freq } => {
-                    println!("removed band near {}", fmt_freq(*freq));
-                    None
-                }
+                Command::BandRm { .. } => unreachable!("band-rm has its own response"),
                 Command::Preamp { db } => {
                     println!("preamp → {}", fmt_gain(*db));
                     None
@@ -273,6 +270,21 @@ fn print_response(cmd: &Command, resp: &Response) {
                 _ => None,
             };
             print_curve(t, changed);
+        }
+        Response::BandRemoved { tuning, removed } => {
+            let Command::BandRm { freq } = cmd else {
+                unreachable!("band-removed response belongs to band-rm");
+            };
+            if removed.freq == *freq {
+                println!("removed band {}", fmt_freq(removed.freq));
+            } else {
+                println!(
+                    "removed band {} (nearest to {})",
+                    fmt_freq(removed.freq),
+                    fmt_freq(*freq)
+                );
+            }
+            print_curve(tuning, None);
         }
         Response::Ok => match cmd {
             Command::Off => println!("eqtune off — native Apple audio restored"),

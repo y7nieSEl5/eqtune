@@ -69,7 +69,8 @@ enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
-enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
+enum Response { Ok, Status(Status), Tuning(Tuning),
+                BandRemoved { tuning, removed }, Presets { … },
                 ResetWouldOverwrite { names },
                 UnsavedSession { tuning, dirty_presets }, Error(String) }
 ```
@@ -77,6 +78,7 @@ enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
 一个client（比如`eqtune band 2000 -6`这行命令）会把一个`Request`改写成JSON，并把一行写入`~/Library/Application Support/eqtune/eqtune.sock`，再读到一个返回的`Response`。
 daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令，改变状态，然后回复。
 `Enable`下，会回复`Tuning`，让CLI打印当前调教曲线；`Disable`下，如果存在未保存的实时改动，会返回`UnsavedSession`并由CLI继续询问保存/覆盖/丢弃；若没有未保存改动，才返回`Ok`。`UnsavedSession`除了当前调教还带有所有实际存在未保存编辑的preset名单——编辑在切换preset后仍然留在原preset上，所以名单可能包含非当前preset；CLI会把它们列出来，而不是只显示当前曲线。
+`RemoveBand`只有在输入frequency与一个已有band的配置frequency足够接近时才会删除一个band；否则不会改变调教，并会返回最近的已有frequency。成功时response也会带回实际被删除的band，让CLI可以如实显示。
 另外，`export`命令会导出单preset TOML并返回`Ok`；而保存/克隆/重命名/import等命令会根据语义返回`Tuning`或预设列表，而不都是`Ok`。
 
 因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。

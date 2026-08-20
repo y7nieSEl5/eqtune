@@ -333,11 +333,32 @@ impl Daemon {
             }
             Request::RemoveBand { freq } => {
                 validate_freq(freq)?;
-                self.active_preset_mut()?
-                    .bands
-                    .retain(|b| (b.freq - freq).abs() >= BAND_MATCH_HZ);
+                let removed = {
+                    let preset = self.active_preset_mut()?;
+                    let (index, nearest) = preset
+                        .bands
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            (a.freq - freq)
+                                .abs()
+                                .total_cmp(&(b.freq - freq).abs())
+                                .then_with(|| a.freq.total_cmp(&b.freq))
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("active preset has no bands to remove"))?;
+                    if (nearest.freq - freq).abs() >= BAND_MATCH_HZ {
+                        return Ok(Response::Error(format!(
+                            "no band matches {freq} Hz; nearest configured band is {} Hz",
+                            nearest.freq
+                        )));
+                    }
+                    preset.bands.remove(index)
+                };
                 self.apply_current_settings()?;
-                Ok(Response::Tuning(self.tuning()))
+                Ok(Response::BandRemoved {
+                    tuning: self.tuning(),
+                    removed,
+                })
             }
             Request::SetPreamp(db) => {
                 validate_preamp(db)?;
@@ -1753,6 +1774,63 @@ mod tests {
         })
         .unwrap();
         assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+    }
+
+    #[test]
+    fn remove_band_removes_exactly_one_matching_band() {
+        let mut config = Config::default();
+        let original = config.presets["bright"].bands.clone();
+        let expected = original
+            .iter()
+            .copied()
+            .find(|band| band.freq == 2_000.0)
+            .unwrap();
+        config.presets.get_mut("bright").unwrap().bands = original.clone();
+        let mut d = daemon_with(config);
+
+        let response = d
+            .apply(Request::RemoveBand {
+                freq: expected.freq + 0.25,
+            })
+            .unwrap();
+
+        let Response::BandRemoved { tuning, removed } = response else {
+            panic!("expected a band-removed response");
+        };
+        assert_eq!(removed, expected);
+        assert_eq!(tuning.bands.len(), original.len() - 1);
+        assert!(!tuning.bands.contains(&expected));
+        assert!(d.has_unsaved_session());
+    }
+
+    #[test]
+    fn remove_band_rejects_a_distant_frequency_without_mutating() {
+        let mut d = daemon_with(Config::default());
+        let before = d.config.clone();
+
+        let response = d.dispatch(Request::RemoveBand { freq: 2_900.0 });
+
+        assert_eq!(
+            response,
+            Response::Error("no band matches 2900 Hz; nearest configured band is 2000 Hz".into())
+        );
+        assert_eq!(d.config, before);
+        assert!(!d.has_unsaved_session());
+    }
+
+    #[test]
+    fn remove_band_rejects_an_empty_preset() {
+        let mut config = Config::default();
+        config.presets.get_mut("bright").unwrap().bands.clear();
+        let mut d = daemon_with(config.clone());
+
+        let response = d.dispatch(Request::RemoveBand { freq: 1_000.0 });
+
+        assert_eq!(
+            response,
+            Response::Error("active preset has no bands to remove".into())
+        );
+        assert_eq!(d.config, config);
     }
 
     #[test]

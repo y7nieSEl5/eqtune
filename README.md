@@ -68,7 +68,7 @@ eqtune preset-rm <name> [name...]     # delete one or more presets
 eqtune preset-export <name> [file]    # write a shareable preset TOML file
 eqtune preset-import <file> [name]    # import a preset, optionally renaming it
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
-eqtune band-rm <freq_hz>              # remove the band nearest a frequency
+eqtune band-rm <freq_hz>              # remove the band at a configured frequency
 eqtune preamp <db>                    # overall make-up gain
 eqtune limiter on | off               # toggle the soft limiter (default on)
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)

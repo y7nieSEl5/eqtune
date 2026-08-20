@@ -97,7 +97,8 @@ enum Request  { Status, Enable, Disable, ListPresets, ShowPreset(Option<String>)
                 SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
-enum Response { Ok, Status(Status), Tuning(Tuning), Presets { … },
+enum Response { Ok, Status(Status), Tuning(Tuning),
+                BandRemoved { tuning, removed }, Presets { … },
                 ResetWouldOverwrite { names },
                 UnsavedSession { tuning, dirty_presets }, Error(String) }
 ```
@@ -106,7 +107,11 @@ A client (`eqtune band 2000 -6`) serializes one `Request` to JSON, writes a sing
 to `~/Library/Application Support/eqtune/eqtune.sock`, and reads one `Response` line back.
 The daemon's accept loop (`Daemon::run`) handles each connection, deserializes the
 request, mutates state, and replies. `Enable` and the EQ edits reply with `Tuning` (the
-active preset, preamp, and bands) so the CLI can print the resulting curve. `Disable`
+active preset, preamp, and bands) so the CLI can print the resulting curve; `RemoveBand`
+removes exactly one band only when its configured frequency matches the request within the
+small edit-matching tolerance. Otherwise it leaves the tuning untouched and reports the
+nearest configured frequency. A successful response also returns the band it actually
+removed so the CLI can name it truthfully. `Disable`
 returns `UnsavedSession` instead of `Ok` when live tuning edits have not been resolved;
 the response carries the active tuning plus every preset name that still has edits. The
 CLI then asks whether to save the active tuning by name, overwrite all dirty presets, or
