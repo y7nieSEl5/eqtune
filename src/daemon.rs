@@ -60,6 +60,7 @@ impl DaemonLock {
     fn acquire(path: &Path) -> anyhow::Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
