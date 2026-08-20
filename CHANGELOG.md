@@ -6,22 +6,73 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Planned
+### Roadmap
 
-- CLI support for low-shelf and high-shelf bands, not just peaking filters.
-- A flat/bypass preset or `eqtune flat` command for A/B testing while the engine remains active.
-- `eqtune preamp-auto` to estimate a conservative make-up gain from the active preset.
-- `eqtune response` to print a frequency-response table using the existing DSP math.
-- Per-output-device preset assignment for automatically selecting speaker, headphone, or
-  DAC tuning.
-- Machine-readable response export (CSV/JSON), dry/wet control, and click-free active
-  bypass for measurement and A/B workflows.
-- Limiter threshold/headroom controls, preset metadata and schema versioning, and
-  non-interactive save/reset options for scripts.
-- Structured engine diagnostics including capture permission, stream format, channel
-  layout, suspension reason, and the last engine error.
-- Offline DSP benchmarks and callback timing telemetry, followed by event-driven Core
-  Audio listeners to replace fixed-rate device and power-state polling where practical.
+The order below keeps correctness and audio recovery ahead of new DSP and routing
+features. Release processing stays single-threaded, uses one Core Audio tap and one DSP
+engine, and gains no generic metadata, routing-rule, or always-on telemetry subsystem.
+
+#### 0.5.1 — Correctness and truthful behavior
+
+- Make interactive prompts EOF-safe without discarding unresolved session drafts.
+- Make `band-rm` remove the genuinely nearest band and report what it removed.
+- Report uninstall failures truthfully, remove the obsolete `launchctl unload` fallback,
+  and prevent a second daemon from replacing the live daemon's socket.
+- Correct the English and Chinese architecture/help claims: live updates are lock-free but
+  not yet transition-smoothed, `preset-save` deliberately supports certain overwrites, and
+  `UnsavedSession` has the current structured response shape.
+
+#### 0.6.0 — Fail-safe, self-recovering engine
+
+- Build one authoritative output-target snapshot by resolving the default device once,
+  querying UID, name, sample rate, and stream facts by that exact ID, passing the same ID
+  into tap startup, and recording the metadata only after stream validation succeeds.
+- Propagate fatal runtime stream/layout failures out of the realtime callback. Tear down
+  the failed tap promptly to restore the native audio path while retaining the user's
+  explicit on/off intent.
+- Retry a failed desired engine start at most six times per incident, after 1, 2, 4, 8,
+  16, and 30 seconds. Exhausted recovery remains safely on the native path until an
+  explicit `on`, output-device change, or legitimate policy-resume event resets the budget.
+- Add small, flat `status` diagnostics for user intent, actual engine state, suspension
+  reason, output UID/name/rate/stream facts, last engine error, retry state, bypass state,
+  and dirty presets. This is control-plane state, not callback telemetry.
+
+The release gate is that no runtime audio-format failure can leave eqtune indefinitely
+producing zeroes: native output returns, retries are bounded, and `status` explains the
+resulting state.
+
+#### 0.7.0 — DSP tools and click-free comparison
+
+- Add dependency-light offline DSP benchmarks for steady-state, silence,
+  settings-update, maximum-band, and bypass-transition costs. Live callback timing stays
+  debug-only so release processing pays no measurement overhead.
+- Expose the existing low-shelf and high-shelf filters through the CLI while keeping the
+  current peaking-band syntax compatible.
+- Put `eqtune response` human output, JSON/CSV export, and `eqtune preamp-auto` over one
+  shared frequency-response implementation and the authoritative device sample rate.
+- Add a click-free, runtime-only `eqtune bypass on|off` for fast A/B comparison. It exposes
+  only dry and wet endpoints and keeps filter state warm; `eqtune off` remains the
+  energy-saving native-path command.
+
+#### 0.8.0 — Config foundation and minimal per-app bypass
+
+- Add explicit config schema versioning with small deliberate migrations, without generic
+  preset metadata. Audit the active-preset invariant at the same time and remove its
+  arbitrary fallback only if every caller can surface the missing preset clearly.
+- Add opt-in application-bundle-ID exclusions to the one existing global tap: selected
+  applications stay native while the remaining system audio is equalized. Do not add
+  per-app presets, gain, routing graphs, process databases, or browser-tab detection.
+- Treat per-app bypass as higher-complexity until launches, exits, helper processes,
+  browser-hosted calls, device switches, and lookup failures are proven fail-safe.
+
+### Possible follow-ups
+
+- Basic per-output-device preset assignment as a direct device-UID-to-preset map, only
+  after its interaction with unsaved drafts is defined. Avoid device categories, matching
+  rules, priorities, fallback chains, and automatic learning.
+- A continuous dry/wet control only if the click-free bypass endpoints prove insufficient;
+  exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
+  semantics that are not justified for A/B testing alone.
 
 ## [0.5.0] - 2026-08-10
 
