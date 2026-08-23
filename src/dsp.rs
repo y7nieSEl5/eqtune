@@ -175,6 +175,56 @@ pub fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
 }
 
+/// Combined linear-filter response at one frequency, including preamp but excluding the
+/// nonlinear limiter. Analysis commands and automatic headroom use this same calculation.
+pub fn response_db(bands: &[Band], preamp_db: f32, fs: f32, freq: f32) -> f32 {
+    let coeffs = active_coeffs(bands, fs);
+    response_from_coeffs(&coeffs, preamp_db, fs, freq)
+}
+
+/// Combined response for several frequencies, designing each band only once.
+pub fn response_curve_db(bands: &[Band], preamp_db: f32, fs: f32, frequencies: &[f32]) -> Vec<f32> {
+    let coeffs = active_coeffs(bands, fs);
+    frequencies
+        .iter()
+        .map(|freq| response_from_coeffs(&coeffs, preamp_db, fs, *freq))
+        .collect()
+}
+
+fn response_from_coeffs(coeffs: &[Coeffs], preamp_db: f32, fs: f32, freq: f32) -> f32 {
+    coeffs.iter().fold(preamp_db, |db, coeffs| {
+        db + 20.0 * coeffs.magnitude(freq, fs).log10()
+    })
+}
+
+fn active_coeffs(bands: &[Band], fs: f32) -> Vec<Coeffs> {
+    bands
+        .iter()
+        .filter(|band| band.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
+        .map(|band| Coeffs::design(band, fs))
+        .collect()
+}
+
+/// Sampled peak of the filter cascade (without preamp) over the audible range.
+pub fn peak_response_db(bands: &[Band], fs: f32) -> f32 {
+    const STEPS: usize = 4096;
+    let low = 20.0f32;
+    let high = 20_000.0f32.min(fs * 0.499);
+    let ratio = high / low;
+    let coeffs = active_coeffs(bands, fs);
+    let mut peak = 0.0f32;
+    for step in 0..=STEPS {
+        let freq = low * ratio.powf(step as f32 / STEPS as f32);
+        peak = peak.max(response_from_coeffs(&coeffs, 0.0, fs, freq));
+    }
+    // Explicitly include every configured center/corner, which is the likely extremum
+    // for a narrow peaking band and costs nothing meaningful on a control command.
+    for band in bands.iter().filter(|band| band.freq < fs * 0.5) {
+        peak = peak.max(response_from_coeffs(&coeffs, 0.0, fs, band.freq));
+    }
+    peak
+}
+
 /// Transparent-below-threshold soft limiter: identity for `|x| <= T`, then a smooth
 /// knee that asymptotically approaches ±1 so the preamp can never hard-clip.
 #[inline]
@@ -476,6 +526,37 @@ mod tests {
             db(c.magnitude(20_000.0, fs)).abs() < 0.5,
             "near nyquist flat"
         );
+    }
+
+    #[test]
+    fn shared_response_combines_preamp_and_bands() {
+        let fs = 48_000.0;
+        let bands = [peak(1_000.0), peak(1_000.0)];
+        let got = response_db(&bands, -3.0, fs, 1_000.0);
+        assert!((got - 9.0).abs() < 0.2, "combined response was {got} dB");
+    }
+
+    #[test]
+    fn shared_response_drops_the_same_identity_bands_as_realtime() {
+        let nearly_flat = Band {
+            kind: BandKind::Peaking,
+            freq: 1_000.0,
+            gain_db: IDENTITY_GAIN_EPS_DB / 2.0,
+            q: 10.0,
+        };
+        assert_eq!(response_db(&[nearly_flat], -3.0, 48_000.0, 1_000.0), -3.0);
+    }
+
+    #[test]
+    fn peak_response_finds_a_narrow_band() {
+        let band = Band {
+            kind: BandKind::Peaking,
+            freq: 1_337.0,
+            gain_db: 12.0,
+            q: 10.0,
+        };
+        let peak = peak_response_db(&[band], 48_000.0);
+        assert!((peak - 12.0).abs() < 0.1, "peak was {peak} dB");
     }
 
     #[test]

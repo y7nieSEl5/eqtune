@@ -17,14 +17,22 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     Config, Preset, validate_band, validate_freq, validate_preamp, validate_preset,
 };
-use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS};
-use crate::ipc::{self, PresetBackup, Request, Response, Status, Tuning};
+use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS, peak_response_db, response_curve_db};
+use crate::ipc::{
+    self, FrequencyResponse, PresetBackup, Request, Response, ResponsePoint, Status, Tuning,
+};
 use crate::sys::{self, EqHandle, OutputTarget, TapSession};
 
 /// Two bands count as "the same band" if their frequencies are this close (Hz).
 const BAND_MATCH_HZ: f32 = 0.5;
 /// Channel count for the processor (stereo).
 const CHANNELS: usize = 2;
+/// Standard 1/3-octave centers keep human and exported response output compact.
+const RESPONSE_FREQUENCIES: [f32; 31] = [
+    20.0, 25.0, 31.5, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0,
+    500.0, 630.0, 800.0, 1_000.0, 1_250.0, 1_600.0, 2_000.0, 2_500.0, 3_150.0, 4_000.0, 5_000.0,
+    6_300.0, 8_000.0, 10_000.0, 12_500.0, 16_000.0, 20_000.0,
+];
 /// Fallback sample rate (Hz) used only when the default output device's nominal rate is
 /// unavailable. 48 kHz is the near-universal default for macOS output devices.
 const DEFAULT_SAMPLE_RATE_HZ: u32 = 48_000;
@@ -524,6 +532,21 @@ impl Daemon {
                 self.apply_current_settings()?;
                 Ok(Response::Tuning(self.tuning()))
             }
+            Request::SetPreampAuto => {
+                let fs = self.output_sample_rate()?;
+                let bands = self
+                    .config
+                    .active()
+                    .map(|preset| preset.bands.as_slice())
+                    .unwrap_or(&[]);
+                let peak = peak_response_db(bands, fs as f32);
+                let db = if peak > 0.0 { -peak } else { 0.0 };
+                validate_preamp(db)?;
+                self.active_preset_mut()?.preamp_db = db;
+                self.apply_current_settings()?;
+                Ok(Response::Tuning(self.tuning()))
+            }
+            Request::GetResponse => Ok(Response::FrequencyResponse(self.frequency_response()?)),
             Request::SetLimiter(on) => {
                 self.commit_setting(|c| c.limiter = on)?;
                 self.apply_current_settings()?;
@@ -621,6 +644,45 @@ impl Daemon {
         let bands: &[Band] = active.map(|p| p.bands.as_slice()).unwrap_or(&[]);
         let preamp = active.map(|p| p.preamp_db).unwrap_or(0.0);
         EqSettings::new(bands, fs, preamp, self.config.limiter)
+    }
+
+    /// Prefer the validated running target; otherwise resolve one exact default-device
+    /// snapshot for this command. No separate rate lookup can drift to another device.
+    fn output_sample_rate(&self) -> anyhow::Result<f64> {
+        match self
+            .engine_target
+            .as_ref()
+            .filter(|_| self.engine.is_some())
+        {
+            Some(target) => Ok(target.sample_rate),
+            None => Ok(OutputTarget::resolve_default()?.sample_rate),
+        }
+    }
+
+    fn frequency_response(&self) -> anyhow::Result<FrequencyResponse> {
+        let fs = self.output_sample_rate()?;
+        let active = self.config.active();
+        let bands = active.map(|preset| preset.bands.as_slice()).unwrap_or(&[]);
+        let preamp_db = active.map(|preset| preset.preamp_db).unwrap_or(0.0);
+        let frequencies: Vec<_> = RESPONSE_FREQUENCIES
+            .iter()
+            .copied()
+            .filter(|frequency| *frequency < fs as f32 * 0.5)
+            .collect();
+        let gains = response_curve_db(bands, preamp_db, fs as f32, &frequencies);
+        let points = frequencies
+            .into_iter()
+            .zip(gains)
+            .map(|(frequency_hz, gain_db)| ResponsePoint {
+                frequency_hz,
+                gain_db,
+            })
+            .collect();
+        Ok(FrequencyResponse {
+            sample_rate_hz: fs,
+            preamp_db,
+            points,
+        })
     }
 
     /// Start or stop the audio engine so its running state matches `engine_target_on`.

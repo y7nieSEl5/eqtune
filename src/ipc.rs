@@ -60,6 +60,8 @@ pub enum Request {
         freq: f32,
     },
     SetPreamp(f32),
+    SetPreampAuto,
+    GetResponse,
     SetLimiter(bool),
     SetAutoOffLowPower(bool),
     SetAutoOffIdle(bool),
@@ -95,6 +97,7 @@ pub enum Response {
         tuning: Tuning,
         removed: Band,
     },
+    FrequencyResponse(FrequencyResponse),
     Presets {
         active: String,
         names: Vec<String>,
@@ -129,6 +132,20 @@ pub struct Tuning {
     pub preamp_db: f32,
     /// The preset's EQ bands, in frequency order.
     pub bands: Vec<Band>,
+}
+
+/// The active tuning's linear response at the output device's sample rate.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct FrequencyResponse {
+    pub sample_rate_hz: f64,
+    pub preamp_db: f32,
+    pub points: Vec<ResponsePoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ResponsePoint {
+    pub frequency_hz: f32,
+    pub gain_db: f32,
 }
 
 /// A snapshot of daemon state, returned for `eqtune status`.
@@ -250,6 +267,8 @@ mod tests {
             },
             Request::RemoveBand { freq: 2000.0 },
             Request::SetPreamp(7.0),
+            Request::SetPreampAuto,
+            Request::GetResponse,
             Request::SetLimiter(false),
             Request::SetAutoOffLowPower(false),
             Request::SetAutoOffIdle(false),
@@ -342,6 +361,14 @@ mod tests {
                     q: 1.41,
                 },
             },
+            Response::FrequencyResponse(FrequencyResponse {
+                sample_rate_hz: 48_000.0,
+                preamp_db: -3.0,
+                points: vec![ResponsePoint {
+                    frequency_hz: 1_000.0,
+                    gain_db: 2.5,
+                }],
+            }),
             Response::Presets {
                 active: "default".into(),
                 names: vec!["default".into(), "flat".into()],

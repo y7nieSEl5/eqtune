@@ -8,7 +8,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::{Bash, Fish, Zsh, generate};
 
 use eqtune::daemon::Daemon;
-use eqtune::ipc::{self, PresetBackup, Request, Response, Tuning};
+use eqtune::ipc::{self, FrequencyResponse, PresetBackup, Request, Response, Tuning};
 
 #[derive(Parser)]
 #[command(name = "eqtune", version, about = "System-wide audio EQ for macOS")]
@@ -69,6 +69,16 @@ enum Command {
     /// Set the preamp make-up gain, in dB.
     #[command(allow_negative_numbers = true)]
     Preamp { db: f32 },
+    /// Set preamp to offset the active filters' maximum boost.
+    #[command(name = "preamp-auto")]
+    PreampAuto,
+    /// Show or export the active frequency response.
+    Response {
+        #[arg(short, long, value_enum, default_value_t = ResponseFormat::Human)]
+        format: ResponseFormat,
+        /// Optional JSON/CSV output file.
+        path: Option<PathBuf>,
+    },
     /// Toggle the soft limiter (on/off).
     Limiter { state: Toggle },
     /// Toggle auto-off while macOS Low Power Mode is active (on/off).
@@ -93,6 +103,13 @@ enum Command {
 enum Toggle {
     On,
     Off,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq)]
+enum ResponseFormat {
+    Human,
+    Json,
+    Csv,
 }
 
 /// Shells supported by the static completion generator.
@@ -144,6 +161,8 @@ fn main() -> anyhow::Result<()> {
                         handle_off_response(&resp)?;
                     } else if matches!(client_cmd, Command::Reset { .. }) {
                         handle_reset_response(&client_cmd, &resp)?;
+                    } else if matches!(client_cmd, Command::Response { .. }) {
+                        handle_frequency_response(&client_cmd, &resp)?;
                     } else {
                         print_response(&client_cmd, &resp);
                     }
@@ -193,6 +212,13 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
         },
         Command::BandRm { freq } => Request::RemoveBand { freq: *freq },
         Command::Preamp { db } => Request::SetPreamp(*db),
+        Command::PreampAuto => Request::SetPreampAuto,
+        Command::Response { format, path } => {
+            if *format == ResponseFormat::Human && path.is_some() {
+                anyhow::bail!("a response output path requires --format json or --format csv");
+            }
+            Request::GetResponse
+        }
         Command::Limiter { state } => Request::SetLimiter(matches!(state, Toggle::On)),
         Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
@@ -259,6 +285,10 @@ fn print_response(cmd: &Command, resp: &Response) {
                     println!("preamp → {}", fmt_gain(*db));
                     None
                 }
+                Command::PreampAuto => {
+                    println!("preamp → auto ({})", fmt_gain(t.preamp_db));
+                    None
+                }
                 Command::Reset { name: None } => {
                     println!("reset to shipped defaults");
                     None
@@ -285,6 +315,9 @@ fn print_response(cmd: &Command, resp: &Response) {
                 );
             }
             print_curve(tuning, None);
+        }
+        Response::FrequencyResponse(_) => {
+            unreachable!("frequency-response output has its own renderer")
         }
         Response::Ok => match cmd {
             Command::Off => println!("eqtune off — native Apple audio restored"),
@@ -428,6 +461,55 @@ fn print_response(cmd: &Command, resp: &Response) {
             );
         }
     }
+}
+
+fn handle_frequency_response(cmd: &Command, resp: &Response) -> anyhow::Result<()> {
+    let Command::Response { format, path } = cmd else {
+        unreachable!("only response uses this renderer");
+    };
+    let Response::FrequencyResponse(curve) = resp else {
+        print_response(cmd, resp);
+        return Ok(());
+    };
+    let output = match format {
+        ResponseFormat::Human => format_response(curve),
+        ResponseFormat::Json => format!("{}\n", serde_json::to_string_pretty(curve)?),
+        ResponseFormat::Csv => format_response_csv(curve),
+    };
+    if let Some(path) = path {
+        std::fs::write(path, output)?;
+        println!("exported response → {}", path.display());
+    } else {
+        print!("{output}");
+    }
+    Ok(())
+}
+
+fn format_response(curve: &FrequencyResponse) -> String {
+    let mut output = format!(
+        "sample rate: {} Hz · preamp {}\n frequency      gain\n",
+        trim(curve.sample_rate_hz as f32),
+        fmt_gain(curve.preamp_db)
+    );
+    for point in &curve.points {
+        output.push_str(&format!(
+            "  {:>8}  {:>8}\n",
+            fmt_freq(point.frequency_hz),
+            fmt_gain(point.gain_db)
+        ));
+    }
+    output
+}
+
+fn format_response_csv(curve: &FrequencyResponse) -> String {
+    let mut output = String::from("sample_rate_hz,frequency_hz,gain_db\n");
+    for point in &curve.points {
+        output.push_str(&format!(
+            "{},{},{}\n",
+            curve.sample_rate_hz, point.frequency_hz, point.gain_db
+        ));
+    }
+    output
 }
 
 fn handle_off_response(resp: &Response) -> anyhow::Result<()> {
@@ -783,6 +865,23 @@ mod tests {
         assert_eq!(fmt_q(1.41), "1.41");
         assert_eq!(fmt_q(2.0), "2");
         assert_eq!(fmt_q(0.7), "0.7");
+    }
+
+    #[test]
+    fn response_formats_include_the_authoritative_rate() {
+        let curve = FrequencyResponse {
+            sample_rate_hz: 48_000.0,
+            preamp_db: -3.0,
+            points: vec![eqtune::ipc::ResponsePoint {
+                frequency_hz: 1_000.0,
+                gain_db: 2.5,
+            }],
+        };
+        assert!(format_response(&curve).contains("sample rate: 48000 Hz"));
+        assert_eq!(
+            format_response_csv(&curve),
+            "sample_rate_hz,frequency_hz,gain_db\n48000,1000,2.5\n"
+        );
     }
 
     #[test]
