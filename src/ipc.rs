@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::dsp::Band;
+use crate::dsp::{Band, BandKind};
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Tuning and preset-list responses can be larger than requests, but still have a firm
@@ -52,6 +52,7 @@ pub enum Request {
         name: Option<String>,
     },
     SetBand {
+        kind: BandKind,
         freq: f32,
         gain_db: f32,
         q: f32,
@@ -261,6 +262,7 @@ mod tests {
                 name: Some("shared-car".into()),
             },
             Request::SetBand {
+                kind: BandKind::Peaking,
                 freq: 1000.0,
                 gain_db: -10.0,
                 q: 1.0,

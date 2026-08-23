@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::{
     Config, Preset, validate_band, validate_freq, validate_preamp, validate_preset,
 };
-use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS, peak_response_db, response_curve_db};
+#[cfg(test)]
+use crate::dsp::BandKind;
+use crate::dsp::{Band, EqSettings, MAX_BANDS, peak_response_db, response_curve_db};
 use crate::ipc::{
     self, FrequencyResponse, PresetBackup, Request, Response, ResponsePoint, Status, Tuning,
 };
@@ -470,7 +472,12 @@ impl Daemon {
                 self.commit_config(|c| import_preset(c, &path, name.as_deref()))?;
                 Ok(Response::Tuning(self.tuning()))
             }
-            Request::SetBand { freq, gain_db, q } => {
+            Request::SetBand {
+                kind,
+                freq,
+                gain_db,
+                q,
+            } => {
                 validate_band(freq, gain_db, q)?;
                 let preset = self.active_preset_mut()?;
                 if let Some(b) = preset
@@ -478,6 +485,7 @@ impl Daemon {
                     .iter_mut()
                     .find(|b| (b.freq - freq).abs() < BAND_MATCH_HZ)
                 {
+                    b.kind = kind;
                     b.gain_db = gain_db;
                     b.q = q;
                 } else {
@@ -487,7 +495,7 @@ impl Daemon {
                         )));
                     }
                     preset.bands.push(Band {
-                        kind: BandKind::Peaking,
+                        kind,
                         freq,
                         gain_db,
                         q,
@@ -2098,6 +2106,7 @@ mod tests {
         for i in 0..MAX_BANDS {
             let freq = 20.0 + i as f32;
             d.apply(Request::SetBand {
+                kind: BandKind::Peaking,
                 freq,
                 gain_db: 3.0,
                 q: 1.0,
@@ -2108,6 +2117,7 @@ mod tests {
         // One more *new* band must be rejected without mutating the preset.
         let resp = d
             .apply(Request::SetBand {
+                kind: BandKind::Peaking,
                 freq: 19_000.0,
                 gain_db: 3.0,
                 q: 1.0,
@@ -2117,12 +2127,14 @@ mod tests {
         assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
         // Editing an existing band is still allowed at the cap.
         d.apply(Request::SetBand {
+            kind: BandKind::LowShelf,
             freq: 20.0,
             gain_db: -3.0,
             q: 2.0,
         })
         .unwrap();
         assert_eq!(d.config.presets["empty"].bands.len(), MAX_BANDS);
+        assert_eq!(d.config.presets["empty"].bands[0].kind, BandKind::LowShelf);
     }
 
     #[test]

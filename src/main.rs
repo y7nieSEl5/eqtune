@@ -4,7 +4,7 @@
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::aot::{Bash, Fish, Zsh, generate};
 
 use eqtune::daemon::Daemon;
@@ -57,12 +57,13 @@ enum Command {
     PresetImport { path: PathBuf, name: Option<String> },
     /// Set or update a band: <freq_hz> <gain_db> [q].
     #[command(allow_negative_numbers = true)]
-    Band {
-        freq: f32,
-        gain_db: f32,
-        #[arg(default_value_t = 1.0)]
-        q: f32,
-    },
+    Band(BandArgs),
+    /// Set or update a low shelf: <freq_hz> <gain_db> [q].
+    #[command(name = "low-shelf", allow_negative_numbers = true)]
+    LowShelf(BandArgs),
+    /// Set or update a high shelf: <freq_hz> <gain_db> [q].
+    #[command(name = "high-shelf", allow_negative_numbers = true)]
+    HighShelf(BandArgs),
     /// Remove the band at <freq_hz>.
     #[command(name = "band-rm")]
     BandRm { freq: f32 },
@@ -96,6 +97,14 @@ enum Command {
     Uninstall,
     /// Generate a shell completion script on stdout.
     Completions { shell: CompletionShell },
+}
+
+#[derive(Args)]
+struct BandArgs {
+    freq: f32,
+    gain_db: f32,
+    #[arg(default_value_t = 1.0)]
+    q: f32,
 }
 
 /// An on/off argument for toggle subcommands (parsed as `on` / `off`).
@@ -205,11 +214,9 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
             path: absolute_path(path)?,
             name: name.clone(),
         },
-        Command::Band { freq, gain_db, q } => Request::SetBand {
-            freq: *freq,
-            gain_db: *gain_db,
-            q: *q,
-        },
+        Command::Band(args) => band_request(eqtune::dsp::BandKind::Peaking, args),
+        Command::LowShelf(args) => band_request(eqtune::dsp::BandKind::LowShelf, args),
+        Command::HighShelf(args) => band_request(eqtune::dsp::BandKind::HighShelf, args),
         Command::BandRm { freq } => Request::RemoveBand { freq: *freq },
         Command::Preamp { db } => Request::SetPreamp(*db),
         Command::PreampAuto => Request::SetPreampAuto,
@@ -228,6 +235,15 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
             unreachable!("handled above")
         }
     })
+}
+
+fn band_request(kind: eqtune::dsp::BandKind, args: &BandArgs) -> Request {
+    Request::SetBand {
+        kind,
+        freq: args.freq,
+        gain_db: args.gain_db,
+        q: args.q,
+    }
 }
 
 /// Render the daemon's reply, tailored to the command that produced it: `on` and edits
@@ -271,15 +287,9 @@ fn print_response(cmd: &Command, resp: &Response) {
                     }
                     None
                 }
-                Command::Band { freq, gain_db, q } => {
-                    println!(
-                        "band {} → {} (Q{})",
-                        fmt_freq(*freq),
-                        fmt_gain(*gain_db),
-                        fmt_q(*q)
-                    );
-                    Some(*freq)
-                }
+                Command::Band(args) => print_band_edit("band", args),
+                Command::LowShelf(args) => print_band_edit("low shelf", args),
+                Command::HighShelf(args) => print_band_edit("high shelf", args),
                 Command::BandRm { .. } => unreachable!("band-rm has its own response"),
                 Command::Preamp { db } => {
                     println!("preamp → {}", fmt_gain(*db));
@@ -461,6 +471,16 @@ fn print_response(cmd: &Command, resp: &Response) {
             );
         }
     }
+}
+
+fn print_band_edit(kind: &str, args: &BandArgs) -> Option<f32> {
+    println!(
+        "{kind} {} → {} (Q{})",
+        fmt_freq(args.freq),
+        fmt_gain(args.gain_db),
+        fmt_q(args.q)
+    );
+    Some(args.freq)
 }
 
 fn handle_frequency_response(cmd: &Command, resp: &Response) -> anyhow::Result<()> {
@@ -777,8 +797,13 @@ fn print_bands(t: &Tuning, changed: Option<f32>) {
         } else {
             ""
         };
+        let kind = match b.kind {
+            eqtune::dsp::BandKind::Peaking => "",
+            eqtune::dsp::BandKind::LowShelf => "low shelf ",
+            eqtune::dsp::BandKind::HighShelf => "high shelf ",
+        };
         println!(
-            "  {:>8}  {:>8}  Q{}{mark}",
+            "  {kind}{:>8}  {:>8}  Q{}{mark}",
             fmt_freq(b.freq),
             fmt_gain(b.gain_db),
             trim(b.q)
@@ -882,6 +907,19 @@ mod tests {
             format_response_csv(&curve),
             "sample_rate_hz,frequency_hz,gain_db\n48000,1000,2.5\n"
         );
+    }
+
+    #[test]
+    fn shelf_commands_preserve_the_peaking_band_command() {
+        for (name, expected) in [
+            ("band", eqtune::dsp::BandKind::Peaking),
+            ("low-shelf", eqtune::dsp::BandKind::LowShelf),
+            ("high-shelf", eqtune::dsp::BandKind::HighShelf),
+        ] {
+            let cli = Cli::try_parse_from(["eqtune", name, "100", "-3", "0.7"]).unwrap();
+            let request = to_request(&cli.command).unwrap();
+            assert!(matches!(request, Request::SetBand { kind, .. } if kind == expected));
+        }
     }
 
     #[test]
