@@ -19,7 +19,7 @@ use crate::config::{
 };
 use crate::dsp::{Band, BandKind, EqSettings, MAX_BANDS};
 use crate::ipc::{self, PresetBackup, Request, Response, Status, Tuning};
-use crate::sys::{self, EqHandle, TapSession};
+use crate::sys::{self, EqHandle, OutputTarget, TapSession};
 
 /// Two bands count as "the same band" if their frequencies are this close (Hz).
 const BAND_MATCH_HZ: f32 = 0.5;
@@ -163,8 +163,9 @@ pub struct Daemon {
     /// unsaved session survives a daemon restart. Removed once the session resolves.
     session_path: PathBuf,
     engine: Option<(TapSession, EqHandle)>,
-    /// (output device id, sample rate Hz) the running engine was built for.
-    engine_target: Option<(u32, u32)>,
+    /// Authoritative metadata for the output the running engine was validated against.
+    /// It is adopted only after tap startup succeeds.
+    engine_target: Option<OutputTarget>,
     /// The effective target: the audio engine should be running iff this is true.
     /// `reconcile` starts/stops the engine to match it. It folds `user_intent` together
     /// with the automatic suspends (Low Power Mode, idle).
@@ -262,6 +263,7 @@ impl Daemon {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => eprintln!("accept error: {e}"),
             }
+            self.follow_engine_health();
             self.follow_low_power();
             self.follow_idle_activity();
             self.follow_default_device();
@@ -576,17 +578,29 @@ impl Daemon {
         if self.engine.is_some() {
             return Ok(());
         }
-        let (dev, rate) = current_target();
-        let settings = self.settings_for(rate as f32);
-        match TapSession::start(CHANNELS, settings) {
-            Some(pair) => {
-                self.engine = Some(pair);
-                self.engine_target = Some((dev, rate));
-                Ok(())
-            }
-            None => Err(anyhow::anyhow!(
-                "could not start the audio tap — needs macOS 14.2+ and audio-capture permission"
-            )),
+        let target = OutputTarget::resolve_default()?;
+        let settings = self.settings_for(target.sample_rate as f32);
+        let pair = TapSession::start(&target, CHANNELS, settings)?;
+        self.engine = Some(pair);
+        // Do not expose a partly-probed target: the snapshot becomes authoritative only
+        // after the shim validated the aggregate streams and started its IOProc.
+        self.engine_target = Some(target);
+        Ok(())
+    }
+
+    /// Lift a realtime stream/layout failure onto the control thread. The callback only
+    /// publishes an atomic error and silences the unsafe block; teardown happens here,
+    /// outside realtime constraints, and restores the native path while `user_intent`
+    /// and `engine_target_on` continue to say the user wants EQ processing.
+    fn follow_engine_health(&mut self) {
+        let error = self
+            .engine
+            .as_ref()
+            .and_then(|(session, _)| session.runtime_error());
+        if let Some(error) = error {
+            eprintln!("audio engine failed: {error} — restoring native output");
+            self.engine = None;
+            self.engine_target = None;
         }
     }
 
@@ -596,9 +610,18 @@ impl Daemon {
         if self.engine.is_none() {
             return;
         }
-        let current = current_target();
-        if self.engine_target != Some(current) {
-            eprintln!("default output changed to {current:?} — rebuilding engine");
+        let Some(target) = self.engine_target.as_ref() else {
+            return;
+        };
+        // The steady-state poll needs only the one mutable target property that changes
+        // DSP construction. UID, name, and stream facts are resolved once per startup;
+        // runtime layout changes are reported by the IOProc itself.
+        let Some(rate) = sys::output_device_sample_rate(target.id) else {
+            eprintln!("could not inspect output #{} sample rate", target.id);
+            return;
+        };
+        if rate.round() as u32 != target.sample_rate.round() as u32 {
+            eprintln!("output sample rate changed to {rate} Hz — rebuilding engine");
             self.engine = None;
             self.engine_target = None;
             if let Err(e) = self.start_engine() {
@@ -649,7 +672,8 @@ impl Daemon {
         if let Some((_, handle)) = &self.engine {
             let rate = self
                 .engine_target
-                .map(|(_, r)| r)
+                .as_ref()
+                .map(|target| target.sample_rate.round() as u32)
                 .unwrap_or(DEFAULT_SAMPLE_RATE_HZ);
             let idle_frames = IDLE_SUSPEND_AFTER.as_secs().saturating_mul(rate as u64);
             if handle.silent_frames() >= idle_frames {
@@ -745,7 +769,8 @@ impl Daemon {
         if self.engine.is_some() {
             let fs = self
                 .engine_target
-                .map(|(_, r)| r as f32)
+                .as_ref()
+                .map(|target| target.sample_rate as f32)
                 .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f32);
             let settings = self.settings_for(fs);
             if let Some((_, handle)) = &self.engine {
@@ -947,8 +972,9 @@ impl Daemon {
         // the running engine with a device it is not on.
         let output_device = self
             .engine_target
+            .as_ref()
             .filter(|_| self.engine.is_some())
-            .map(|(dev, _)| sys::output_device_name(dev).unwrap_or_else(|| format!("#{dev}")));
+            .map(|target| target.name.clone());
         Status {
             enabled: self.engine.is_some(),
             active_preset: self.config.active_preset.clone(),
@@ -1034,15 +1060,6 @@ fn check_request_bounds(line_len: usize, deadline: Instant) -> anyhow::Result<()
         anyhow::bail!("client did not send a complete request in time");
     }
     Ok(())
-}
-
-/// The current default output device and its (rounded) sample rate.
-fn current_target() -> (u32, u32) {
-    let dev = sys::default_output_device().unwrap_or(0);
-    let rate = sys::default_output_sample_rate()
-        .unwrap_or(DEFAULT_SAMPLE_RATE_HZ as f64)
-        .round() as u32;
-    (dev, rate)
 }
 
 /// Initial `(engine_target_on, idle_suspended)` for a daemon restoring the persisted

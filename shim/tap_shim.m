@@ -5,6 +5,7 @@
 #import "tap_shim.h"
 
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -16,6 +17,8 @@ static void log_err(const char *what, OSStatus st) {
 // Current default output device, or kAudioObjectUnknown (0) on failure. Defined in the
 // helpers section below; the single query lives there so nothing here re-implements it.
 static AudioObjectID default_output_device(void);
+// Caller must CFRelease the returned string.
+static CFStringRef copy_device_uid(AudioObjectID device);
 
 static bool copy_stream_format(AudioDeviceID device,
                                AudioObjectPropertyScope scope,
@@ -45,8 +48,8 @@ uint32_t eqtune_default_output_device(void) {
     return (uint32_t)default_output_device();
 }
 
-double eqtune_default_output_sample_rate(void) {
-    AudioObjectID dev = default_output_device();
+double eqtune_output_device_sample_rate(uint32_t dev_id) {
+    AudioObjectID dev = (AudioObjectID)dev_id;
     if (dev == kAudioObjectUnknown) {
         return 0;
     }
@@ -109,6 +112,43 @@ bool eqtune_output_device_name(uint32_t dev_id, char *buf, size_t buflen) {
     }
 }
 
+bool eqtune_output_device_uid(uint32_t dev_id, char *buf, size_t buflen) {
+    if (!buf || buflen == 0) {
+        return false;
+    }
+    @autoreleasepool {
+        CFStringRef uid = copy_device_uid((AudioObjectID)dev_id);
+        if (!uid) {
+            return false;
+        }
+        bool ok = CFStringGetCString(uid, buf, (CFIndex)buflen, kCFStringEncodingUTF8);
+        CFRelease(uid);
+        return ok;
+    }
+}
+
+static void export_stream_facts(const AudioStreamBasicDescription *format,
+                                eqtune_stream_facts *facts) {
+    facts->sample_rate = format->mSampleRate;
+    facts->format_id = format->mFormatID;
+    facts->format_flags = format->mFormatFlags;
+    facts->bytes_per_frame = format->mBytesPerFrame;
+    facts->channels_per_frame = format->mChannelsPerFrame;
+    facts->bits_per_channel = format->mBitsPerChannel;
+}
+
+bool eqtune_output_device_stream_facts(uint32_t dev_id, eqtune_stream_facts *facts) {
+    if (!facts || dev_id == kAudioObjectUnknown) {
+        return false;
+    }
+    AudioStreamBasicDescription format = {0};
+    if (!copy_stream_format((AudioDeviceID)dev_id, kAudioObjectPropertyScopeOutput, &format)) {
+        return false;
+    }
+    export_stream_facts(&format, facts);
+    return true;
+}
+
 // --- helpers ---------------------------------------------------------------
 
 static AudioObjectID default_output_device(void) {
@@ -161,7 +201,36 @@ struct eqtune_tap_session {
     AudioDeviceIOProcID ioproc;
     eqtune_process_cb cb;
     void *ctx;
+    _Atomic uint32_t runtime_error;
 };
+
+enum {
+    EQTUNE_RUNTIME_ERROR_NONE = 0,
+    EQTUNE_RUNTIME_ERROR_OUTPUT_LAYOUT = 1,
+    EQTUNE_RUNTIME_ERROR_INPUT_LAYOUT = 2,
+    EQTUNE_RUNTIME_ERROR_BUFFER_SIZE = 3,
+};
+
+static void silence_output(AudioBufferList *output) {
+    if (!output) {
+        return;
+    }
+    for (UInt32 b = 0; b < output->mNumberBuffers; b++) {
+        AudioBuffer *buffer = &output->mBuffers[b];
+        if (buffer->mData) {
+            memset(buffer->mData, 0, buffer->mDataByteSize);
+        }
+    }
+}
+
+static void fail_runtime(struct eqtune_tap_session *session,
+                         AudioBufferList *output,
+                         uint32_t error) {
+    uint32_t expected = EQTUNE_RUNTIME_ERROR_NONE;
+    atomic_compare_exchange_strong_explicit(&session->runtime_error, &expected, error,
+                                            memory_order_relaxed, memory_order_relaxed);
+    silence_output(output);
+}
 
 static OSStatus io_proc(AudioObjectID inDevice,
                         const AudioTimeStamp *inNow,
@@ -176,58 +245,74 @@ static OSStatus io_proc(AudioObjectID inDevice,
         return noErr;
     }
 
+    if (atomic_load_explicit(&s->runtime_error, memory_order_relaxed) !=
+        EQTUNE_RUNTIME_ERROR_NONE) {
+        silence_output(outOutputData);
+        return noErr;
+    }
+
     // Start-up validation establishes a single interleaved stereo stream. Keep a runtime
     // guard as well: Core Audio must never make us cast or copy an unexpected layout if a
     // device changes its stream topology underneath the aggregate.
     if (outOutputData->mNumberBuffers != 1 ||
         !outOutputData->mBuffers[0].mData ||
         outOutputData->mBuffers[0].mNumberChannels != 2) {
-        for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
-            AudioBuffer *out = &outOutputData->mBuffers[b];
-            if (out->mData) {
-                memset(out->mData, 0, out->mDataByteSize);
-            }
-        }
+        fail_runtime(s, outOutputData, EQTUNE_RUNTIME_ERROR_OUTPUT_LAYOUT);
         return noErr;
     }
 
-    for (UInt32 b = 0; b < outOutputData->mNumberBuffers; b++) {
-        AudioBuffer *out = &outOutputData->mBuffers[b];
-        float *out_data = (float *)out->mData;
-        UInt32 channels = out->mNumberChannels;
-        UInt32 frames = out->mDataByteSize / sizeof(float) / channels;
+    AudioBuffer *out = &outOutputData->mBuffers[0];
+    const UInt32 frame_bytes = 2 * sizeof(float);
+    if (out->mDataByteSize == 0 || out->mDataByteSize % frame_bytes != 0) {
+        fail_runtime(s, outOutputData, EQTUNE_RUNTIME_ERROR_BUFFER_SIZE);
+        return noErr;
+    }
+    if (!inInputData || inInputData->mNumberBuffers != 1 ||
+        !inInputData->mBuffers[0].mData ||
+        inInputData->mBuffers[0].mNumberChannels != 2) {
+        fail_runtime(s, outOutputData, EQTUNE_RUNTIME_ERROR_INPUT_LAYOUT);
+        return noErr;
+    }
+    const AudioBuffer *in = &inInputData->mBuffers[0];
+    if (in->mDataByteSize != out->mDataByteSize || in->mDataByteSize % frame_bytes != 0) {
+        fail_runtime(s, outOutputData, EQTUNE_RUNTIME_ERROR_BUFFER_SIZE);
+        return noErr;
+    }
 
-        // Fill the output from the matching tap input buffer (system audio).
-        if (inInputData && inInputData->mNumberBuffers == 1 &&
-            inInputData->mBuffers[0].mData &&
-            inInputData->mBuffers[0].mNumberChannels == channels) {
-            const AudioBuffer *in = &inInputData->mBuffers[b];
-            UInt32 copy = in->mDataByteSize < out->mDataByteSize ? in->mDataByteSize : out->mDataByteSize;
-            memcpy(out_data, in->mData, copy);
-            if (copy < out->mDataByteSize) {
-                memset((uint8_t *)out_data + copy, 0, out->mDataByteSize - copy);
-            }
-        } else {
-            memset(out_data, 0, out->mDataByteSize);
-        }
-
-        if (s->cb && out_data && frames > 0) {
-            s->cb(s->ctx, out_data, frames, channels);
-        }
+    memcpy(out->mData, in->mData, out->mDataByteSize);
+    UInt32 frames = out->mDataByteSize / frame_bytes;
+    if (s->cb && frames > 0) {
+        s->cb(s->ctx, (float *)out->mData, frames, 2);
     }
     return noErr;
 }
 
-eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
+static void set_start_error(char *buf, size_t buflen, const char *message) {
+    if (buf && buflen > 0) {
+        snprintf(buf, buflen, "%s", message);
+    }
+}
+
+static void set_start_osstatus_error(char *buf, size_t buflen, const char *what, OSStatus status) {
+    if (buf && buflen > 0) {
+        snprintf(buf, buflen, "%s failed (OSStatus %d)", what, (int)status);
+    }
+}
+
+eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
+                                     eqtune_process_cb cb,
+                                     void *ctx,
+                                     char *error_buf,
+                                     size_t error_buflen) {
     @autoreleasepool {
-        AudioObjectID output = default_output_device();
+        AudioObjectID output = (AudioObjectID)output_device;
         if (output == kAudioObjectUnknown) {
-            fprintf(stderr, "eqtune shim: no default output device\n");
+            set_start_error(error_buf, error_buflen, "no output device");
             return NULL;
         }
         CFStringRef output_uid = copy_device_uid(output);
         if (!output_uid) {
-            fprintf(stderr, "eqtune shim: could not read output device UID\n");
+            set_start_error(error_buf, error_buflen, "could not read output device UID");
             return NULL;
         }
 
@@ -245,6 +330,8 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
         OSStatus st = AudioHardwareCreateProcessTap(desc, &tap);
         if (st != noErr || tap == kAudioObjectUnknown) {
             log_err("AudioHardwareCreateProcessTap", st);
+            set_start_osstatus_error(error_buf, error_buflen,
+                                     "AudioHardwareCreateProcessTap", st);
             CFRelease(output_uid);
             return NULL;
         }
@@ -270,6 +357,8 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
         CFRelease(output_uid);
         if (st != noErr || aggregate == kAudioObjectUnknown) {
             log_err("AudioHardwareCreateAggregateDevice", st);
+            set_start_osstatus_error(error_buf, error_buflen,
+                                     "AudioHardwareCreateAggregateDevice", st);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;
         }
@@ -288,6 +377,9 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
             fprintf(stderr,
                     "eqtune shim: aggregate device does not expose matching interleaved "
                     "stereo Float32 input/output streams\n");
+            set_start_error(error_buf, error_buflen,
+                            "aggregate device does not expose matching interleaved stereo "
+                            "Float32 input/output streams");
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;
@@ -296,6 +388,7 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
         struct eqtune_tap_session *s = calloc(1, sizeof(struct eqtune_tap_session));
         if (!s) {
             fprintf(stderr, "eqtune shim: could not allocate tap session\n");
+            set_start_error(error_buf, error_buflen, "could not allocate tap session");
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;
@@ -308,6 +401,7 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
         st = AudioDeviceCreateIOProcID(aggregate, io_proc, s, &s->ioproc);
         if (st != noErr) {
             log_err("AudioDeviceCreateIOProcID", st);
+            set_start_osstatus_error(error_buf, error_buflen, "AudioDeviceCreateIOProcID", st);
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             free(s);
@@ -317,6 +411,7 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
         st = AudioDeviceStart(aggregate, s->ioproc);
         if (st != noErr) {
             log_err("AudioDeviceStart", st);
+            set_start_osstatus_error(error_buf, error_buflen, "AudioDeviceStart", st);
             AudioDeviceDestroyIOProcID(aggregate, s->ioproc);
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
@@ -326,6 +421,13 @@ eqtune_tap_session *eqtune_tap_start(eqtune_process_cb cb, void *ctx) {
 
         return s;
     }
+}
+
+uint32_t eqtune_tap_runtime_error(eqtune_tap_session *s) {
+    if (!s) {
+        return EQTUNE_RUNTIME_ERROR_NONE;
+    }
+    return atomic_load_explicit(&s->runtime_error, memory_order_relaxed);
 }
 
 void eqtune_tap_stop(eqtune_tap_session *s) {
