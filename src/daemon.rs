@@ -358,7 +358,7 @@ impl Daemon {
 
     fn apply(&mut self, req: Request) -> anyhow::Result<Response> {
         match req {
-            Request::Status => Ok(Response::Status(self.status())),
+            Request::Status => Ok(Response::Status(Box::new(self.status()))),
             Request::Enable => {
                 self.user_intent = true;
                 self.idle_suspended = false;
@@ -1106,26 +1106,57 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let active = self.config.active();
-        // Resolve the name of the device the engine is actually attached to. Between a
-        // default-device change and the next `follow_default_device` tick, `engine_target`
-        // still points at the old device, so naming the *current default* here would label
-        // the running engine with a device it is not on.
-        let output_device = self
+        // Metadata comes only from the target whose stream validation and startup
+        // succeeded. Never relabel a running engine from the current system default.
+        let target = self
             .engine_target
             .as_ref()
-            .filter(|_| self.engine.is_some())
-            .map(|target| target.name.clone());
+            .filter(|_| self.engine.is_some());
+        let now = Instant::now();
+        let retry_in_seconds = self.recovery.next_retry.map(|at| {
+            let millis = at.saturating_duration_since(now).as_millis();
+            millis.div_ceil(1_000) as u64
+        });
         Status {
-            enabled: self.engine.is_some(),
+            user_intent: self.user_intent,
+            engine_running: self.engine.is_some(),
+            suspension_reason: self.suspension_reason().map(str::to_owned),
             active_preset: self.config.active_preset.clone(),
             preamp_db: active.map(|p| p.preamp_db).unwrap_or(0.0),
             band_count: active.map(|p| p.bands.len()).unwrap_or(0),
             limiter: self.config.limiter,
-            output_device,
+            output_uid: target.map(|target| target.uid.clone()),
+            output_name: target.map(|target| target.name.clone()),
+            output_rate_hz: target.map(|target| target.sample_rate),
+            output_stream: target.map(|target| target.stream.description()),
+            last_engine_error: self.last_engine_error.clone(),
+            retry_attempts: self.recovery.retries_attempted,
+            retry_limit: RETRY_DELAYS.len(),
+            retry_in_seconds,
+            retry_exhausted: self.recovery.exhausted,
+            bypassed: false,
+            dirty_presets: self.dirty_preset_names(),
             low_power: self.low_power,
             auto_off_low_power: self.config.auto_off_low_power,
             auto_off_idle: self.config.auto_off_idle,
-            idle_suspended: self.idle_suspended,
+        }
+    }
+
+    fn suspension_reason(&self) -> Option<&'static str> {
+        if self.engine.is_some() {
+            None
+        } else if !self.user_intent {
+            Some("user-off")
+        } else if self.config.auto_off_low_power && self.low_power && !self.engine_target_on {
+            Some("low-power")
+        } else if self.idle_suspended {
+            Some("idle")
+        } else if self.recovery.exhausted {
+            Some("recovery-exhausted")
+        } else if self.recovery.next_retry.is_some() {
+            Some("recovering")
+        } else {
+            Some("starting")
         }
     }
 
@@ -2615,6 +2646,54 @@ mod tests {
         assert!(d.engine.is_none());
         assert!(d.last_engine_error.is_none());
         assert!(d.recovery.exhausted);
+    }
+
+    #[test]
+    fn status_explains_recovery_and_unsaved_presets() {
+        let mut d = daemon_with(Config::default());
+        d.user_intent = true;
+        d.engine_target_on = true;
+        d.last_engine_error = Some("runtime input stream layout changed".into());
+        d.recovery.schedule_initial(Instant::now());
+        d.config.presets.get_mut("bright").unwrap().preamp_db = -3.0;
+
+        let status = d.status();
+
+        assert!(status.user_intent);
+        assert!(!status.engine_running);
+        assert_eq!(status.suspension_reason.as_deref(), Some("recovering"));
+        assert_eq!(status.retry_attempts, 0);
+        assert_eq!(status.retry_limit, 6);
+        assert_eq!(status.retry_in_seconds, Some(1));
+        assert!(!status.retry_exhausted);
+        assert_eq!(
+            status.last_engine_error.as_deref(),
+            Some("runtime input stream layout changed")
+        );
+        assert_eq!(status.dirty_presets, ["bright"]);
+        assert!(!status.bypassed);
+        assert!(status.output_uid.is_none());
+    }
+
+    #[test]
+    fn status_distinguishes_policy_and_exhaustion_suspensions() {
+        let mut d = daemon_with(Config {
+            enabled: true,
+            ..Config::default()
+        });
+        d.user_intent = true;
+        d.engine_target_on = false;
+        d.low_power = true;
+        assert_eq!(d.suspension_reason(), Some("low-power"));
+
+        d.low_power = false;
+        d.idle_suspended = true;
+        assert_eq!(d.suspension_reason(), Some("idle"));
+
+        d.idle_suspended = false;
+        d.engine_target_on = true;
+        d.recovery.exhausted = true;
+        assert_eq!(d.suspension_reason(), Some("recovery-exhausted"));
     }
 
     #[test]

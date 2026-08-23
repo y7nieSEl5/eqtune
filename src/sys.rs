@@ -104,6 +104,20 @@ impl StreamFacts {
         // kAudioFormatFlagIsNonInterleaved
         self.format_flags & (1 << 5) == 0
     }
+
+    pub fn description(&self) -> String {
+        format!(
+            "{} Hz, {} ch, {}, {}",
+            self.sample_rate,
+            self.channels,
+            self.format_name(),
+            if self.interleaved() {
+                "interleaved"
+            } else {
+                "non-interleaved"
+            }
+        )
+    }
 }
 
 /// One coherent description of a prospective output. The default ID is resolved once;
@@ -342,6 +356,7 @@ mod tests {
         };
         assert_eq!(facts.format_name(), "Float32");
         assert!(facts.interleaved());
+        assert_eq!(facts.description(), "48000 Hz, 2 ch, Float32, interleaved");
 
         facts.format_flags |= 1 << 5;
         assert!(!facts.interleaved());

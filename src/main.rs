@@ -328,14 +328,68 @@ fn print_response(cmd: &Command, resp: &Response) {
             _ => println!("ok"),
         },
         Response::Status(s) => {
-            println!("enabled:       {}", s.enabled);
+            println!(
+                "intent:        {}",
+                if s.user_intent { "on" } else { "off" }
+            );
+            println!(
+                "engine:        {}",
+                if s.engine_running {
+                    "running"
+                } else {
+                    "stopped"
+                }
+            );
+            println!(
+                "suspension:    {}",
+                s.suspension_reason.as_deref().unwrap_or("none")
+            );
             println!("preset:        {}", s.active_preset);
             println!("preamp:        {:+} dB", s.preamp_db);
             println!("bands:         {}", s.band_count);
             println!("limiter:       {}", s.limiter);
             println!(
-                "output device: {}",
-                s.output_device.as_deref().unwrap_or("(engine not running)")
+                "output UID:    {}",
+                s.output_uid.as_deref().unwrap_or("(unavailable)")
+            );
+            println!(
+                "output name:   {}",
+                s.output_name.as_deref().unwrap_or("(unavailable)")
+            );
+            println!(
+                "output rate:   {}",
+                s.output_rate_hz
+                    .map(|rate| format!("{} Hz", trim(rate as f32)))
+                    .unwrap_or_else(|| "(unavailable)".into())
+            );
+            println!(
+                "output stream: {}",
+                s.output_stream.as_deref().unwrap_or("(unavailable)")
+            );
+            println!(
+                "last error:    {}",
+                s.last_engine_error.as_deref().unwrap_or("none")
+            );
+            let retry = match (s.retry_exhausted, s.retry_in_seconds) {
+                (false, Some(seconds)) => format!(
+                    "scheduled {}/{} in {seconds}s",
+                    s.retry_attempts + 1,
+                    s.retry_limit
+                ),
+                (true, _) => {
+                    format!("exhausted {}/{}", s.retry_attempts, s.retry_limit)
+                }
+                _ => "idle".into(),
+            };
+            println!("retry:         {retry}");
+            println!("bypass:        {}", if s.bypassed { "on" } else { "off" });
+            println!(
+                "dirty presets: {}",
+                if s.dirty_presets.is_empty() {
+                    "none".into()
+                } else {
+                    s.dirty_presets.join(", ")
+                }
             );
             println!("low power:     {}", if s.low_power { "on" } else { "off" });
             println!(
@@ -345,10 +399,6 @@ fn print_response(cmd: &Command, resp: &Response) {
             println!(
                 "auto-off idle: {}",
                 if s.auto_off_idle { "on" } else { "off" }
-            );
-            println!(
-                "idle suspend:  {}",
-                if s.idle_suspended { "yes" } else { "no" }
             );
         }
         Response::Presets { active, names } => {

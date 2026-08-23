@@ -85,7 +85,7 @@ pub enum Request {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Response {
     Ok,
-    Status(Status),
+    Status(Box<Status>),
     /// The active tuning after `on` or any EQ edit, so the client can show the resulting
     /// curve (preset, preamp, and bands).
     Tuning(Tuning),
@@ -134,21 +134,39 @@ pub struct Tuning {
 /// A snapshot of daemon state, returned for `eqtune status`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct Status {
-    pub enabled: bool,
+    /// The user's durable desired on/off state, independent of temporary suspension or
+    /// engine failure.
+    pub user_intent: bool,
+    /// Whether the Core Audio tap is actually running now.
+    pub engine_running: bool,
+    /// Why desired processing is not running, if applicable.
+    pub suspension_reason: Option<String>,
     pub active_preset: String,
     pub preamp_db: f32,
     pub band_count: usize,
     pub limiter: bool,
-    /// The real output device audio is being sent to (None until the engine runs).
-    pub output_device: Option<String>,
+    /// Validated output metadata. All fields remain `None` until startup succeeds.
+    pub output_uid: Option<String>,
+    pub output_name: Option<String>,
+    pub output_rate_hz: Option<f64>,
+    /// Compact sample-rate/channel/format/layout description.
+    pub output_stream: Option<String>,
+    pub last_engine_error: Option<String>,
+    /// Number of retries already attempted in the current incident.
+    pub retry_attempts: usize,
+    pub retry_limit: usize,
+    pub retry_in_seconds: Option<u64>,
+    pub retry_exhausted: bool,
+    /// Runtime dry-path bypass. It remains false until the 0.7.0 bypass command exists.
+    pub bypassed: bool,
+    /// Presets carrying session edits that have not been saved or discarded.
+    pub dirty_presets: Vec<String>,
     /// Whether macOS Low Power Mode is currently active.
     pub low_power: bool,
     /// Whether the auto-off-on-Low-Power-Mode policy is enabled.
     pub auto_off_low_power: bool,
     /// Whether sustained no-media/no-signal idle suspension is enabled.
     pub auto_off_idle: bool,
-    /// Whether the engine is currently suspended because no media is active.
-    pub idle_suspended: bool,
 }
 
 /// Location of the control socket.
@@ -266,20 +284,31 @@ mod tests {
     #[test]
     fn response_round_trips() {
         let st = Status {
-            enabled: true,
+            user_intent: true,
+            engine_running: true,
+            suspension_reason: None,
             active_preset: "default".into(),
             preamp_db: 7.0,
             band_count: 3,
             limiter: true,
-            output_device: Some("MacBook Pro Speakers".into()),
+            output_uid: Some("BuiltInSpeakerDevice".into()),
+            output_name: Some("MacBook Pro Speakers".into()),
+            output_rate_hz: Some(48_000.0),
+            output_stream: Some("48000 Hz, 2 ch, Float32, interleaved".into()),
+            last_engine_error: None,
+            retry_attempts: 0,
+            retry_limit: 6,
+            retry_in_seconds: None,
+            retry_exhausted: false,
+            bypassed: false,
+            dirty_presets: vec!["bright".into()],
             low_power: false,
             auto_off_low_power: true,
             auto_off_idle: true,
-            idle_suspended: false,
         };
         let resps = [
             Response::Ok,
-            Response::Status(st),
+            Response::Status(Box::new(st)),
             Response::Tuning(Tuning {
                 enabled: true,
                 preset: "bright".into(),
