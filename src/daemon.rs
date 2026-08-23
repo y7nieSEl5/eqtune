@@ -47,6 +47,55 @@ const IDLE_SUSPEND_AFTER: Duration = Duration::from_secs(10);
 /// is best-effort, so at most this much of an in-progress burst is at risk on a crash.
 const SESSION_MIRROR_MIN_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_PRESET_NAME_LEN: usize = 64;
+/// Bounded recovery schedule for one engine-failure incident. The first failed desired
+/// start is the incident trigger; these are the six subsequent retry delays.
+const RETRY_DELAYS: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(30),
+];
+
+#[derive(Debug, Default)]
+struct Recovery {
+    retries_attempted: usize,
+    next_retry: Option<Instant>,
+    exhausted: bool,
+}
+
+impl Recovery {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn pause(&mut self) {
+        self.next_retry = None;
+    }
+
+    /// Schedule after an initial failure, before any retries have run.
+    fn schedule_initial(&mut self, now: Instant) {
+        self.retries_attempted = 0;
+        self.exhausted = false;
+        self.next_retry = Some(now + RETRY_DELAYS[0]);
+    }
+
+    /// Record one failed retry and either schedule the next or exhaust the incident.
+    fn retry_failed(&mut self, now: Instant) {
+        self.retries_attempted += 1;
+        if self.retries_attempted >= RETRY_DELAYS.len() {
+            self.next_retry = None;
+            self.exhausted = true;
+        } else {
+            self.next_retry = Some(now + RETRY_DELAYS[self.retries_attempted]);
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        self.next_retry.is_some_and(|at| now >= at)
+    }
+}
 
 /// Process-lifetime advisory lock for the daemon. The lock file intentionally remains on
 /// disk after exit: deleting it would let two processes lock different inodes during a
@@ -179,6 +228,12 @@ pub struct Daemon {
     user_intent: bool,
     /// Last-seen macOS Low Power Mode state (edge-detected in `follow_low_power`).
     low_power: bool,
+    /// Last default output ID seen by the device follower. Unlike `engine_target`, this
+    /// remains populated while recovery is waiting/exhausted, so a device change can
+    /// reset the incident budget even though no tap is running.
+    observed_output_id: Option<u32>,
+    recovery: Recovery,
+    last_engine_error: Option<String>,
     /// Whether the engine is currently off because captured audio was silent long enough
     /// to count as no active media.
     idle_suspended: bool,
@@ -201,6 +256,7 @@ impl Daemon {
             .unwrap_or_else(|| saved_config.clone());
         // Seed from the real state so the first poll doesn't fire a spurious edge.
         let low_power = sys::low_power_enabled();
+        let observed_output_id = sys::default_output_device();
         // Runtime on/off intent, seeded from the persisted `enabled` and then tracked in
         // memory so it stays correct even if a later persist fails (see `set_enabled`).
         let user_intent = config.enabled;
@@ -219,6 +275,9 @@ impl Daemon {
             engine: None,
             engine_target: None,
             low_power,
+            observed_output_id,
+            recovery: Recovery::default(),
+            last_engine_error: None,
             draft_dirty: false,
             draft_last_write: None,
         })
@@ -267,6 +326,7 @@ impl Daemon {
             self.follow_low_power();
             self.follow_idle_activity();
             self.follow_default_device();
+            self.follow_recovery();
             self.maybe_flush_draft(Instant::now());
             std::thread::sleep(POLL);
         }
@@ -303,24 +363,20 @@ impl Daemon {
                 self.user_intent = true;
                 self.idle_suspended = false;
                 self.engine_target_on = true;
+                // An explicit `on` always starts a fresh incident and tries immediately,
+                // including while a previous incident was waiting or exhausted.
+                self.recovery.reset();
                 // Override: starts even while Low Power Mode is active.
-                if let Err(e) = self.reconcile() {
-                    // A failed start is a failed enable: leave no half-on target or intent
-                    // behind, or a later unrelated reconcile (an LPM edge) would start the
-                    // EQ as a side effect of a command that never succeeded.
-                    self.user_intent = false;
-                    self.engine_target_on = false;
-                    return Err(e);
-                }
-                // Persist only after the engine actually started: recording enabled=true
-                // for a start that failed (capture permission not granted yet) would make
-                // a later daemon restart silently start the EQ although no `eqtune on`
-                // ever succeeded. The live `user_intent` above already reflects the on
-                // state, so a persist failure here costs only durability, not correct
-                // runtime idle/LPM behavior.
+                let start = self.reconcile();
+                // `enabled` is desired user intent, not a claim that the tap is healthy.
+                // Persist it even when the immediate start failed so bounded recovery and
+                // daemon restarts continue honoring the explicit command.
                 self.set_enabled(true).context(
-                    "the EQ is running, but the on state could not be saved — it would \
-                     not survive a daemon restart; retry `eqtune on`",
+                    "the on intent could not be saved — it would not survive a daemon \
+                     restart; retry `eqtune on`",
+                )?;
+                start.context(
+                    "native output is active; automatic recovery is scheduled after 1 second",
                 )?;
                 Ok(Response::Tuning(self.tuning()))
             }
@@ -333,6 +389,7 @@ impl Daemon {
                 self.user_intent = false;
                 self.idle_suspended = false;
                 self.engine_target_on = false;
+                self.recovery.reset();
                 self.reconcile()?; // drops the TapSession -> large energy drop
                 self.set_enabled(false).context(
                     "the EQ was stopped for this run, but the off state could not be \
@@ -476,12 +533,16 @@ impl Daemon {
                 self.commit_setting(|c| c.auto_off_low_power = on)?;
                 if on && self.low_power {
                     self.engine_target_on = false; // apply the policy right now
+                    self.recovery.pause();
                 } else if !on {
                     // Lift any LPM suppression — but an idle suspension is not this
                     // toggle's to lift: restarting the engine here with no media playing
                     // would contradict the idle policy (follow_low_power and
                     // SetAutoOffIdle apply the same guard).
                     self.engine_target_on = self.user_intent && !self.idle_suspended;
+                    if self.engine_target_on && self.engine.is_none() {
+                        self.recovery.reset();
+                    }
                 }
                 self.reconcile()?;
                 Ok(Response::Ok)
@@ -492,6 +553,7 @@ impl Daemon {
                     self.idle_suspended = false;
                     if self.user_intent && !(self.config.auto_off_low_power && self.low_power) {
                         self.engine_target_on = true;
+                        self.recovery.reset();
                     }
                 }
                 self.reconcile()?;
@@ -566,7 +628,11 @@ impl Daemon {
     /// (no tap permission / unsupported macOS); stopping cannot.
     fn reconcile(&mut self) -> anyhow::Result<()> {
         if self.engine_target_on && self.engine.is_none() {
-            self.start_engine()?;
+            // A scheduled or exhausted incident is owned by `follow_recovery`; ordinary
+            // reconciles must not smuggle in unbounded extra attempts.
+            if self.recovery.next_retry.is_none() && !self.recovery.exhausted {
+                self.try_start_engine(Instant::now(), false)?;
+            }
         } else if !self.engine_target_on && self.engine.is_some() {
             self.engine = None; // drops TapSession -> stops the audio thread
             self.engine_target = None;
@@ -588,6 +654,27 @@ impl Daemon {
         Ok(())
     }
 
+    fn try_start_engine(&mut self, now: Instant, retry: bool) -> anyhow::Result<()> {
+        match self.start_engine() {
+            Ok(()) => {
+                self.recovery.reset();
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                self.last_engine_error = Some(message.clone());
+                if self.engine_target_on {
+                    if retry {
+                        self.recovery.retry_failed(now);
+                    } else {
+                        self.recovery.schedule_initial(now);
+                    }
+                }
+                Err(anyhow::anyhow!(message))
+            }
+        }
+    }
+
     /// Lift a realtime stream/layout failure onto the control thread. The callback only
     /// publishes an atomic error and silences the unsafe block; teardown happens here,
     /// outside realtime constraints, and restores the native path while `user_intent`
@@ -601,12 +688,33 @@ impl Daemon {
             eprintln!("audio engine failed: {error} — restoring native output");
             self.engine = None;
             self.engine_target = None;
+            self.last_engine_error = Some(error.to_string());
+            self.recovery.reset();
+            if self.engine_target_on {
+                self.recovery.schedule_initial(Instant::now());
+            }
         }
     }
 
     /// Rebuild the engine if the system default output device (or its sample rate)
     /// changed, so replay follows wherever audio is now meant to go.
     fn follow_default_device(&mut self) {
+        let output_id = sys::default_output_device();
+        if output_id != self.observed_output_id {
+            self.observed_output_id = output_id;
+            eprintln!("default output changed to {output_id:?} — rebuilding engine");
+            self.engine = None;
+            self.engine_target = None;
+            if self.engine_target_on {
+                self.recovery.reset();
+                if let Err(e) = self.reconcile() {
+                    eprintln!("engine rebuild failed: {e}");
+                }
+            } else {
+                self.recovery.pause();
+            }
+            return;
+        }
         if self.engine.is_none() {
             return;
         }
@@ -624,8 +732,32 @@ impl Daemon {
             eprintln!("output sample rate changed to {rate} Hz — rebuilding engine");
             self.engine = None;
             self.engine_target = None;
-            if let Err(e) = self.start_engine() {
+            self.recovery.reset();
+            if let Err(e) = self.reconcile() {
                 eprintln!("engine rebuild failed: {e}");
+            }
+        }
+    }
+
+    fn follow_recovery(&mut self) {
+        if !self.engine_target_on || self.engine.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if !self.recovery.due(now) {
+            return;
+        }
+        let attempt = self.recovery.retries_attempted + 1;
+        self.recovery.next_retry = None;
+        eprintln!("retrying audio engine ({attempt}/{})", RETRY_DELAYS.len());
+        if let Err(e) = self.try_start_engine(now, true) {
+            if self.recovery.exhausted {
+                eprintln!(
+                    "audio engine recovery exhausted after {} retries: {e}",
+                    RETRY_DELAYS.len()
+                );
+            } else {
+                eprintln!("audio engine retry failed: {e}");
             }
         }
     }
@@ -647,6 +779,12 @@ impl Daemon {
         } else {
             self.user_intent && !self.idle_suspended
         };
+        if now {
+            self.recovery.pause();
+        } else if self.engine_target_on && self.engine.is_none() {
+            // Leaving a suppressing policy is a legitimate new resume incident.
+            self.recovery.reset();
+        }
         eprintln!(
             "low power mode {} — eqtune {}",
             if now { "on" } else { "off" },
@@ -679,6 +817,7 @@ impl Daemon {
             if handle.silent_frames() >= idle_frames {
                 self.idle_suspended = true;
                 self.engine_target_on = false;
+                self.recovery.pause();
                 eprintln!("no active media detected — eqtune suspended");
                 if let Err(e) = self.reconcile() {
                     eprintln!("engine idle-suspend failed: {e}");
@@ -696,6 +835,7 @@ impl Daemon {
         if sys::default_output_device_running() {
             self.idle_suspended = false;
             self.engine_target_on = true;
+            self.recovery.reset();
             eprintln!("default output active — eqtune resuming");
             if let Err(e) = self.reconcile() {
                 eprintln!("engine idle-resume failed: {e}");
@@ -2421,6 +2561,63 @@ mod tests {
     }
 
     #[test]
+    fn recovery_uses_the_bounded_backoff_schedule() {
+        let start = Instant::now();
+        let mut recovery = Recovery::default();
+
+        recovery.schedule_initial(start);
+        assert_eq!(recovery.next_retry, Some(start + RETRY_DELAYS[0]));
+        assert_eq!(recovery.retries_attempted, 0);
+
+        for (attempt, delay) in RETRY_DELAYS.iter().enumerate().skip(1) {
+            let failure = start + Duration::from_secs(attempt as u64 * 100);
+            recovery.retry_failed(failure);
+            assert_eq!(recovery.retries_attempted, attempt);
+            assert_eq!(recovery.next_retry, Some(failure + *delay));
+            assert!(!recovery.exhausted);
+        }
+
+        recovery.retry_failed(start + Duration::from_secs(1_000));
+        assert_eq!(recovery.retries_attempted, RETRY_DELAYS.len());
+        assert!(recovery.next_retry.is_none());
+        assert!(recovery.exhausted);
+    }
+
+    #[test]
+    fn recovery_reset_opens_a_fresh_incident_budget() {
+        let start = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.schedule_initial(start);
+        for attempt in 0..RETRY_DELAYS.len() {
+            recovery.retry_failed(start + Duration::from_secs(attempt as u64));
+        }
+        assert!(recovery.exhausted);
+
+        recovery.reset();
+        assert_eq!(recovery.retries_attempted, 0);
+        assert!(recovery.next_retry.is_none());
+        assert!(!recovery.exhausted);
+
+        recovery.schedule_initial(start);
+        assert_eq!(recovery.next_retry, Some(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn exhausted_recovery_cannot_reconcile_an_extra_attempt() {
+        let mut d = daemon_with(Config::default());
+        d.user_intent = true;
+        d.engine_target_on = true;
+        d.recovery.exhausted = true;
+        d.recovery.retries_attempted = RETRY_DELAYS.len();
+
+        d.reconcile().unwrap();
+
+        assert!(d.engine.is_none());
+        assert!(d.last_engine_error.is_none());
+        assert!(d.recovery.exhausted);
+    }
+
+    #[test]
     fn daemon_lock_allows_only_one_holder() -> anyhow::Result<()> {
         let path = tmp_path("daemon.lock");
         let first = DaemonLock::acquire(&path)?;
@@ -2507,6 +2704,9 @@ mod tests {
             engine_target: None,
             engine_target_on: false,
             low_power: false,
+            observed_output_id: None,
+            recovery: Recovery::default(),
+            last_engine_error: None,
             idle_suspended: false,
             draft_dirty: false,
             draft_last_write: None,
