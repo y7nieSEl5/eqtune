@@ -12,19 +12,6 @@ The remaining order keeps focused DSP tools ahead of new routing features. Relea
 processing stays single-threaded, uses one Core Audio tap and one DSP engine, and gains no
 generic metadata, routing-rule, or always-on telemetry subsystem.
 
-#### 0.7.0 — DSP tools and click-free comparison
-
-- Add dependency-light offline DSP benchmarks for steady-state, silence,
-  settings-update, maximum-band, and bypass-transition costs. Live callback timing stays
-  debug-only so release processing pays no measurement overhead.
-- Expose the existing low-shelf and high-shelf filters through the CLI while keeping the
-  current peaking-band syntax compatible.
-- Put `eqtune response` human output, JSON/CSV export, and `eqtune preamp-auto` over one
-  shared frequency-response implementation and the authoritative device sample rate.
-- Add a click-free, runtime-only `eqtune bypass on|off` for fast A/B comparison. It exposes
-  only dry and wet endpoints and keeps filter state warm; `eqtune off` remains the
-  energy-saving native-path command.
-
 #### 0.8.0 — Config foundation and minimal per-app bypass
 
 - Add explicit config schema versioning with small deliberate migrations, without generic
@@ -44,6 +31,22 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
 - A continuous dry/wet control only if the click-free bypass endpoints prove insufficient;
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
+
+## [0.7.0] - 2026-08-23
+
+### Added
+
+- `eqtune low-shelf` and `eqtune high-shelf` expose the existing RBJ shelf filters while
+  preserving `eqtune band` as the peaking-filter syntax.
+- `eqtune response` prints a compact human response or exports JSON/CSV. It and
+  `eqtune preamp-auto` share one coefficient-based implementation and use the validated
+  running output rate, or one exact default-output snapshot while stopped.
+- `eqtune bypass on|off` provides a runtime-only, 10 ms dry/wet transition for A/B.
+  Filter state stays warm at the dry endpoint; `eqtune off` remains the native-path,
+  energy-saving command.
+- `cargo bench --bench dsp` measures steady-state, sustained-silence, settings-update,
+  64-band, and bypass-transition costs with no benchmark dependency or production
+  callback instrumentation.
 
 ## [0.6.0] - 2026-08-23
 
@@ -260,7 +263,8 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
 - The EQ engine is lighter in steady state: filter coefficients are only rebuilt when the EQ changes, 0 dB bands are dropped from the live processing chain, and silence is skipped.
 - `eqtune on` and edit commands continue to print the resulting curve, and edits still apply live while persisting to the user config file.
 
-[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.7.0
 [0.6.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.6.0
 [0.5.1]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.1
 [0.5.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.0

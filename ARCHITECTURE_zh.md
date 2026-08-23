@@ -64,12 +64,13 @@ enum Request  { Status, Enable, Disable, ListPresets, SetPreset(String),
                 SavePreset { name }, ClonePreset { source, dest },
                 DeletePresets { names }, RenamePreset { from, to },
                 ExportPreset { name, path }, ImportPreset { path, name },
-                SetBand { freq, gain_db, q }, RemoveBand { freq },
-                SetPreamp(f32), SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
+                SetBand { kind, freq, gain_db, q }, RemoveBand { freq },
+                SetPreamp(f32), SetPreampAuto, GetResponse, SetBypass(bool),
+                SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
                 SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
-enum Response { Ok, Status(Status), Tuning(Tuning),
+enum Response { Ok, Status(Status), Tuning(Tuning), FrequencyResponse(…),
                 BandRemoved { tuning, removed }, Presets { … },
                 ResetWouldOverwrite { names },
                 UnsavedSession { tuning, dirty_presets }, Error(String) }
@@ -81,6 +82,7 @@ daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令
 `RemoveBand`只有在输入frequency与一个已有band的配置frequency足够接近时才会删除一个band；否则不会改变调教，并会返回最近的已有frequency。成功时response也会带回实际被删除的band，让CLI可以如实显示。
 如果任何后续prompt在用户作出选择前遇到EOF，CLI会报错退出而不会把EOF当作默认选项，也不会发送保存、覆盖、丢弃或确认reset的请求；未处理的session draft会继续保留。
 另外，`export`命令会导出单preset TOML并返回`Ok`；而保存/克隆/重命名/import等命令会根据语义返回`Tuning`或预设列表，而不都是`Ok`。
+`GetResponse`与`SetPreampAuto`共用实时RBJ coefficient的response计算，并使用已经验证的运行中输出sample rate；engine停止时则只解析一次完整的默认输出snapshot。JSON/CSV格式化和写文件都留在短命CLI里。`SetBypass`只改变内存中的runtime状态。
 
 因为读写形式严格遵循输入一行JSON再输出一行JSON的规则，这个交互方式扩展和测试的成本都很低，也不会产生一些长时间运行的进程带来的莫名其妙的问题。
 
@@ -116,9 +118,11 @@ IOProc每个block还会检查实际input/output buffer topology。如果layout�
 
 请注意
 `EqSettings`（音频线程中所需全部参数的不可变快照）和`Processor`（音频线程本地的filter状态）通过`Arc<ArcSwap<EqSettings>>`相连接。control线程通过一次原子指针交换发布新快照，audio线程在每个block中用`load()`读取快照，无需等待。**audio线程是lock-free的**，这很重要，因为实时音频处理中阻塞或等待互斥锁可能引发优先级反转和掉帧。
-不过，新的coefficients、preamp和limiter状态目前仍会在audio block边界直接生效，并没有transition smoothing。因此lock-free只保证audio线程不会等待control线程，并不保证每次实时调教都完全没有click。
+新的coefficients、preamp和limiter状态仍会在audio block边界直接生效。runtime bypass是唯一例外：它在10 ms内于dry/wet两个endpoint之间渐变。即使完全dry，wet filter仍继续推进，所以切回wet不会复活旧state；它不写config，也不会停止tap。真正省电、恢复原生路径仍使用`eqtune off`。
 每个`EqSettings`在构造时都会带上唯一的generation stamp，且内部字段保持私有，所以audio线程根据generation判断是否需要同步新coefficients，而不是依赖`Arc`的堆地址；即使allocator复用了同一个地址，也不会漏掉一次实时调教更新。`Processor`在创建时也会按`MAX_BANDS`（64）为每个声道预留容量，所有添加、导入、加载preset的路径都会执行同一个上限校验，因此切换到更大的preset时也不会在audio线程重新分配内存。
 `src/sys.rs`负责把它俩连起来。`process-trampoline`是shim调用的`extern "C"`函数。它加载当前设置之后在buffer中运行processor。`TapSession`拥有原生session，在`Drop`的时候可以停止音频，所以这顺便很好地实现了`eqtune off`，本质就是drop掉`TapSession`，而且这可以避免泄露Core Audio对象或者以错误的方式终止它们。
+
+`benches/dsp.rs`只用标准库离线测量steady-state、持续静音、settings update、64-band上限和bypass transition；production callback里没有clock read或timing counter。
 
 ## engine lifecycle
 

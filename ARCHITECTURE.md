@@ -55,9 +55,9 @@ It helps to think of eqtune as two independent planes:
   times a second and must never block. The control plane hands it new settings
   *lock-free* so a live EQ edit never waits on a control-thread lock.
 
-Keeping these planes decoupled is the central design idea. Settings are currently adopted
-at an audio-block boundary without transition smoothing, however, so lock-free publication
-does not by itself guarantee a click-free edit.
+Keeping these planes decoupled is the central design idea. Filter, preamp, and limiter
+edits are adopted at an audio-block boundary without smoothing. Runtime bypass is the one
+exception: it ramps between dry and wet over 10 ms.
 
 ---
 
@@ -91,13 +91,14 @@ enum Request  { Status, Enable, Disable, ListPresets, ShowPreset(Option<String>)
                 SavePreset { name }, ClonePreset { source, dest },
                 DeletePresets { names }, RenamePreset { from, to },
                 ExportPreset { name, path }, ImportPreset { path, name },
-                SetBand { freq, gain_db, q }, RemoveBand { freq },
-                SetPreamp(f32), SetLimiter(bool),
+                SetBand { kind, freq, gain_db, q }, RemoveBand { freq },
+                SetPreamp(f32), SetPreampAuto, GetResponse, SetBypass(bool),
+                SetLimiter(bool),
                 SetAutoOffLowPower(bool), SetAutoOffIdle(bool),
                 SaveSessionAs { name }, SaveSessionOverwrite, DiscardSession,
                 ResetPreset { name }, ConfirmResetPreset { name, backups },
                 Reset, ConfirmReset { backups } }
-enum Response { Ok, Status(Status), Tuning(Tuning),
+enum Response { Ok, Status(Status), Tuning(Tuning), FrequencyResponse(…),
                 BandRemoved { tuning, removed }, Presets { … },
                 ResetWouldOverwrite { names },
                 UnsavedSession { tuning, dirty_presets }, Error(String) }
@@ -124,6 +125,11 @@ send a confirm request with optional backup preset names. Export writes a single
 TOML file and replies `Ok`. `SetLimiter`, `SetAutoOffLowPower`, and `SetAutoOffIdle`
 reply `Ok` and the client renders the confirmation. The limiter toggle is persisted as a
 global setting and pushed to a running engine immediately; it is not a preset edit.
+`GetResponse` returns compact 1/3-octave points calculated from the same coefficient code
+as realtime processing, using the validated running output rate or one exact output
+snapshot while stopped. JSON/CSV rendering and file output stay in the short-lived client.
+`SetPreampAuto` samples that shared response more densely and applies enough negative
+preamp to offset its peak boost. `SetBypass` changes only runtime state.
 
 Because the wire format is "one JSON line in, one JSON line out," the protocol is trivial
 to extend (add an enum variant) and trivial to test (`serde_json` round-trip tests live in
@@ -210,7 +216,8 @@ behavior. The per-sample path is: `preamp → biquad cascade → optional soft l
 The interesting part is how settings cross the plane boundary safely. Two types:
 
 - **`EqSettings`** — an *immutable* snapshot of everything the audio thread needs
-  (designed coefficients, preamp gain, limiter flag). Built on the control thread.
+  (designed coefficients, preamp gain, limiter flag, bypass endpoint). Built on the
+  control thread.
 - **`Processor`** — *audio-thread-local* filter state (the biquad memory).
 
 They're connected by an `Arc<ArcSwap<EqSettings>>` (the `arc-swap` crate). The control
@@ -229,6 +236,16 @@ path enforces that cap, so adopting a larger preset resizes within existing capa
 instead of allocating on the audio thread. Snapshots also retain each coefficient's source
 band metadata. When an edit, insertion, or removal changes the band occupying a cascade
 slot, that section's delay state is reset rather than being inherited by an unrelated band.
+
+Bypass adds only three scalar values to `Processor`. During its 10 ms endpoint ramp the
+existing loop mixes dry and wet samples; at either endpoint it avoids mix arithmetic.
+The wet cascade still advances while output is fully dry, so switching back cannot revive
+stale state. Bypass is runtime-only and leaves the tap active; `off` still drops
+`TapSession` for the energy-saving native path.
+
+The zero-dependency `benches/dsp.rs` executable measures steady-state, sustained silence,
+settings adoption, the 64-band cap, and bypass transitions offline. No clock read or
+timing counter is compiled into the production callback.
 
 `src/sys.rs` wires this up: `process_trampoline` is the `extern "C"` function the shim
 calls. It loads the current settings and runs the processor over the buffer. The

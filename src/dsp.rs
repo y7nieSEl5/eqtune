@@ -116,8 +116,7 @@ impl Coeffs {
         }
     }
 
-    /// Magnitude response `|H(e^{jw})|` at frequency `f` (Hz). Used by tests and any
-    /// future spectrum/preview tooling.
+    /// Magnitude response `|H(e^{jw})|` at frequency `f` (Hz).
     pub fn magnitude(&self, f: f32, fs: f32) -> f32 {
         let w = 2.0 * PI * f / fs;
         // e^{-jw} = cos(w) - j sin(w); e^{-2jw} = cos(2w) - j sin(2w)
@@ -246,9 +245,9 @@ pub fn soft_clip(x: f32) -> f32 {
 const IDENTITY_GAIN_EPS_DB: f32 = 1e-3;
 
 /// An immutable snapshot of everything the real-time processor needs: a biquad
-/// coefficient set per band, a linear preamp gain, and the limiter flag. Cheap to
-/// share and swapped atomically, so the control thread can update the EQ live without
-/// ever locking the audio thread.
+/// coefficient set per band, a linear preamp gain, the limiter flag, and the runtime
+/// bypass endpoint. Cheap to share and swapped atomically, so the control thread can
+/// update the EQ live without ever locking the audio thread.
 ///
 /// Every field is private, so the only way to obtain a value is [`EqSettings::new`],
 /// which stamps a fresh `generation`. That makes the snapshot
@@ -354,8 +353,8 @@ fn block_is_silent(buf: &[f32]) -> bool {
 /// Real-time, audio-thread-local filter state. Each block it syncs its biquad
 /// coefficients to the supplied [`EqSettings`] and processes in place. Unchanged bands
 /// retain their filter memory, but changed coefficients, preamp, and limiter state are
-/// adopted at a block boundary without transition smoothing, so a live edit is lock-free
-/// but not guaranteed to be click-free.
+/// adopted at a block boundary without smoothing. Runtime bypass alone ramps between dry
+/// and wet while continuing to advance filter state.
 pub struct Processor {
     channels: Vec<Vec<Biquad>>,
     /// Band metadata corresponding to the current cascade slots. Capacity is reserved on

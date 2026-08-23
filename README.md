@@ -70,8 +70,13 @@ eqtune preset-rm <name> [name...]     # delete one or more presets
 eqtune preset-export <name> [file]    # write a shareable preset TOML file
 eqtune preset-import <file> [name]    # import a preset, optionally renaming it
 eqtune band <freq_hz> <gain_db> [q]   # add or update a band (negative gains OK)
+eqtune low-shelf <freq> <gain> [q]    # add or update a low shelf
+eqtune high-shelf <freq> <gain> [q]   # add or update a high shelf
 eqtune band-rm <freq_hz>              # remove the band at a configured frequency
 eqtune preamp <db>                    # overall make-up gain
+eqtune preamp-auto                    # offset the active filters' peak boost
+eqtune response [-f human|json|csv] [file] # inspect or export the response
+eqtune bypass on | off                # click-free dry/wet A/B (runtime only)
 eqtune limiter on | off               # toggle the soft limiter (default on)
 eqtune lowpower on | off              # auto-off in macOS Low Power Mode (default on)
 eqtune idle on | off                  # auto-off while no media is active (default on)
@@ -80,7 +85,7 @@ eqtune completions bash|zsh|fish      # print a shell completion script
 eqtune install | uninstall            # manage the launchd daemon
 ```
 
-- `eqtune on` and every edit (`preset`/`band`/`band-rm`/`preamp`/`reset`) print the
+- `eqtune on` and every edit (`preset`/bands/`band-rm`/preamp/`reset`) print the
   resulting curve — the active preset, preamp, and each band — with the band you just
   changed flagged. `eqtune off` confirms the native Apple audio path is restored.
 - Tuning edits apply **live** (no audio restart). If you edited bands or the preamp,
@@ -101,6 +106,9 @@ eqtune install | uninstall            # manage the launchd daemon
   and 30 seconds. After the sixth retry, recovery stays exhausted until an explicit
   `eqtune on`, an output-device change, or a real policy resume starts a fresh incident.
 - For the no-eqtune native Apple sound, use `eqtune off`.
+- `eqtune bypass on` crossfades to dry audio in 10 ms for quick A/B comparison while
+  keeping filter state warm. It is not saved and does not stop the engine; use
+  `eqtune off` to restore the native path and save energy.
 - To save battery, eqtune **auto-disables while no media is active** and resumes when
   playback starts again. It also auto-disables while macOS Low Power Mode is on and
   resumes when it turns off. An explicit `eqtune on` overrides Low Power Mode; turn
@@ -170,8 +178,11 @@ The EQ is fully editable. `eqtune band` adds or updates a peaking filter at any 
 ```sh
 eqtune band 2000 -6        # cut 2 kHz by 6 dB (default Q 1.0)
 eqtune band 8000 3 2.0     # boost 8 kHz by 3 dB with a narrower Q
+eqtune low-shelf 100 3 0.7 # lift bass below 100 Hz
+eqtune high-shelf 8000 -2  # trim treble above 8 kHz
 eqtune band-rm 2000        # remove the 2 kHz band
 eqtune preamp 4            # set the preamp to +4 dB
+eqtune preamp-auto         # offset the measured peak filter boost
 ```
 
 Editable values are validated before they reach the audio engine: band frequencies must
@@ -182,6 +193,13 @@ numbered sibling) and starts from shipped defaults instead of crash-looping.
 The soft limiter is enabled by default to keep boosted output bounded; advanced users can
 toggle it globally with `eqtune limiter on|off`. The change is persisted immediately and
 applies live without becoming part of a preset's unsaved tuning session.
+
+`eqtune response` prints the active linear response at standard 1/3-octave centers.
+`--format json` and `--format csv` write to stdout, or to an optional path. Response and
+`preamp-auto` share the same RBJ coefficient math and use the validated running output's
+sample rate (or one exact default-device snapshot while stopped). The nonlinear limiter
+is intentionally not represented; `preamp-auto` is a headroom estimate for the filter
+cascade and becomes an ordinary unsaved preamp edit.
 
 ## Battery & energy
 
@@ -213,6 +231,9 @@ long listening session draws less power:
   they're removed from the live processing chain (the `pro` preset alone sheds ~5 of 28).
 - **Idle suspension and silence skipping** — when nothing is playing, eqtune can suspend
   the engine entirely; before suspension, sustained silence also skips per-sample work.
+- **Offline measurements** — `cargo bench --bench dsp` measures steady, silence,
+  settings-update, 64-band, and bypass-transition paths without putting timing code in
+  the release callback.
 
 These trim the overhead but can't remove it — system-wide real-time audio always costs
 some power while the engine is active. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the

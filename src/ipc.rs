@@ -176,7 +176,7 @@ pub struct Status {
     pub retry_limit: usize,
     pub retry_in_seconds: Option<u64>,
     pub retry_exhausted: bool,
-    /// Runtime dry-path bypass. It remains false until the 0.7.0 bypass command exists.
+    /// Runtime dry-path bypass; never persisted to config.
     pub bypassed: bool,
     /// Presets carrying session edits that have not been saved or discarded.
     pub dirty_presets: Vec<String>,
