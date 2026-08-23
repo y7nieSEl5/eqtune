@@ -80,6 +80,8 @@ enum Command {
         /// Optional JSON/CSV output file.
         path: Option<PathBuf>,
     },
+    /// Toggle click-free runtime dry-path bypass (on/off).
+    Bypass { state: Toggle },
     /// Toggle the soft limiter (on/off).
     Limiter { state: Toggle },
     /// Toggle auto-off while macOS Low Power Mode is active (on/off).
@@ -226,6 +228,7 @@ fn to_request(cmd: &Command) -> anyhow::Result<Request> {
             }
             Request::GetResponse
         }
+        Command::Bypass { state } => Request::SetBypass(matches!(state, Toggle::On)),
         Command::Limiter { state } => Request::SetLimiter(matches!(state, Toggle::On)),
         Command::Lowpower { state } => Request::SetAutoOffLowPower(matches!(state, Toggle::On)),
         Command::Idle { state } => Request::SetAutoOffIdle(matches!(state, Toggle::On)),
@@ -358,6 +361,16 @@ fn print_response(cmd: &Command, resp: &Response) {
                         "on"
                     } else {
                         "off"
+                    }
+                );
+            }
+            Command::Bypass { state } => {
+                println!(
+                    "bypass: {}",
+                    if matches!(state, Toggle::On) {
+                        "on (dry)"
+                    } else {
+                        "off (wet)"
                     }
                 );
             }

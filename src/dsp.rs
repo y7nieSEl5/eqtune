@@ -264,6 +264,8 @@ pub struct EqSettings {
     coeffs: Vec<Coeffs>,
     preamp: f32,
     limiter: bool,
+    bypassed: bool,
+    bypass_ramp_frames: u32,
     /// Version stamp, unique per constructed snapshot ([`EqSettings::new`] draws it from a
     /// process-global counter). The real-time [`Processor`] compares it against the last
     /// snapshot it synced to decide whether to re-copy coefficients, so an update is
@@ -284,6 +286,18 @@ impl EqSettings {
     /// 0 dB are skipped: they are mathematically identity, so omitting them saves a
     /// biquad per sample with no audible change.
     pub fn new(bands: &[Band], fs: f32, preamp_db: f32, limiter: bool) -> Self {
+        Self::with_bypass(bands, fs, preamp_db, limiter, false)
+    }
+
+    /// Build a snapshot with a runtime dry-path endpoint. Bypass is deliberately absent
+    /// from persisted config; it only controls the processor's click-free A/B mix.
+    pub fn with_bypass(
+        bands: &[Band],
+        fs: f32,
+        preamp_db: f32,
+        limiter: bool,
+        bypassed: bool,
+    ) -> Self {
         let bands: Vec<Band> = bands
             .iter()
             .filter(|b| b.gain_db.abs() >= IDENTITY_GAIN_EPS_DB)
@@ -307,6 +321,8 @@ impl EqSettings {
             coeffs,
             preamp: db_to_lin(preamp_db),
             limiter,
+            bypassed,
+            bypass_ramp_frames: (fs * 0.010).round().max(1.0) as u32,
             generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
         }
     }
@@ -353,6 +369,9 @@ pub struct Processor {
     last_generation: Option<u64>,
     /// Consecutive near-silent blocks seen so far (gates the silence-skip).
     silent_blocks: u32,
+    wet_mix: f32,
+    wet_target: f32,
+    bypass_ramp_remaining: u32,
 }
 
 impl Processor {
@@ -367,6 +386,9 @@ impl Processor {
             band_layout: Vec::with_capacity(MAX_BANDS),
             last_generation: None,
             silent_blocks: 0,
+            wet_mix: 1.0,
+            wet_target: 1.0,
+            bypass_ramp_remaining: 0,
         }
     }
 
@@ -384,6 +406,17 @@ impl Processor {
         // generation (see `last_generation`); in steady state this skips dozens of copies
         // per block.
         if self.last_generation != Some(settings.generation) {
+            let next_wet = if settings.bypassed { 0.0 } else { 1.0 };
+            if self.last_generation.is_none() {
+                // Startup adopts the requested endpoint directly; there is no preceding
+                // audible eqtune path to transition from.
+                self.wet_mix = next_wet;
+                self.wet_target = next_wet;
+                self.bypass_ramp_remaining = 0;
+            } else if next_wet != self.wet_target {
+                self.wet_target = next_wet;
+                self.bypass_ramp_remaining = settings.bypass_ramp_frames;
+            }
             // `n <= MAX_BANDS` for any preset the mutation paths accept, and each cascade
             // was constructed with that capacity reserved, so this resize stays within
             // capacity and does not allocate on the audio thread.
@@ -440,16 +473,26 @@ impl Processor {
         let frames = buf.len() / channels;
         let active = channels.min(self.channels.len());
         for frame in 0..frames {
+            if self.bypass_ramp_remaining > 0 {
+                self.wet_mix +=
+                    (self.wet_target - self.wet_mix) / self.bypass_ramp_remaining as f32;
+                self.bypass_ramp_remaining -= 1;
+            }
             for ch in 0..active {
                 let idx = frame * channels + ch;
-                let mut s = buf[idx] * settings.preamp;
+                let dry = buf[idx];
+                let mut s = dry * settings.preamp;
                 for bq in self.channels[ch].iter_mut() {
                     s = bq.process(s);
                 }
                 if settings.limiter {
                     s = soft_clip(s);
                 }
-                buf[idx] = s;
+                if self.wet_mix == 1.0 {
+                    buf[idx] = s;
+                } else if self.wet_mix > 0.0 {
+                    buf[idx] = dry + (s - dry) * self.wet_mix;
+                }
             }
         }
         silent
@@ -586,6 +629,47 @@ mod tests {
             p.channels[0].len(),
             1,
             "new snapshot must resize the cascade"
+        );
+    }
+
+    #[test]
+    fn initial_bypass_is_bit_exact_dry() {
+        let mut processor = Processor::new(2);
+        let settings = EqSettings::with_bypass(&[peak(1_000.0)], 48_000.0, 6.0, true, true);
+        let original = vec![0.25f32; 128 * 2];
+        let mut buffer = original.clone();
+        processor.run(&settings, &mut buffer, 2);
+        assert_eq!(buffer, original);
+    }
+
+    #[test]
+    fn bypass_ramps_and_keeps_filter_state_warm() {
+        let band = Band {
+            kind: BandKind::Peaking,
+            freq: 100.0,
+            gain_db: 12.0,
+            q: 5.0,
+        };
+        let mut processor = Processor::new(1);
+        let wet = EqSettings::with_bypass(&[band], 48_000.0, 0.0, false, false);
+        let dry = EqSettings::with_bypass(&[band], 48_000.0, 0.0, false, true);
+        let mut signal = vec![0.25f32; 64];
+        processor.run(&wet, &mut signal, 1);
+        processor.run(&dry, &mut signal[..1], 1);
+        assert!(processor.wet_mix > 0.0 && processor.wet_mix < 1.0);
+
+        let mut impulse = vec![0.0f32; 480];
+        impulse[0] = 1.0;
+        processor.run(&dry, &mut impulse, 1);
+        assert_eq!(processor.wet_mix, 0.0);
+        assert_eq!(impulse[479], 0.0, "fully bypassed output must be dry");
+
+        let wet_again = EqSettings::with_bypass(&[band], 48_000.0, 0.0, false, false);
+        let mut silence = vec![0.0f32; 1];
+        processor.run(&wet_again, &mut silence, 1);
+        assert_ne!(
+            silence[0], 0.0,
+            "the dry interval must still advance filter state"
         );
     }
 

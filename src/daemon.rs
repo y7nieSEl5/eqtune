@@ -244,6 +244,8 @@ pub struct Daemon {
     observed_output_id: Option<u32>,
     recovery: Recovery,
     last_engine_error: Option<String>,
+    /// Runtime-only dry/wet endpoint; intentionally absent from `Config`.
+    bypassed: bool,
     /// Whether the engine is currently off because captured audio was silent long enough
     /// to count as no active media.
     idle_suspended: bool,
@@ -288,6 +290,7 @@ impl Daemon {
             observed_output_id,
             recovery: Recovery::default(),
             last_engine_error: None,
+            bypassed: false,
             draft_dirty: false,
             draft_last_write: None,
         })
@@ -555,6 +558,11 @@ impl Daemon {
                 Ok(Response::Tuning(self.tuning()))
             }
             Request::GetResponse => Ok(Response::FrequencyResponse(self.frequency_response()?)),
+            Request::SetBypass(bypassed) => {
+                self.bypassed = bypassed;
+                self.publish_current_settings();
+                Ok(Response::Ok)
+            }
             Request::SetLimiter(on) => {
                 self.commit_setting(|c| c.limiter = on)?;
                 self.apply_current_settings()?;
@@ -651,7 +659,7 @@ impl Daemon {
         let active = self.config.active();
         let bands: &[Band] = active.map(|p| p.bands.as_slice()).unwrap_or(&[]);
         let preamp = active.map(|p| p.preamp_db).unwrap_or(0.0);
-        EqSettings::new(bands, fs, preamp, self.config.limiter)
+        EqSettings::with_bypass(bands, fs, preamp, self.config.limiter, self.bypassed)
     }
 
     /// Prefer the validated running target; otherwise resolve one exact default-device
@@ -976,6 +984,11 @@ impl Daemon {
     /// the returned error is `sync_session_file`'s.
     fn apply_current_settings(&mut self) -> anyhow::Result<()> {
         let synced = self.sync_session_file();
+        self.publish_current_settings();
+        synced
+    }
+
+    fn publish_current_settings(&self) {
         if self.engine.is_some() {
             let fs = self
                 .engine_target
@@ -987,7 +1000,6 @@ impl Daemon {
                 handle.store(settings); // lock-free live update
             }
         }
-        synced
     }
 
     /// Mirror the session-draft state to disk so it survives a daemon restart.
@@ -1204,7 +1216,7 @@ impl Daemon {
             retry_limit: RETRY_DELAYS.len(),
             retry_in_seconds,
             retry_exhausted: self.recovery.exhausted,
-            bypassed: false,
+            bypassed: self.bypassed,
             dirty_presets: self.dirty_preset_names(),
             low_power: self.low_power,
             auto_off_low_power: self.config.auto_off_low_power,
@@ -2750,6 +2762,18 @@ mod tests {
     }
 
     #[test]
+    fn bypass_is_runtime_only_and_visible_in_status() {
+        let mut d = daemon_with(Config::default());
+        let config = d.config.clone();
+
+        assert_eq!(d.apply(Request::SetBypass(true)).unwrap(), Response::Ok);
+
+        assert!(d.bypassed);
+        assert!(d.status().bypassed);
+        assert_eq!(d.config, config);
+    }
+
+    #[test]
     fn status_distinguishes_policy_and_exhaustion_suspensions() {
         let mut d = daemon_with(Config {
             enabled: true,
@@ -2860,6 +2884,7 @@ mod tests {
             observed_output_id: None,
             recovery: Recovery::default(),
             last_engine_error: None,
+            bypassed: false,
             idle_suspended: false,
             draft_dirty: false,
             draft_last_write: None,
