@@ -21,6 +21,7 @@ include = [
     "LICENSE-MIT",
     "README.md",
     "build.rs",
+    "benches/**",
     "resources/**",
     "shim/**",
     "src/**",
@@ -41,3 +42,7 @@ toml = "1.1.2"
 
 [build-dependencies]
 cc = "1.2.63"
+
+[[bench]]
+name = "dsp"
+harness = false
