@@ -8,28 +8,9 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Roadmap
 
-The remaining order keeps audio recovery ahead of new DSP and routing features. Release
+The remaining order keeps focused DSP tools ahead of new routing features. Release
 processing stays single-threaded, uses one Core Audio tap and one DSP engine, and gains no
 generic metadata, routing-rule, or always-on telemetry subsystem.
-
-#### 0.6.0 — Fail-safe, self-recovering engine
-
-- Build one authoritative output-target snapshot by resolving the default device once,
-  querying UID, name, sample rate, and stream facts by that exact ID, passing the same ID
-  into tap startup, and recording the metadata only after stream validation succeeds.
-- Propagate fatal runtime stream/layout failures out of the realtime callback. Tear down
-  the failed tap promptly to restore the native audio path while retaining the user's
-  explicit on/off intent.
-- Retry a failed desired engine start at most six times per incident, after 1, 2, 4, 8,
-  16, and 30 seconds. Exhausted recovery remains safely on the native path until an
-  explicit `on`, output-device change, or legitimate policy-resume event resets the budget.
-- Add small, flat `status` diagnostics for user intent, actual engine state, suspension
-  reason, output UID/name/rate/stream facts, last engine error, retry state, bypass state,
-  and dirty presets. This is control-plane state, not callback telemetry.
-
-The release gate is that no runtime audio-format failure can leave eqtune indefinitely
-producing zeroes: native output returns, retries are bounded, and `status` explains the
-resulting state.
 
 #### 0.7.0 — DSP tools and click-free comparison
 
@@ -63,6 +44,31 @@ resulting state.
 - A continuous dry/wet control only if the click-free bypass endpoints prove insufficient;
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
+
+## [0.6.0] - 2026-08-23
+
+### Added
+
+- `eqtune status` now reports a flat diagnostic snapshot with desired user intent,
+  actual engine state, suspension reason, validated output UID/name/rate/stream facts,
+  the last engine error, retry progress, bypass state, and dirty presets.
+- Failed desired starts retry at most six times per incident after 1, 2, 4, 8, 16, and
+  30 seconds. Exhaustion stays on the native path until an explicit `on`, output-device
+  change, or legitimate Low-Power/idle resume resets the budget.
+
+### Changed
+
+- Engine startup now builds one authoritative output-target snapshot: it resolves the
+  default device once, queries every property by that exact ID, passes the ID into tap
+  startup, and records metadata only after aggregate stream validation succeeds.
+- `eqtune on` now records desired intent even when the immediate tap start fails, so the
+  bounded recovery loop and daemon restarts continue honoring the explicit request.
+
+### Fixed
+
+- Fatal runtime input/output layout or buffer-size changes now propagate atomically out
+  of the realtime callback. The daemon promptly tears down the failed tap, restoring the
+  native audio path instead of allowing eqtune to produce zeroes indefinitely.
 
 ## [0.5.1] - 2026-08-20
 
@@ -254,6 +260,7 @@ resulting state.
 - The EQ engine is lighter in steady state: filter coefficients are only rebuilt when the EQ changes, 0 dB bands are dropped from the live processing chain, and silence is skipped.
 - `eqtune on` and edit commands continue to print the resulting curve, and edits still apply live while persisting to the user config file.
 
-[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.6.0
 [0.5.1]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.1
 [0.5.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.0

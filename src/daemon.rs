@@ -297,8 +297,8 @@ impl Daemon {
         // Restore the last run's on state (eager path only; the idle-aware restore starts
         // suspended and lets `follow_idle_activity` start the engine on real playback). A
         // start failure (capture permission not yet granted, unsupported macOS) must not
-        // kill the daemon — under launchd KeepAlive that would crash-loop — so log it;
-        // `eqtune on` retries on demand.
+        // kill the daemon — under launchd KeepAlive that would crash-loop. Reconcile
+        // records the failure and starts the bounded recovery schedule instead.
         if self.engine_target_on {
             if let Err(e) = self.reconcile() {
                 eprintln!("could not restore the EQ at startup: {e}");
@@ -764,7 +764,7 @@ impl Daemon {
 
     /// Follow macOS Low Power Mode: on entering LPM, auto-off the engine (a large energy
     /// drop) while remembering the user's intent; on leaving LPM, restore that intent.
-    /// Edge-triggered, so a persistent start failure isn't retried every poll.
+    /// Edge-triggered; leaving a real suppression starts a fresh recovery incident.
     fn follow_low_power(&mut self) {
         let now = sys::low_power_enabled();
         if now == self.low_power {
