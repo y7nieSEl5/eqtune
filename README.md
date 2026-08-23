@@ -22,7 +22,9 @@ eqtune taps the system audio mix with Apple's modern **Core Audio process-tap AP
 eqtune currently processes matching interleaved stereo Float32 aggregate streams. If an
 output device exposes an unsupported layout, eqtune refuses to start the tap and records
 the reason in `~/Library/Application Support/eqtune/daemon.log` instead of risking
-corrupted audio.
+corrupted audio. If a running stream changes to an unsafe layout, eqtune tears the tap
+down within the daemon's control-loop tick, immediately restoring the native audio path,
+then retries at most six times with bounded backoff.
 
 ## Install
 
@@ -92,6 +94,12 @@ eqtune install | uninstall            # manage the launchd daemon
   comes back on if you left it on, with the preset — including tuning edits you haven't
   saved yet — you were listening to. Unsaved edits stay unsaved; the `eqtune off` prompt
   still decides whether to keep them.
+- `eqtune status` separates your desired on/off intent from the actual engine state and
+  explains suspensions or recovery. It also reports only validated output metadata, the
+  last engine error, bounded retry progress, bypass state, and every dirty preset.
+- A failed desired start keeps native output active and retries after 1, 2, 4, 8, 16,
+  and 30 seconds. After the sixth retry, recovery stays exhausted until an explicit
+  `eqtune on`, an output-device change, or a real policy resume starts a fresh incident.
 - For the no-eqtune native Apple sound, use `eqtune off`.
 - To save battery, eqtune **auto-disables while no media is active** and resumes when
   playback starts again. It also auto-disables while macOS Low Power Mode is on and

@@ -141,6 +141,11 @@ second daemon therefore exits without replacing the first one's socket or compet
 config and Core Audio state. Startup also probes an occupied socket for compatibility with
 older daemons; it removes the path only when it is a verified stale Unix socket.
 
+`Status` is intentionally a small, flat control-plane snapshot rather than callback
+telemetry. It separates user intent from the actual engine state and includes the current
+suspension reason, validated output UID/name/rate/stream facts, last engine error, bounded
+retry state, bypass state, and dirty preset names.
+
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
 to the audio thread via `EqHandle::store` — without restarting playback. Editing commands
@@ -167,8 +172,8 @@ observe the system audio mix with no driver. eqtune sets up three objects:
    `CATapMutedWhenTapped`, so the original audio is muted *only while we're tapping it*;
    stop the daemon and normal sound returns instantly.
 
-2. **A private aggregate device** (`AudioHardwareCreateAggregateDevice`) that bundles the
-   **current default output device** (clock + playback) together with **our tap** (input).
+2. **A private aggregate device** (`AudioHardwareCreateAggregateDevice`) that bundles one
+   **snapshotted output device** (clock + playback) together with **our tap** (input).
    Putting both in one aggregate means they share a single clock — so there is no
    resampling or drift to fight between "what we captured" and "what we play back."
 
@@ -185,11 +190,13 @@ system audio ─▶ global process tap (excludes eqtune; muted-when-tapped)
              ─▶ your current default output device
 ```
 
-**Following the output device.** The daemon polls (every 100 ms) for the default output
-device and its sample rate; when you plug in headphones or switch to Bluetooth, it tears
-the aggregate down and rebuilds it around the new device (`follow_default_device`). That's
-why "switch to the headphones when I plug them in" keeps working — eqtune never *becomes*
-your output device, it follows whatever your output device currently is.
+**Following the output device.** Startup resolves the default device ID once, then queries
+UID, name, nominal rate, and stream facts by that exact ID. The same ID is passed into tap
+startup, so a device switch between property reads cannot create a mixed target. The
+snapshot becomes visible to `status` only after the aggregate exposes matching interleaved
+stereo Float32 streams and starts successfully. The daemon polls every 100 ms; when you
+plug in headphones or switch to Bluetooth, it tears the aggregate down and rebuilds it
+around one new snapshot (`follow_default_device`).
 
 ---
 
@@ -229,6 +236,12 @@ calls. It loads the current settings and runs the processor over the buffer. The
 "turn eqtune off" is literally "drop the `TapSession`," and there's no way to leak the
 Core Audio objects or stop them in the wrong order.
 
+The IOProc also validates the live input/output buffer topology on every block. A mismatch
+atomically publishes one fatal error and silences only that unsafe block; the control loop
+observes it within its next tick and drops `TapSession`. Because
+`CATapMutedWhenTapped` lasts only for the tap lifetime, teardown promptly restores native
+audio instead of leaving eqtune producing zeroes indefinitely.
+
 ---
 
 ## 6. Engine lifecycle — the reconcile state machine
@@ -247,6 +260,8 @@ intent and *reconciles*:
   desync the idle/LPM behavior from what is actually running.
 - `low_power` — the last-seen macOS Low Power Mode state.
 - `idle_suspended` — whether the engine is off because captured audio stayed silent.
+- `recovery` — retry count, deadline, and exhaustion for the current failure incident.
+- `last_engine_error` — the latest startup or runtime failure for diagnostics.
 
 `reconcile()` simply makes reality match `engine_target_on`: start the engine if it should
 be on and isn't, drop it if it should be off and is. Every event routes through this:
@@ -256,21 +271,26 @@ be on and isn't, drop it if it should be off and is. Every event routes through 
   is enabled the restore is *lazy* — the engine starts suspended and `follow_idle_activity`
   starts it once playback is actually detected, so a login/restart with nothing playing
   never runs the tap through startup silence; with idle auto-off disabled there is no
-  resume probe, so the restore is eager. A start failure (capture permission not yet
-  granted) is logged, not fatal — launchd KeepAlive must not crash-loop.
-- `eqtune on` sets `user_intent`, starts the engine, and persists `config.enabled` only
-  after a successful start, so a failed start (permission not yet granted) never records
-  an "on" that a later restart would silently act on. `eqtune off` is the mirror image: it
-  clears `user_intent`, stops the engine first — unconditionally — then persists, so a
-  failed config write can cost persistence (reported as an error, retryable) but never
-  leaves audio processing nor lets a later reconcile restore the EQ.
+  resume probe, so the restore is eager. A start failure is logged and starts bounded
+  recovery rather than killing the daemon under launchd KeepAlive.
+- `eqtune on` sets desired `user_intent`, tries immediately, and persists the intent even
+  when that first start fails. Failure leaves native output active while retaining the
+  explicit intent. `eqtune off`
+  clears intent, cancels recovery, stops the engine first — unconditionally — then
+  persists, so a failed config write can cost durability but never leaves audio processing
+  running or lets a later reconcile restore the EQ.
 - `follow_low_power()` (polled) detects a Low-Power-Mode edge: entering LPM forces the
   engine off (a large power saving) while remembering `user_intent`; leaving LPM
   restores it. An explicit `eqtune on` overrides and runs even under LPM.
 - `follow_idle_activity()` watches the audio thread's silent-frame counter while the
   engine is running. After sustained silence it drops the engine; while suspended, it
   polls Core Audio's default-output-device activity and resumes when playback starts.
-- `follow_default_device()` rebuilds the running engine when the output device changes.
+- `follow_default_device()` rebuilds a running engine when the target changes and also
+  observes device-ID changes while the engine is down, so exhausted recovery can restart
+  on a genuinely new output.
+- A failed desired start schedules at most six retries after 1, 2, 4, 8, 16, and 30
+  seconds. Exhaustion cannot be bypassed by ordinary reconciles. Only an explicit `on`,
+  an output-device change, or a real Low-Power/idle policy resume resets the incident.
 
 This is the same mechanism the energy work builds on (§7): "don't run the engine when we
 don't need it."

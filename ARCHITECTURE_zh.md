@@ -87,6 +87,8 @@ daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令
 daemon对这行JSON也有硬边界：一次请求必须在总计5秒内读完，且不能超过64 KiB。这个检查会在每次读取后执行，包括读到结尾换行符的那一次，因此沉默连接、慢速滴字节、或一直不发换行的client都不能卡住单线程的accept/poll循环。
 daemon在接触control socket之前会先获取一个nonblocking advisory lock，所以第二个daemon会直接退出，不能替换第一个daemon的socket或与它争用config和Core Audio状态。对于旧版本留下的socket，启动过程也会先探测，只会删除已经确认失效的Unix socket。
 
+`Status`刻意保持为扁平、低频的control-plane快照，而不是callback telemetry。它会区分用户想要的on/off和engine实际是否运行，并给出挂起原因、通过验证的输出UID/name/rate/stream facts、最后一次engine错误、有界retry状态、bypass状态和所有dirty preset。
+
 ### audio plane
 
 Apple提供的**Core Audio process-tap API**允许一个来自user-space的进程获得系统的audio mix。eqtune利用这一点设置了三个对象：
@@ -98,13 +100,15 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 2. private aggregate device
 
-`AudioHardwareCreateAggregateDevice`把当前默认输出设备（clock和playback）和我们自己的tap绑定。这样二者共享同一个clock，可以保证捕获音频与回放音频之间没有漂移。
+启动时只解析一次默认输出设备ID，之后UID、name、nominal rate和stream facts都按这个确切ID查询；同一个ID会传给`AudioHardwareCreateAggregateDevice`，把该输出（clock和playback）和我们自己的tap绑定。这样不会在设备切换竞态中拼出一份混合snapshot，二者共享同一个clock，也可以保证捕获音频与回放音频之间没有漂移。只有aggregate通过匹配的interleaved stereo Float32验证并成功启动后，这份snapshot才会被记录并显示在`status`里。
 
 3. I/O callback
 
 `AudioDeviceCreateIOProcID`和`AudioDeviceStart`中，每一个循环里，`io_proc`把系统音频导入output buffer，再调用Rust部分中的`eqtune_process_cb`来原位调衡那个部分的音频。
 
 > daemon每100ms轮询一次默认输出设备和其sample rate。当你插入有线耳机或连接蓝牙耳机时，它会拆掉当前aggregate，并围绕新设备重建aggregate device。
+
+IOProc每个block还会检查实际input/output buffer topology。如果layout或buffer size在运行中变得不安全，callback只会原子地发布一次fatal error并把当前危险block静音；control loop在下一个tick里drop `TapSession`。由于`CATapMutedWhenTapped`只在tap存活时生效，原生音频会立刻恢复，而不会让eqtune无限输出零。
 
 ### dsp and lock-free hand-off
 
@@ -124,11 +128,12 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 - `engine_target_on`：engine现在该在运行
 - `user_intent`：用户明确指令的on/off，存在内存里。自动挂起（低电量、静音）都以它为准。它在启动时用持久化的`config.enabled`初始化，之后每次`on`/`off`一进来就立刻更新——早于把它写盘的那一步。
-- `config.enabled`：持久化的on/off，daemon启动时恢复，所以重启或重新登录后EQ还保持你上次的开关状态。它只是磁盘上的记录，实时的reconcile逻辑读的是`user_intent`，所以一次写盘失败（会报错、可重试）绝不会让idle/低电量的行为和实际运行状态脱节。`eqtune on`先设`user_intent`、启动engine，只有启动成功后才写入`config.enabled`（启动失败绝不会在下次重启时被悄悄恢复成开启）；`eqtune off`则相反：先清掉`user_intent`、无条件停止engine，再持久化——写盘失败会报错并可重试，但绝不会让音频继续被处理，也不会让之后的reconcile把EQ又开回来。
+- `config.enabled`：持久化的用户意图，daemon启动时恢复，所以重启或重新登录后仍会尝试满足你上次的on/off。实时reconcile读的是`user_intent`。`eqtune on`会立即设置意图并尝试启动；即使第一次启动失败也仍会持久化这个意图、保持原生音频并进入有界恢复。`eqtune off`则先清掉意图、取消恢复、无条件停止engine，再持久化——写盘失败会报错并可重试，但绝不会让音频继续被处理，也不会让之后的reconcile把EQ又开回来。
 - `low_power`：MacBook在低电量模式下吗？都低电量模式了，就别调衡了吧。
 - `idle_suspended`: 没有捕获到任何音频呢？没放音乐，engine运行着干嘛呢？
+- `recovery`：当前故障incident的retry次数、deadline和是否耗尽；`last_engine_error`保留最近一次启动或runtime错误。
 
-`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。daemon启动时用持久化的`config.enabled`初始化`user_intent`（并遵循低电量模式策略）先reconcile一次。如果开启了idle自动关闭，这次恢复是"懒"的——engine先挂起，等`follow_idle_activity`真正检测到在放音频时才启动，这样开机/重启时没在放音乐就不会白白让tap空跑一段静音；没开idle自动关闭时没有resume探测可依赖，就直接恢复启动。如果此时启动engine失败（比如还没授予捕获权限），只记录日志而不退出，避免launchd KeepAlive反复重启。
+`reconcile()`会让实际engine状态与`engine_target_on`对齐：该开就启动，该关就停止。daemon启动时用持久化的`config.enabled`初始化`user_intent`（并遵循低电量模式策略）先reconcile一次。如果开启了idle自动关闭，这次恢复是"懒"的——engine先挂起，等`follow_idle_activity`真正检测到在放音频时才启动，这样开机/重启时没在放音乐就不会白白让tap空跑一段静音；没开idle自动关闭时没有resume探测可依赖，就直接恢复启动。启动或runtime失败后，engine保持关闭、走原生路径，并只会在1、2、4、8、16、30秒后各retry一次。六次用完后，普通reconcile不能偷偷增加尝试；只有明确的`eqtune on`、输出设备改变，或真正的低电量/idle policy resume才会重置这次incident的budget。
 
 > 其实，为了省电，我也想办法让`Processor`的开支减小。现在的`Processor` (a) 只在调教generation改变时同步filter的coeffs; (b) 0dB被忽略，因此不消耗biquad; (c) 持续静音时跳过逐sample处理。
 
