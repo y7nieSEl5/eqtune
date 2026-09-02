@@ -6,17 +6,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Changed
-
-- Process taps are now bound to the exact snapshotted output UID and sole stream, so
-  ordinary stereo devices run at their native rate, including 44.1 kHz USB headphones,
-  without resampling. Unsupported mono, multichannel, multistream, planar, integer-client,
-  or encoded layouts stay on the native path with precise format diagnostics.
-- Failed engine starts retain the attempted output UID/name/rate/stream in `status` without
-  claiming the engine is running.
-- macOS 14.2 is enforced in Objective-C compilation and Mach-O metadata; CI builds and
-  checks both Apple Silicon and Intel release binaries against that deployment floor.
-
 ### Roadmap
 
 The remaining order keeps focused DSP tools ahead of new routing features. Release
@@ -43,6 +32,23 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
 - A continuous dry/wet control only if the click-free bypass endpoints prove insufficient;
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
+
+## [0.7.1] - 2026-09-02
+
+### Fixed
+
+- Process taps now bind to the exact snapshotted output UID and sole stream, so ordinary
+  stereo devices run at their native rate without resampling. This is verified at 44.1 kHz
+  with Apple USB EarPods and Baseus AirGo Bluetooth headphones.
+- Failed engine starts retain the attempted output UID/name/rate/stream in `status` without
+  claiming the engine is running, and aggregate failures report the rejected format.
+
+### Changed
+
+- The supported path is explicitly one mixable, little-endian, interleaved stereo Float32
+  virtual stream. Unsupported layouts stay on native audio with precise diagnostics.
+- macOS 14.2 is enforced in Objective-C compilation and Mach-O metadata; CI builds and
+  checks both Apple Silicon and Intel release binaries against that deployment floor.
 
 ## [0.7.0] - 2026-08-23
 
@@ -275,7 +281,8 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
 - The EQ engine is lighter in steady state: filter coefficients are only rebuilt when the EQ changes, 0 dB bands are dropped from the live processing chain, and silence is skipped.
 - `eqtune on` and edit commands continue to print the resulting curve, and edits still apply live while persisting to the user config file.
 
-[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/y7nieSEl5/eqtune/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.7.1
 [0.7.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.7.0
 [0.6.0]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.6.0
 [0.5.1]: https://github.com/y7nieSEl5/eqtune/releases/tag/v0.5.1
