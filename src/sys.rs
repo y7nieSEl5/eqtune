@@ -98,10 +98,13 @@ impl StreamFacts {
     pub fn compatibility_error(&self) -> Option<&'static str> {
         const LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
         const IS_FLOAT: u32 = 1;
+        const IS_NON_MIXABLE: u32 = 1 << 6;
         if self.format_id != LINEAR_PCM {
             Some("output stream is not linear PCM")
         } else if self.format_flags & IS_FLOAT == 0 || self.bits_per_channel != 32 {
             Some("output stream is not Float32")
+        } else if self.format_flags & IS_NON_MIXABLE != 0 {
+            Some("output stream is not mixable")
         } else if !self.interleaved() {
             Some("output stream is non-interleaved")
         } else if self.channels != 2 {
@@ -447,6 +450,12 @@ mod tests {
         assert_eq!(
             facts.compatibility_error(),
             Some("output stream is not Float32")
+        );
+        facts.bits_per_channel = 32;
+        facts.format_flags |= 1 << 6;
+        assert_eq!(
+            facts.compatibility_error(),
+            Some("output stream is not mixable")
         );
     }
 }

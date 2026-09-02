@@ -50,6 +50,7 @@ static bool supported_stereo_float_format(const AudioStreamBasicDescription *for
     return format->mFormatID == kAudioFormatLinearPCM &&
            (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
            (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0 &&
+           (format->mFormatFlags & kAudioFormatFlagIsNonMixable) == 0 &&
            format->mBitsPerChannel == 32 &&
            format->mChannelsPerFrame == 2 &&
            format->mBytesPerFrame == 2 * sizeof(float);
