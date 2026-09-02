@@ -332,6 +332,36 @@ static void set_start_osstatus_error(char *buf, size_t buflen, const char *what,
     }
 }
 
+static void describe_format(const AudioStreamBasicDescription *format,
+                            char *buf,
+                            size_t buflen) {
+    snprintf(buf, buflen,
+             "%.0f Hz, %u ch, format 0x%08x, flags 0x%08x, %u-bit, %u B/frame",
+             format->mSampleRate,
+             (unsigned)format->mChannelsPerFrame,
+             (unsigned)format->mFormatID,
+             (unsigned)format->mFormatFlags,
+             (unsigned)format->mBitsPerChannel,
+             (unsigned)format->mBytesPerFrame);
+}
+
+static void set_start_format_error(char *buf,
+                                   size_t buflen,
+                                   const char *reason,
+                                   const AudioStreamBasicDescription *input,
+                                   const AudioStreamBasicDescription *output) {
+    char input_desc[160];
+    char output_desc[160];
+    describe_format(input, input_desc, sizeof(input_desc));
+    describe_format(output, output_desc, sizeof(output_desc));
+    fprintf(stderr, "eqtune shim: %s: input [%s], output [%s]\n",
+            reason, input_desc, output_desc);
+    if (buf && buflen > 0) {
+        snprintf(buf, buflen, "%s: input [%s], output [%s]",
+                 reason, input_desc, output_desc);
+    }
+}
+
 eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
                                      uint32_t output_stream_index,
                                      eqtune_process_cb cb,
@@ -404,20 +434,34 @@ eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
 
         AudioStreamBasicDescription input_format = {0};
         AudioStreamBasicDescription output_format = {0};
-        bool formats_ok = copy_device_stream_format(aggregate, kAudioObjectPropertyScopeInput,
-                                                    &input_format) &&
-                          copy_device_stream_format(aggregate, kAudioObjectPropertyScopeOutput,
-                                                    &output_format) &&
-                          supported_stereo_float_format(&input_format) &&
-                          supported_stereo_float_format(&output_format) &&
-                          input_format.mSampleRate == output_format.mSampleRate;
-        if (!formats_ok) {
-            fprintf(stderr,
-                    "eqtune shim: aggregate device does not expose matching interleaved "
-                    "stereo Float32 input/output streams\n");
-            set_start_error(error_buf, error_buflen,
-                            "aggregate device does not expose matching interleaved stereo "
-                            "Float32 input/output streams");
+        bool input_read = copy_device_stream_format(aggregate, kAudioObjectPropertyScopeInput,
+                                                    &input_format);
+        bool output_read = copy_device_stream_format(aggregate, kAudioObjectPropertyScopeOutput,
+                                                     &output_format);
+        if (!input_read || !output_read) {
+            const char *message = !input_read && !output_read
+                ? "could not read aggregate input or output format"
+                : (!input_read ? "could not read aggregate input format"
+                               : "could not read aggregate output format");
+            fprintf(stderr, "eqtune shim: %s\n", message);
+            set_start_error(error_buf, error_buflen, message);
+            AudioHardwareDestroyAggregateDevice(aggregate);
+            AudioHardwareDestroyProcessTap(tap);
+            return NULL;
+        }
+        if (!supported_stereo_float_format(&input_format) ||
+            !supported_stereo_float_format(&output_format)) {
+            set_start_format_error(error_buf, error_buflen,
+                                   "aggregate requires interleaved stereo Float32",
+                                   &input_format, &output_format);
+            AudioHardwareDestroyAggregateDevice(aggregate);
+            AudioHardwareDestroyProcessTap(tap);
+            return NULL;
+        }
+        if (input_format.mSampleRate != output_format.mSampleRate) {
+            set_start_format_error(error_buf, error_buflen,
+                                   "aggregate input/output rates do not match",
+                                   &input_format, &output_format);
             AudioHardwareDestroyAggregateDevice(aggregate);
             AudioHardwareDestroyProcessTap(tap);
             return NULL;

@@ -192,18 +192,6 @@ impl OutputTarget {
             channels: raw.channels_per_frame,
             bits_per_channel: raw.bits_per_channel,
         };
-        if let Some(reason) = stream.compatibility_error() {
-            anyhow::bail!(
-                "unsupported output format for {name}: {reason} ({})",
-                stream.description()
-            );
-        }
-        if (sample_rate - stream.sample_rate).abs() >= 0.5 {
-            anyhow::bail!(
-                "output rate mismatch for {name}: nominal {sample_rate} Hz, stream {} Hz",
-                stream.sample_rate
-            );
-        }
         Ok(Self {
             id,
             uid,
@@ -212,6 +200,25 @@ impl OutputTarget {
             stream_index: output.stream_index,
             stream,
         })
+    }
+
+    pub fn validate_compatibility(&self) -> anyhow::Result<()> {
+        if let Some(reason) = self.stream.compatibility_error() {
+            anyhow::bail!(
+                "unsupported output format for {}: {reason} ({})",
+                self.name,
+                self.stream.description()
+            );
+        }
+        if (self.sample_rate - self.stream.sample_rate).abs() >= 0.5 {
+            anyhow::bail!(
+                "output rate mismatch for {}: nominal {} Hz, stream {} Hz",
+                self.name,
+                self.sample_rate,
+                self.stream.sample_rate
+            );
+        }
+        Ok(())
     }
 }
 

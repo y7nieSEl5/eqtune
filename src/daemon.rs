@@ -225,6 +225,10 @@ pub struct Daemon {
     /// Authoritative metadata for the output the running engine was validated against.
     /// It is adopted only after tap startup succeeds.
     engine_target: Option<OutputTarget>,
+    /// Most recent complete one-stream output snapshot attempted by the engine. Kept
+    /// across a failed start so status can name the device and format being rejected;
+    /// unlike `engine_target`, this is never evidence that processing is active.
+    attempted_target: Option<OutputTarget>,
     /// The effective target: the audio engine should be running iff this is true.
     /// `reconcile` starts/stops the engine to match it. It folds `user_intent` together
     /// with the automatic suspends (Low Power Mode, idle).
@@ -286,6 +290,7 @@ impl Daemon {
             session_path,
             engine: None,
             engine_target: None,
+            attempted_target: None,
             low_power,
             observed_output_id,
             recovery: Recovery::default(),
@@ -722,7 +727,10 @@ impl Daemon {
         if self.engine.is_some() {
             return Ok(());
         }
+        self.attempted_target = None;
         let target = OutputTarget::resolve_default()?;
+        self.attempted_target = Some(target.clone());
+        target.validate_compatibility()?;
         let settings = self.settings_for(target.sample_rate as f32);
         let pair = TapSession::start(&target, CHANNELS, settings)?;
         self.engine = Some(pair);
@@ -783,6 +791,7 @@ impl Daemon {
             eprintln!("default output changed to {output_id:?} — rebuilding engine");
             self.engine = None;
             self.engine_target = None;
+            self.attempted_target = None;
             if self.engine_target_on {
                 self.recovery.reset();
                 if let Err(e) = self.reconcile() {
@@ -1188,12 +1197,14 @@ impl Daemon {
 
     fn status(&self) -> Status {
         let active = self.config.active();
-        // Metadata comes only from the target whose stream validation and startup
-        // succeeded. Never relabel a running engine from the current system default.
+        // Prefer the target whose aggregate is actually running. During recovery, retain
+        // the complete snapshot used by the latest failed start so status can explain
+        // which device and format failed without claiming the engine is active.
         let target = self
             .engine_target
             .as_ref()
-            .filter(|_| self.engine.is_some());
+            .filter(|_| self.engine.is_some())
+            .or(self.attempted_target.as_ref());
         let now = Instant::now();
         let retry_in_seconds = self.recovery.next_retry.map(|at| {
             let millis = at.saturating_duration_since(now).as_millis();
@@ -2739,6 +2750,21 @@ mod tests {
         let mut d = daemon_with(Config::default());
         d.user_intent = true;
         d.engine_target_on = true;
+        d.attempted_target = Some(OutputTarget {
+            id: 227,
+            uid: "USB-EarPods".into(),
+            name: "EarPods".into(),
+            sample_rate: 44_100.0,
+            stream_index: 0,
+            stream: crate::sys::StreamFacts {
+                sample_rate: 44_100.0,
+                format_id: u32::from_be_bytes(*b"lpcm"),
+                format_flags: 1,
+                bytes_per_frame: 8,
+                channels: 2,
+                bits_per_channel: 32,
+            },
+        });
         d.last_engine_error = Some("runtime input stream layout changed".into());
         d.recovery.schedule_initial(Instant::now());
         d.config.presets.get_mut("bright").unwrap().preamp_db = -3.0;
@@ -2758,7 +2784,13 @@ mod tests {
         );
         assert_eq!(status.dirty_presets, ["bright"]);
         assert!(!status.bypassed);
-        assert!(status.output_uid.is_none());
+        assert_eq!(status.output_uid.as_deref(), Some("USB-EarPods"));
+        assert_eq!(status.output_name.as_deref(), Some("EarPods"));
+        assert_eq!(status.output_rate_hz, Some(44_100.0));
+        assert_eq!(
+            status.output_stream.as_deref(),
+            Some("44100 Hz, 2 ch, Float32, interleaved")
+        );
     }
 
     #[test]
@@ -2879,6 +2911,7 @@ mod tests {
             session_path: tmp_path("daemon-session.toml"),
             engine: None,
             engine_target: None,
+            attempted_target: None,
             engine_target_on: false,
             low_power: false,
             observed_output_id: None,
