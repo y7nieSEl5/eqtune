@@ -49,6 +49,7 @@ static bool copy_audio_stream_format(AudioStreamID stream,
 static bool supported_stereo_float_format(const AudioStreamBasicDescription *format) {
     return format->mFormatID == kAudioFormatLinearPCM &&
            (format->mFormatFlags & kAudioFormatFlagIsFloat) != 0 &&
+           (format->mFormatFlags & kAudioFormatFlagIsBigEndian) == 0 &&
            (format->mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0 &&
            (format->mFormatFlags & kAudioFormatFlagIsNonMixable) == 0 &&
            format->mBitsPerChannel == 32 &&
@@ -390,10 +391,21 @@ eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
             initExcludingProcesses:exclude
             andDeviceUID:(__bridge NSString *)output_uid
             withStream:(NSInteger)output_stream_index];
+        if (!desc) {
+            set_start_error(error_buf, error_buflen,
+                            "could not describe the selected output stream tap");
+            CFRelease(output_uid);
+            return NULL;
+        }
         desc.name = @"eqtune";
         desc.privateTap = YES;
         desc.muteBehavior = CATapMutedWhenTapped;
         NSString *tap_uuid = desc.UUID.UUIDString;
+        if (!tap_uuid) {
+            set_start_error(error_buf, error_buflen, "could not create a tap UID");
+            CFRelease(output_uid);
+            return NULL;
+        }
 
         AudioObjectID tap = kAudioObjectUnknown;
         OSStatus st = AudioHardwareCreateProcessTap(desc, &tap);
