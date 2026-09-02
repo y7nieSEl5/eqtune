@@ -3,6 +3,8 @@
 //! build steps are skipped on other targets and when docs.rs cross-documents the macOS
 //! target from its Linux builder, where no Apple compiler or SDK is available.
 
+const MIN_MACOS: &str = "14.2";
+
 fn main() {
     println!("cargo:rerun-if-changed=shim/tap_shim.m");
     println!("cargo:rerun-if-changed=shim/tap_shim.h");
@@ -20,7 +22,14 @@ fn main() {
         .file("shim/tap_shim.m")
         .include("shim")
         .flag("-fobjc-arc")
+        .flag(format!("-mmacosx-version-min={MIN_MACOS}"))
+        .flag("-Werror=unguarded-availability-new")
         .compile("eqtune_shim");
+
+    // The process-tap API starts at 14.2. Pin the final Mach-O load command as well as
+    // the Objective-C compilation above, so a build on a newer SDK cannot silently raise
+    // the advertised deployment floor.
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={MIN_MACOS}");
 
     for framework in ["Foundation", "CoreFoundation", "CoreAudio", "AudioToolbox"] {
         println!("cargo:rustc-link-lib=framework={framework}");

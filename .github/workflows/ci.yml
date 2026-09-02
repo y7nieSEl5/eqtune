@@ -11,6 +11,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Keep both Rust/cc dependency builds and the final Mach-O at the public minimum.
+  MACOSX_DEPLOYMENT_TARGET: "14.2"
 
 jobs:
   check:
@@ -27,6 +29,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 
@@ -42,3 +45,12 @@ jobs:
 
       - name: tests
         run: cargo nextest run
+
+      - name: deployment builds
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --target "$target"
+            minos=$(vtool -show-build "target/$target/release/eqtune" |
+              awk '/minos/{print $2; exit}')
+            test "$minos" = "$MACOSX_DEPLOYMENT_TARGET"
+          done
