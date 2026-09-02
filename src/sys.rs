@@ -30,9 +30,10 @@ unsafe extern "C" {
     /// false if unavailable or the buffer is too small.
     fn eqtune_output_device_name(dev: u32, buf: *mut c_char, buflen: usize) -> bool;
     fn eqtune_output_device_uid(dev: u32, buf: *mut c_char, buflen: usize) -> bool;
-    fn eqtune_output_device_stream_facts(dev: u32, facts: *mut RawStreamFacts) -> bool;
+    fn eqtune_output_device_stream(dev: u32, stream: *mut RawOutputStream) -> bool;
     fn eqtune_tap_start(
         output_device: u32,
+        output_stream_index: u32,
         cb: ProcessCb,
         ctx: *mut c_void,
         error_buf: *mut c_char,
@@ -75,6 +76,14 @@ struct RawStreamFacts {
     bits_per_channel: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RawOutputStream {
+    stream_count: u32,
+    stream_index: u32,
+    facts: RawStreamFacts,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StreamFacts {
     pub sample_rate: f64,
@@ -86,6 +95,26 @@ pub struct StreamFacts {
 }
 
 impl StreamFacts {
+    pub fn compatibility_error(&self) -> Option<&'static str> {
+        const LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
+        const IS_FLOAT: u32 = 1;
+        if self.format_id != LINEAR_PCM {
+            Some("output stream is not linear PCM")
+        } else if self.format_flags & IS_FLOAT == 0 || self.bits_per_channel != 32 {
+            Some("output stream is not Float32")
+        } else if !self.interleaved() {
+            Some("output stream is non-interleaved")
+        } else if self.channels != 2 {
+            Some("output stream is not stereo")
+        } else if self.bytes_per_frame != 2 * std::mem::size_of::<f32>() as u32 {
+            Some("output stream has an unsupported frame layout")
+        } else if !self.sample_rate.is_finite() || self.sample_rate <= 0.0 {
+            Some("output stream has an invalid sample rate")
+        } else {
+            None
+        }
+    }
+
     pub fn format_name(&self) -> String {
         const LINEAR_PCM: u32 = u32::from_be_bytes(*b"lpcm");
         const IS_FLOAT: u32 = 1;
@@ -129,6 +158,7 @@ pub struct OutputTarget {
     pub uid: String,
     pub name: String,
     pub sample_rate: f64,
+    pub stream_index: u32,
     pub stream: StreamFacts,
 }
 
@@ -143,23 +173,44 @@ impl OutputTarget {
         let name = output_device_name(id).unwrap_or_else(|| format!("#{id}"));
         let sample_rate = output_device_sample_rate(id)
             .ok_or_else(|| anyhow::anyhow!("could not read output device sample rate for #{id}"))?;
-        let mut raw = RawStreamFacts::default();
-        if !unsafe { eqtune_output_device_stream_facts(id, &mut raw) } {
-            anyhow::bail!("could not read output stream format for #{id}");
+        let mut output = RawOutputStream::default();
+        if !unsafe { eqtune_output_device_stream(id, &mut output) } {
+            anyhow::bail!("could not inspect output streams for {name}");
+        }
+        if output.stream_count != 1 {
+            anyhow::bail!(
+                "unsupported output topology for {name}: expected one output stream, found {}",
+                output.stream_count
+            );
+        }
+        let raw = output.facts;
+        let stream = StreamFacts {
+            sample_rate: raw.sample_rate,
+            format_id: raw.format_id,
+            format_flags: raw.format_flags,
+            bytes_per_frame: raw.bytes_per_frame,
+            channels: raw.channels_per_frame,
+            bits_per_channel: raw.bits_per_channel,
+        };
+        if let Some(reason) = stream.compatibility_error() {
+            anyhow::bail!(
+                "unsupported output format for {name}: {reason} ({})",
+                stream.description()
+            );
+        }
+        if (sample_rate - stream.sample_rate).abs() >= 0.5 {
+            anyhow::bail!(
+                "output rate mismatch for {name}: nominal {sample_rate} Hz, stream {} Hz",
+                stream.sample_rate
+            );
         }
         Ok(Self {
             id,
             uid,
             name,
             sample_rate,
-            stream: StreamFacts {
-                sample_rate: raw.sample_rate,
-                format_id: raw.format_id,
-                format_flags: raw.format_flags,
-                bytes_per_frame: raw.bytes_per_frame,
-                channels: raw.channels_per_frame,
-                bits_per_channel: raw.bits_per_channel,
-            },
+            stream_index: output.stream_index,
+            stream,
         })
     }
 }
@@ -294,6 +345,7 @@ impl TapSession {
         let raw = unsafe {
             eqtune_tap_start(
                 target.id,
+                target.stream_index,
                 process_trampoline,
                 ctx,
                 error.as_mut_ptr().cast::<c_char>(),
@@ -360,5 +412,34 @@ mod tests {
 
         facts.format_flags |= 1 << 5;
         assert!(!facts.interleaved());
+        assert_eq!(
+            facts.compatibility_error(),
+            Some("output stream is non-interleaved")
+        );
+    }
+
+    #[test]
+    fn consumer_output_contract_accepts_native_rates_but_rejects_topology_changes() {
+        let mut facts = StreamFacts {
+            sample_rate: 44_100.0,
+            format_id: u32::from_be_bytes(*b"lpcm"),
+            format_flags: 1,
+            bytes_per_frame: 8,
+            channels: 2,
+            bits_per_channel: 32,
+        };
+        assert_eq!(facts.compatibility_error(), None);
+
+        facts.channels = 6;
+        assert_eq!(
+            facts.compatibility_error(),
+            Some("output stream is not stereo")
+        );
+        facts.channels = 2;
+        facts.bits_per_channel = 24;
+        assert_eq!(
+            facts.compatibility_error(),
+            Some("output stream is not Float32")
+        );
     }
 }

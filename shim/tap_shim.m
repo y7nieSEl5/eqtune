@@ -20,8 +20,8 @@ static AudioObjectID default_output_device(void);
 // Caller must CFRelease the returned string.
 static CFStringRef copy_device_uid(AudioObjectID device);
 
-static bool copy_stream_format(AudioDeviceID device,
-                               AudioObjectPropertyScope scope,
+static bool copy_device_stream_format(AudioDeviceID device,
+                                      AudioObjectPropertyScope scope,
                                AudioStreamBasicDescription *format) {
     UInt32 size = sizeof(*format);
     AudioObjectPropertyAddress addr = {
@@ -30,6 +30,17 @@ static bool copy_stream_format(AudioDeviceID device,
         .mElement = kAudioObjectPropertyElementMain,
     };
     return AudioObjectGetPropertyData(device, &addr, 0, NULL, &size, format) == noErr;
+}
+
+static bool copy_audio_stream_format(AudioStreamID stream,
+                                     AudioStreamBasicDescription *format) {
+    UInt32 size = sizeof(*format);
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioStreamPropertyVirtualFormat,
+        .mScope = kAudioObjectPropertyScopeGlobal,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    return AudioObjectGetPropertyData(stream, &addr, 0, NULL, &size, format) == noErr;
 }
 
 // The Rust processor consumes one interleaved stereo Float32 buffer. Establish that
@@ -137,15 +148,37 @@ static void export_stream_facts(const AudioStreamBasicDescription *format,
     facts->bits_per_channel = format->mBitsPerChannel;
 }
 
-bool eqtune_output_device_stream_facts(uint32_t dev_id, eqtune_stream_facts *facts) {
-    if (!facts || dev_id == kAudioObjectUnknown) {
+bool eqtune_output_device_stream(uint32_t dev_id, eqtune_output_stream *output) {
+    if (!output || dev_id == kAudioObjectUnknown) {
+        return false;
+    }
+    memset(output, 0, sizeof(*output));
+    AudioObjectPropertyAddress addr = {
+        .mSelector = kAudioDevicePropertyStreams,
+        .mScope = kAudioObjectPropertyScopeOutput,
+        .mElement = kAudioObjectPropertyElementMain,
+    };
+    UInt32 size = 0;
+    if (AudioObjectGetPropertyDataSize((AudioDeviceID)dev_id, &addr, 0, NULL, &size) != noErr ||
+        size % sizeof(AudioStreamID) != 0) {
+        return false;
+    }
+    output->stream_count = size / sizeof(AudioStreamID);
+    if (output->stream_count != 1) {
+        return true;
+    }
+
+    AudioStreamID stream = kAudioObjectUnknown;
+    if (AudioObjectGetPropertyData((AudioDeviceID)dev_id, &addr, 0, NULL, &size, &stream) != noErr ||
+        stream == kAudioObjectUnknown) {
         return false;
     }
     AudioStreamBasicDescription format = {0};
-    if (!copy_stream_format((AudioDeviceID)dev_id, kAudioObjectPropertyScopeOutput, &format)) {
+    if (!copy_audio_stream_format(stream, &format)) {
         return false;
     }
-    export_stream_facts(&format, facts);
+    output->stream_index = 0;
+    export_stream_facts(&format, &output->facts);
     return true;
 }
 
@@ -300,6 +333,7 @@ static void set_start_osstatus_error(char *buf, size_t buflen, const char *what,
 }
 
 eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
+                                     uint32_t output_stream_index,
                                      eqtune_process_cb cb,
                                      void *ctx,
                                      char *error_buf,
@@ -316,11 +350,15 @@ eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
             return NULL;
         }
 
-        // Tap: stereo, global, excluding ourselves; muted at the hardware only while
-        // we are reading it, so stopping the daemon restores normal audio.
+        // Bind capture to the same snapshotted device stream used for playback. Core
+        // Audio documents that this tap adopts that stream's format, avoiding a generic
+        // global tap rate/layout that can disagree with (for example) 44.1 kHz USB audio.
         AudioObjectID self_obj = self_process_object();
         NSArray *exclude = (self_obj != kAudioObjectUnknown) ? @[ @(self_obj) ] : @[];
-        CATapDescription *desc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:exclude];
+        CATapDescription *desc = [[CATapDescription alloc]
+            initExcludingProcesses:exclude
+            andDeviceUID:(__bridge NSString *)output_uid
+            withStream:(NSInteger)output_stream_index];
         desc.name = @"eqtune";
         desc.privateTap = YES;
         desc.muteBehavior = CATapMutedWhenTapped;
@@ -366,10 +404,10 @@ eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
 
         AudioStreamBasicDescription input_format = {0};
         AudioStreamBasicDescription output_format = {0};
-        bool formats_ok = copy_stream_format(aggregate, kAudioObjectPropertyScopeInput,
-                                             &input_format) &&
-                          copy_stream_format(aggregate, kAudioObjectPropertyScopeOutput,
-                                             &output_format) &&
+        bool formats_ok = copy_device_stream_format(aggregate, kAudioObjectPropertyScopeInput,
+                                                    &input_format) &&
+                          copy_device_stream_format(aggregate, kAudioObjectPropertyScopeOutput,
+                                                    &output_format) &&
                           supported_stereo_float_format(&input_format) &&
                           supported_stereo_float_format(&output_format) &&
                           input_format.mSampleRate == output_format.mSampleRate;

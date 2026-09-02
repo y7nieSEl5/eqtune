@@ -39,8 +39,16 @@ typedef struct eqtune_stream_facts {
     uint32_t bits_per_channel;
 } eqtune_stream_facts;
 
-// Query the output-scope stream format of exactly `dev`.
-bool eqtune_output_device_stream_facts(uint32_t dev, eqtune_stream_facts *facts);
+// One coherent output-stream query. `stream_count` is always populated on a successful
+// query; `stream_index` and `facts` are populated only when the device has exactly one
+// output stream, which is eqtune's supported consumer-output topology.
+typedef struct eqtune_output_stream {
+    uint32_t stream_count;
+    uint32_t stream_index;
+    eqtune_stream_facts facts;
+} eqtune_output_stream;
+
+bool eqtune_output_device_stream(uint32_t dev, eqtune_output_stream *stream);
 
 // Called from the real-time audio thread to process captured audio in place.
 // `buffer` holds `frames * channels` interleaved 32-bit float samples.
@@ -54,6 +62,7 @@ typedef struct eqtune_tap_session eqtune_tap_session;
 // (output device + tap share a clock, so no drift compensation is required).
 // Returns NULL on failure (details are logged to stderr).
 eqtune_tap_session *eqtune_tap_start(uint32_t output_device,
+                                     uint32_t output_stream_index,
                                      eqtune_process_cb cb,
                                      void *ctx,
                                      char *error_buf,
