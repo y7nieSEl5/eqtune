@@ -6,6 +6,17 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Process taps are now bound to the exact snapshotted output UID and sole stream, so
+  ordinary stereo devices run at their native rate, including 44.1 kHz USB headphones,
+  without resampling. Unsupported mono, multichannel, multistream, planar, integer-client,
+  or encoded layouts stay on the native path with precise format diagnostics.
+- Failed engine starts retain the attempted output UID/name/rate/stream in `status` without
+  claiming the engine is running.
+- macOS 14.2 is enforced in Objective-C compilation and Mach-O metadata; CI builds and
+  checks both Apple Silicon and Intel release binaries against that deployment floor.
+
 ### Roadmap
 
 The remaining order keeps focused DSP tools ahead of new routing features. Release
@@ -17,9 +28,10 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
 - Add explicit config schema versioning with small deliberate migrations, without generic
   preset metadata. Audit the active-preset invariant at the same time and remove its
   arbitrary fallback only if every caller can surface the missing preset clearly.
-- Add opt-in application-bundle-ID exclusions to the one existing global tap: selected
-  applications stay native while the remaining system audio is equalized. Do not add
-  per-app presets, gain, routing graphs, process databases, or browser-tab detection.
+- Add opt-in application-bundle-ID exclusions to the one existing device-scoped tap:
+  selected applications stay native while the remaining system audio is equalized. Do
+  not add per-app presets, gain, routing graphs, process databases, or browser-tab
+  detection.
 - Treat per-app bypass as higher-complexity until launches, exits, helper processes,
   browser-hosted calls, device switches, and lookup failures are proven fail-safe.
 

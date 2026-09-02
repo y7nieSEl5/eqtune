@@ -29,7 +29,7 @@ eqtune通过利用Apple从macOS 14.2开始支持的**Core Audio process-tap API*
                                      └──────────┬──────────┘
                                                 │  process-tap API
                                                 ▼
-   system audio ─▶ global tap ─▶ aggregate device ─▶ IOProc ─▶ default output device
+   system audio ─▶ device-scoped tap ─▶ aggregate device ─▶ IOProc ─▶ default output
                                          (capture → EQ → replay, one shared clock)
 ```
 > 是的，这个项目没能完全用Rust实现：因为process-tap API更偏Objective-C形态，且目前缺少成熟的Rust封装🤷
@@ -89,20 +89,20 @@ daemon的接受循环（`Daemon::run`）处理每个连接。它读取JSON命令
 daemon对这行JSON也有硬边界：一次请求必须在总计5秒内读完，且不能超过64 KiB。这个检查会在每次读取后执行，包括读到结尾换行符的那一次，因此沉默连接、慢速滴字节、或一直不发换行的client都不能卡住单线程的accept/poll循环。
 daemon在接触control socket之前会先获取一个nonblocking advisory lock，所以第二个daemon会直接退出，不能替换第一个daemon的socket或与它争用config和Core Audio状态。对于旧版本留下的socket，启动过程也会先探测，只会删除已经确认失效的Unix socket。
 
-`Status`刻意保持为扁平、低频的control-plane快照，而不是callback telemetry。它会区分用户想要的on/off和engine实际是否运行，并给出挂起原因、通过验证的输出UID/name/rate/stream facts、最后一次engine错误、有界retry状态、bypass状态和所有dirty preset。
+`Status`刻意保持为扁平、低频的control-plane快照，而不是callback telemetry。它会区分用户想要的on/off和engine实际是否运行，并给出挂起原因、输出UID/name/rate/stream facts、最后一次engine错误、有界retry状态、bypass状态和所有dirty preset。输出信息来自已经成功运行的target；启动失败时则保留最近一次完整的尝试snapshot用于诊断，但不会把engine误报为running。
 
 ### audio plane
 
 Apple提供的**Core Audio process-tap API**允许一个来自user-space的进程获得系统的audio mix。eqtune利用这一点设置了三个对象：
 
-1. global process tap
+1. device-scoped process tap
 
-需要注意的是，这个tap里不包含eqtune自己的进程，否则我们捕获后重新播放的音频会被再次捕获，造成一个邪恶的死循环（我们其实通过`kAudioHardwarePropertyTranslatePIDToProcessObject`来获得我们自己的音频对象，但这不是重点）。
+这个tap绑定到同一次snapshot得到的输出UID和唯一output stream，捕获所有发往该stream的进程音频，但不包含eqtune自己的进程，否则重新播放的音频会被再次捕获，造成反馈循环。Core Audio会让tap匹配所选stream的格式，因此44.1 kHz设备会得到44.1 kHz tap，不需要resampler。
 另外，我们用`CATapMutedWhenTapped`来实现只在我们悄悄截走了音频的时候才把原生音频静音，否则关闭了daemon，原生的音频也没了。
 
 2. private aggregate device
 
-启动时只解析一次默认输出设备ID，之后UID、name、nominal rate和stream facts都按这个确切ID查询；同一个ID会传给`AudioHardwareCreateAggregateDevice`，把该输出（clock和playback）和我们自己的tap绑定。这样不会在设备切换竞态中拼出一份混合snapshot，二者共享同一个clock，也可以保证捕获音频与回放音频之间没有漂移。只有aggregate通过匹配的interleaved stereo Float32验证并成功启动后，这份snapshot才会被记录并显示在`status`里。
+启动时只解析一次默认输出设备ID，再枚举这个设备的output streams。目前接受一个mixable、interleaved stereo Float32 stream，并使用设备原生sample rate（包括44.1和48 kHz）；UID、name、nominal rate和stream facts都按这个确切ID查询。相同UID和stream index用于构造tap，aggregate再把该输出（clock和playback）与tap绑定，避免设备切换竞态和额外resampling。通过验证并成功启动的target才代表running engine；完整但失败的尝试snapshot仍会显示在`status`中，方便诊断。
 
 3. I/O callback
 

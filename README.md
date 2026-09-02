@@ -19,12 +19,14 @@ eqtune taps the system audio mix with Apple's modern **Core Audio process-tap AP
 - Xcode Command Line Tools — `xcode-select --install` (clang + CoreAudio)
 - Rust — https://rustup.rs
 
-eqtune currently processes matching interleaved stereo Float32 aggregate streams. If an
-output device exposes an unsupported layout, eqtune refuses to start the tap and records
-the reason in `~/Library/Application Support/eqtune/daemon.log` instead of risking
-corrupted audio. If a running stream changes to an unsafe layout, eqtune tears the tap
-down within the daemon's control-loop tick, immediately restoring the native audio path,
-then retries at most six times with bounded backoff.
+eqtune processes one output stream with a mixable, interleaved stereo Float32 format at
+the device's native sample rate (including 44.1 and 48 kHz). This covers ordinary built-in,
+wired USB, and Bluetooth listening outputs without a resampler. Mono, multichannel,
+multistream, non-interleaved, integer-client, and encoded-passthrough layouts currently
+fall back to native audio with the exact rejected format in `status`/`daemon.log`. If a
+running stream changes to an unsafe layout, eqtune tears the tap down within the daemon's
+control-loop tick, restores the native path, and retries at most six times with bounded
+backoff.
 
 ## Install
 
@@ -100,8 +102,9 @@ eqtune install | uninstall            # manage the launchd daemon
   saved yet — you were listening to. Unsaved edits stay unsaved; the `eqtune off` prompt
   still decides whether to keep them.
 - `eqtune status` separates your desired on/off intent from the actual engine state and
-  explains suspensions or recovery. It also reports only validated output metadata, the
-  last engine error, bounded retry progress, bypass state, and every dirty preset.
+  explains suspensions or recovery. It reports the validated running output—or the exact
+  output snapshot from the latest failed attempt—plus the last engine error, bounded
+  retry progress, bypass state, and every dirty preset.
 - A failed desired start keeps native output active and retries after 1, 2, 4, 8, 16,
   and 30 seconds. After the sixth retry, recovery stays exhausted until an explicit
   `eqtune on`, an output-device change, or a real policy resume starts a fresh incident.
@@ -242,15 +245,16 @@ engine and signal path work.
 ## How it works
 
 ```
-system audio ─▶ global process tap (excludes eqtune; muted-when-tapped)
+system audio ─▶ device-scoped process tap (excludes eqtune; muted-when-tapped)
              ─▶ private aggregate device (output device + tap, one shared clock)
              ─▶ IOProc: capture → biquad EQ + preamp + soft limiter → replay
              ─▶ your current default output device
 ```
 
-A launchd LaunchAgent runs the daemon; a Unix-socket CLI controls it. Putting the tap
-and the output device in a single aggregate device means they share one clock, so
-there's no resampling/drift to fight. A lightweight poll makes the engine follow
+A launchd LaunchAgent runs the daemon; a Unix-socket CLI controls it. The tap is bound to
+the exact output UID and its sole stream, so Core Audio exposes capture at that stream's
+native format. Putting that tap and output in one aggregate device gives them one clock,
+with no resampling or drift to fight. A lightweight poll makes the engine follow
 default-device changes (plug in headphones and audio follows).
 
 For a deeper dive — the daemon/CLI split, the lock-free real-time DSP, the Objective-C

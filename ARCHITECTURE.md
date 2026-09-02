@@ -34,7 +34,7 @@ plus a thin native shim:
                                      └──────────┬──────────┘
                                                 │  process-tap API
                                                 ▼
-   system audio ─▶ global tap ─▶ aggregate device ─▶ IOProc ─▶ default output device
+   system audio ─▶ device-scoped tap ─▶ aggregate device ─▶ IOProc ─▶ default output
                                          (capture → EQ → replay, one shared clock)
 ```
 
@@ -149,8 +149,9 @@ older daemons; it removes the path only when it is a verified stale Unix socket.
 
 `Status` is intentionally a small, flat control-plane snapshot rather than callback
 telemetry. It separates user intent from the actual engine state and includes the current
-suspension reason, validated output UID/name/rate/stream facts, last engine error, bounded
-retry state, bypass state, and dirty preset names.
+suspension reason, output UID/name/rate/stream facts, last engine error, bounded retry
+state, bypass state, and dirty preset names. Output facts describe the validated running
+target, or the last complete attempted target while startup is recovering or exhausted.
 
 **Live edits.** Tuning commands (`SetBand`, `SetPreamp`, `SetPreset`, …) mutate the
 daemon's working config and, if the engine is running, push freshly-designed coefficients
@@ -171,11 +172,12 @@ This is the part that needs Apple's frameworks, and it lives in `shim/tap_shim.m
 modern **Core Audio process-tap API** (macOS 14.2+) lets a normal user-space process
 observe the system audio mix with no driver. eqtune sets up three objects:
 
-1. **A global process tap** (`AudioHardwareCreateProcessTap` with a `CATapDescription`).
-   It's a *stereo, global, private* tap that **excludes eqtune's own process** — otherwise
-   the audio we replay would be re-captured into a feedback loop. (We find our own audio
-   object via `kAudioHardwarePropertyTranslatePIDToProcessObject`.) It uses
-   `CATapMutedWhenTapped`, so the original audio is muted *only while we're tapping it*;
+1. **A device-scoped process tap** (`AudioHardwareCreateProcessTap` with a
+   `CATapDescription`). It captures every process destined for the exact snapshotted
+   output UID and stream while **excluding eqtune's own process** — otherwise replay would
+   feed back into capture. Core Audio makes the tap match that selected stream's format,
+   so a 44.1 kHz output produces a 44.1 kHz tap without a resampler. The tap stays private
+   and uses `CATapMutedWhenTapped`, so original audio is muted only while eqtune reads it;
    stop the daemon and normal sound returns instantly.
 
 2. **A private aggregate device** (`AudioHardwareCreateAggregateDevice`) that bundles one
@@ -190,19 +192,20 @@ observe the system audio mix with no driver. eqtune sets up three objects:
 The resulting signal path:
 
 ```
-system audio ─▶ global process tap (excludes eqtune; muted-when-tapped)
+system audio ─▶ device-scoped process tap (excludes eqtune; muted-when-tapped)
              ─▶ private aggregate device (output device + tap, one shared clock)
              ─▶ IOProc: capture → [Rust: preamp → biquad cascade → soft limiter] → replay
              ─▶ your current default output device
 ```
 
-**Following the output device.** Startup resolves the default device ID once, then queries
-UID, name, nominal rate, and stream facts by that exact ID. The same ID is passed into tap
-startup, so a device switch between property reads cannot create a mixed target. The
-snapshot becomes visible to `status` only after the aggregate exposes matching interleaved
-stereo Float32 streams and starts successfully. The daemon polls every 100 ms; when you
-plug in headphones or switch to Bluetooth, it tears the aggregate down and rebuilds it
-around one new snapshot (`follow_default_device`).
+**Following the output device.** Startup resolves the default device ID once, enumerates
+that exact device's output streams, and accepts one mixable interleaved stereo Float32
+stream at any valid native rate. UID, name, nominal rate, and the selected stream format
+all come from that snapshot; its UID and stream index are passed into tap construction.
+The running target becomes authoritative only after aggregate validation and startup,
+while a complete failed target remains visible in `status` for diagnosis. The daemon
+polls every 100 ms; when you plug in headphones or switch to Bluetooth, it tears the
+aggregate down and rebuilds it around one new snapshot (`follow_default_device`).
 
 ---
 
