@@ -104,6 +104,10 @@ Apple提供的**Core Audio process-tap API**允许一个来自user-space的进�
 
 启动时只解析一次默认输出设备ID，再枚举这个设备的output streams。目前接受一个mixable、interleaved stereo Float32 stream，并使用设备原生sample rate（包括44.1和48 kHz）；UID、name、nominal rate和stream facts都按这个确切ID查询。相同UID和stream index用于构造tap，aggregate再把该输出（clock和playback）与tap绑定，避免设备切换竞态和额外resampling。通过验证并成功启动的target才代表running engine；完整但失败的尝试snapshot仍会显示在`status`中，方便诊断。
 
+兼容边界由Core Audio提供给client的virtual format决定，而不是设备宣传的物理bit depth。目前要求单一output stream、mixable、little-endian、interleaved stereo Float32，但不限制原生sample rate。0.7.1已经在44.1 kHz Apple USB EarPods、44.1 kHz Baseus AirGo蓝牙耳机，以及48 kHz MacBook Air扬声器上验证。很多物理上使用16/24-bit PCM的USB设备仍会被Core Audio以Float32 virtual stream暴露，因此也可以落入这条轻量路径。
+
+零个或多个output streams、真正的mono或multichannel、non-interleaved、integer client format、nonmixable/big-endian PCM和encoded passthrough会在不安全处理开始前被拒绝；aggregate在启动IOProc前还会再验证一次。实时路径刻意不加入channel mapper、interleaver、integer converter、decoder或resampler。遇到不支持的配置时保留原生音频，并在`status`和daemon log中显示具体topology或format。
+
 3. I/O callback
 
 `AudioDeviceCreateIOProcID`和`AudioDeviceStart`中，每一个循环里，`io_proc`把系统音频导入output buffer，再调用Rust部分中的`eqtune_process_cb`来原位调衡那个部分的音频。

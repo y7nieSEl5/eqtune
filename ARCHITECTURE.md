@@ -207,6 +207,21 @@ while a complete failed target remains visible in `status` for diagnosis. The da
 polls every 100 ms; when you plug in headphones or switch to Bluetooth, it tears the
 aggregate down and rebuilds it around one new snapshot (`follow_default_device`).
 
+**Compatibility boundary.** The selected stream must be mixable, little-endian,
+interleaved stereo Float32. Its native sample rate is unrestricted; the device-scoped tap
+inherits it, the aggregate uses the output as its clock, and Rust designs the filters for
+that same rate. This path is verified with 44.1 kHz Apple USB EarPods, 44.1 kHz Baseus
+AirGo Bluetooth headphones, and 48 kHz MacBook Air speakers. Core Audio's
+client-facing virtual format is what matters, so a USB device that physically transports
+16- or 24-bit PCM can still qualify when the HAL exposes Float32 to clients.
+
+Zero or multiple output streams, true mono or multichannel streams, non-interleaved or
+integer client formats, nonmixable/big-endian PCM, and encoded passthrough are rejected
+before unsafe processing. The aggregate is also revalidated before its IOProc starts.
+There is intentionally no channel mapper, interleaver, integer converter, decoder, or
+resampler in the realtime path; unsupported configurations keep native audio and expose
+their topology or format through status and the daemon log.
+
 ---
 
 ## 5. The DSP, and the lock-free hand-off

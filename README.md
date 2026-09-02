@@ -19,14 +19,28 @@ eqtune taps the system audio mix with Apple's modern **Core Audio process-tap AP
 - Xcode Command Line Tools — `xcode-select --install` (clang + CoreAudio)
 - Rust — https://rustup.rs
 
-eqtune processes one output stream with a mixable, interleaved stereo Float32 format at
-the device's native sample rate (including 44.1 and 48 kHz). This covers ordinary built-in,
-wired USB, and Bluetooth listening outputs without a resampler. Mono, multichannel,
-multistream, non-interleaved, integer-client, and encoded-passthrough layouts currently
-fall back to native audio with the exact rejected format in `status`/`daemon.log`. If a
-running stream changes to an unsafe layout, eqtune tears the tap down within the daemon's
-control-loop tick, restores the native path, and retries at most six times with bounded
-backoff.
+### Output compatibility
+
+eqtune processes one output stream whose Core Audio virtual format is mixable,
+little-endian, interleaved stereo Float32. It follows the stream's native sample rate—no
+48 kHz requirement and no resampler. Version 0.7.1 is verified with:
+
+- Apple USB EarPods at 44.1 kHz;
+- Baseus AirGo Bluetooth headphones at 44.1 kHz;
+- MacBook Air speakers at 48 kHz.
+
+Other built-in speakers, 3.5 mm headphones, USB headphones/DACs, and Bluetooth outputs
+using that same single-stream stereo virtual format should work. A device's advertised
+physical bit depth is not decisive: many 16/24-bit USB devices are presented to apps by
+Core Audio as a mixable Float32 virtual stream. `eqtune status` shows the format actually
+seen by eqtune.
+
+eqtune does not currently process true mono, multichannel, multistream, non-interleaved,
+integer-client, nonmixable, big-endian, or encoded-passthrough output streams. Those
+configurations remain on native audio with the rejected topology or format recorded in
+`status`/`daemon.log`. If a running stream changes to an unsafe layout, eqtune tears the
+tap down within the daemon's control-loop tick, restores the native path, and retries at
+most six times with bounded backoff.
 
 ## Install
 
