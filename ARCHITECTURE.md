@@ -207,6 +207,14 @@ while a complete failed target remains visible in `status` for diagnosis. The da
 polls every 100 ms; when you plug in headphones or switch to Bluetooth, it tears the
 aggregate down and rebuilds it around one new snapshot (`follow_default_device`).
 
+**Startup transition.** Native playback continues while the daemon creates the process
+tap and aggregate device and starts I/O. `CATapMutedWhenTapped` suppresses the original
+app audio once capture is active, and the engine replays the equalized signal. Startup,
+idle resume, output changes, and sample-rate changes can therefore expose a few seconds
+of unequalized audio, with different tone or loudness from the selected preset. Startup
+duration is device-dependent; there is no fixed handover deadline. Failed starts leave
+native playback active under the existing bounded recovery policy.
+
 **Compatibility boundary.** The selected stream must be mixable, little-endian,
 interleaved stereo Float32. Its native sample rate is unrestricted; the device-scoped tap
 inherits it, the aggregate uses the output as its clock, and Rust designs the filters for

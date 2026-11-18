@@ -231,9 +231,16 @@ quicker than with Apple's native audio path.
 > playback. If battery life matters to you, leave the Low Power Mode auto-off enabled
 > (the default) and run `eqtune off` when you don't need the EQ.
 
-**Idle auto-off.** When captured system audio stays silent, eqtune tears the audio engine
+**Idle auto-off.** After two minutes of captured silence, eqtune tears the audio engine
 down automatically and brings it back when the default output device reports active I/O
 again. Disable this behaviour with `eqtune idle off`.
+
+**Startup and output changes.** Audio plays through macOS's native path while the EQ
+engine starts or rebuilds after an idle resume, output-device switch, or sample-rate
+change. You may hear a few seconds of unequalized audio before the EQ takes effect;
+the duration depends on the device and startup conditions. Its tone or loudness can
+differ from your EQ preset. If startup fails, native playback continues while eqtune
+attempts recovery.
 
 **Low Power Mode auto-off.** When macOS switches on Low Power Mode, eqtune tears the
 audio engine down automatically (the single biggest saving) and brings it back when Low

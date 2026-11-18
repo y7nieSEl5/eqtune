@@ -6,6 +6,14 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+Integrated [@immdipu](https://github.com/immdipu)'s two-minute idle delay and `discard`
+command, preserving the original commits and authorship.
+
+### Documentation
+
+- Describe native, unequalized playback while the EQ engine starts or rebuilds, its
+  possible tone or loudness difference, and device-dependent startup duration.
+
 ### Roadmap
 
 The remaining order keeps focused DSP tools ahead of new routing features. Release
