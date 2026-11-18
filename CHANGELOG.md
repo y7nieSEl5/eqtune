@@ -6,19 +6,6 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-Integrated [@immdipu](https://github.com/immdipu)'s two-minute idle delay and `discard`
-command, preserving the original commits and authorship.
-
-### Added
-
-- An offline DSP component-ablation benchmark, with raw measurements, a dependency
-  snapshot, findings, and instructions for rerunning or extending the experiment.
-
-### Documentation
-
-- Describe native, unequalized playback while the EQ engine starts or rebuilds, its
-  possible tone or loudness difference, and device-dependent startup duration.
-
 ### Roadmap
 
 The remaining order keeps focused DSP tools ahead of new routing features. Release
@@ -46,21 +33,30 @@ generic metadata, routing-rule, or always-on telemetry subsystem.
   exposing intermediate mixes adds persistence, limiter, response, and phase-interaction
   semantics that are not justified for A/B testing alone.
 
-## [0.7.1-oomph.2] - 2026-11-02
+## [0.7.2] - 2026-11-17
+
+Thanks to [Dipu (@immdipu)](https://github.com/immdipu) for the two-minute idle delay
+and `eqtune discard`. Their original commits and authorship are preserved.
 
 ### Added
 
-- `eqtune discard` drops unsaved tuning changes while the EQ keeps running. Before, the
-  only way to discard was the `eqtune off` prompt, so a front end that wanted to keep the
-  EQ on had to restart the engine, and native audio played in between.
-
-## [0.7.1-oomph.1] - 2026-11-02
+- `eqtune discard` drops unsaved tuning changes while the EQ keeps running.
+- An offline DSP component-ablation experiment with its runner, raw measurements,
+  dependency snapshot, findings, and instructions for rerunning or extending it.
 
 ### Changed
 
-- Idle auto-off waits for 2 minutes of silence instead of 10 seconds. A resume plays the
-  first second or two without the EQ while the tap restarts, so the short gaps of picking
-  the next song or switching apps no longer suspend the engine.
+- Idle auto-off now waits for two minutes of silence instead of ten seconds, avoiding
+  engine restarts during short pauses between songs or apps.
+- Keep native playback audible while the EQ engine starts or rebuilds. This follows
+  eqtune's lightweight, straightforward design: clicking Play should produce sound
+  immediately, even before the EQ is ready. We intentionally left out the fork's
+  temporary device muting to avoid silent startup and additional mute-state management.
+
+### Documentation
+
+- Explain the brief interval of unequalized playback during startup and output changes,
+  its possible tone or loudness difference, and device-dependent startup duration.
 
 ## [0.7.1] - 2026-09-02
 

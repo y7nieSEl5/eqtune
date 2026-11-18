@@ -242,6 +242,10 @@ the duration depends on the device and startup conditions. Its tone or loudness 
 differ from your EQ preset. If startup fails, native playback continues while eqtune
 attempts recovery.
 
+This keeps startup lightweight and straightforward: clicking Play produces sound
+immediately, and EQ takes effect when the engine is ready. Hearing native audio during
+that brief transition is intentional; eqtune does not mute the speaker while launching.
+
 **Low Power Mode auto-off.** When macOS switches on Low Power Mode, eqtune tears the
 audio engine down automatically (the single biggest saving) and brings it back when Low
 Power Mode turns off. An explicit `eqtune on` still overrides and runs even under Low
