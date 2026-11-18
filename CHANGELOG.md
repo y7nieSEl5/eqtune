@@ -9,6 +9,11 @@ This project follows [Semantic Versioning](https://semver.org/).
 Integrated [@immdipu](https://github.com/immdipu)'s two-minute idle delay and `discard`
 command, preserving the original commits and authorship.
 
+### Added
+
+- An offline DSP component-ablation benchmark, with raw measurements, a dependency
+  snapshot, findings, and instructions for rerunning or extending the experiment.
+
 ### Documentation
 
 - Describe native, unequalized playback while the EQ engine starts or rebuilds, its

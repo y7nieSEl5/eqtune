@@ -273,6 +273,10 @@ The zero-dependency `benches/dsp.rs` executable measures steady-state, sustained
 settings adoption, the 64-band cap, and bypass transitions offline. No clock read or
 timing counter is compiled into the production callback.
 
+`benches/dsp_ablation.rs` provides a separate component-cost experiment using shipped
+presets and deterministic inputs. Its [experiment notes](experiments/dsp-ablation/README.md)
+include recorded results, limitations, and directions for rerunning or extending it.
+
 `src/sys.rs` wires this up: `process_trampoline` is the `extern "C"` function the shim
 calls. It loads the current settings and runs the processor over the buffer. The
 `TapSession` struct owns the native session and **stops audio on `Drop`** (RAII) — so

@@ -264,6 +264,10 @@ These trim the overhead but can't remove it — system-wide real-time audio alwa
 some power while the engine is active. See [ARCHITECTURE.md](ARCHITECTURE.md) for how the
 engine and signal path work.
 
+For a small component-cost experiment, see [DSP component ablation](experiments/dsp-ablation/README.md).
+It includes the benchmark source, raw results, findings, and instructions to rerun or
+extend it with other workloads. Run `cargo bench --locked --bench dsp_ablation` to try it.
+
 ## How it works
 
 ```

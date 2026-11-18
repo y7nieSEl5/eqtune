@@ -46,3 +46,7 @@ cc = "1.2.63"
 [[bench]]
 name = "dsp"
 harness = false
+
+[[bench]]
+name = "dsp_ablation"
+harness = false
